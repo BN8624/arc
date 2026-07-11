@@ -68,3 +68,11 @@ arc episode script-import E001 --gate /path/to/E001_story_gate.json --script /pa
 ```
 
 명령은 PASS gate와 대본의 최소 계약을 검증한 뒤 두 원본을 보존하고 `SCRIPT_DRAFT`로 전환한다.
+
+## 실제 1차 리뷰·수정 대본 import
+
+```bash
+arc episode rewrite-import E001 --review /path/to/E001_review_1.json --script /path/to/E001_script_revised.md
+```
+
+명령은 `REWRITE_ONCE` 리뷰와 수정 대본 계약을 함께 검증하고 `SCRIPT_DRAFT → REVIEW_1 → REVISED`를 기록한다.

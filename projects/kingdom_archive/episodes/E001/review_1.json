@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "project_id": "kingdom_archive",
+  "world_version": "1.0",
+  "episode_id": "E001",
+  "source": {
+    "batch_id": "KA_20260712_001",
+    "pitch_id": "P001",
+    "script_artifact": "script_draft.md"
+  },
+  "review_round": 1,
+  "verdict": "REWRITE_ONCE",
+  "summary": "핵심 선택, 기록보관소 프레임, 마지막 단서는 작동한다. 다만 알리바이 증거의 법정 논리가 불명확하고, 세라의 배신 설명 중 수신자까지 바꾼 듯한 문장이 기존 갈등과 충돌한다. 반복 심문을 압축하고 인물별 화법을 분리한 한 차례 재작성이 필요하다.",
+  "scores": {
+    "standalone_story": 8,
+    "protagonist_choice": 9,
+    "human_stakes": 7,
+    "dialogue_distinction": 6,
+    "pacing": 7,
+    "world_consistency": 7,
+    "archive_identity": 9,
+    "production_feasibility": 9
+  },
+  "strengths_to_preserve": [
+    "세라가 자신의 무죄 증거 제출을 직접 막는 장면 5의 선택",
+    "독살과 왕명 배반을 역사 기록이 의도적으로 합치는 결말",
+    "도려낸 제47면과 상충하는 증거물 제9호 기록",
+    "북부 수신자와 명령 내용을 공개하지 않는 절제",
+    "두 장소와 네 발화 인물로 제한된 제작 규모"
+  ],
+  "required_revisions": [
+    {
+      "id": "RR01",
+      "severity": "HIGH",
+      "problem": "북문 장부가 이미 세라의 위치를 보여주는 것처럼 쓰여 있어, 왜 이름과 수신지를 밝혀야만 알리바이가 성립하는지 불명확하다.",
+      "required_change": "제출된 사본에는 정확한 시각과 신원 인증 정보가 없고, 원본의 전령 서명과 수신 확인이 있어야 알리바이가 법적 증거가 된다고 명확히 한다."
+    },
+    {
+      "id": "RR02",
+      "severity": "HIGH",
+      "problem": "세라가 '왕이 명한 사람도, 왕이 명한 길도 아니었다'고 말해 왕이 살리려던 수신자를 보호한다는 앞선 설명과 충돌한다.",
+      "required_change": "수신자는 바꾸지 않은 채 수신자 명부를 없애고, 왕이 지정한 전령과 공식 경로를 바꾼 것으로 정리한다."
+    },
+    {
+      "id": "RR03",
+      "severity": "MEDIUM",
+      "problem": "장면 2, 4, 5에서 수신자와 전령 이름을 반복해서 묻는 구조가 긴장을 분산시킨다.",
+      "required_change": "장면 2에서는 거래 조건을, 장면 4에서는 왕실과 교단의 정치적 이용을, 장면 5에서는 최종 선택만 담당하도록 기능을 분리한다."
+    },
+    {
+      "id": "RR04",
+      "severity": "MEDIUM",
+      "problem": "네 인물 모두 완성된 경구를 주고받아 화법이 비슷하게 들린다.",
+      "required_change": "베른은 짧고 법률적인 문장, 로엔은 제도와 교단을 의식한 절제된 문장, 탈렌은 평범하고 직접적인 질문, 세라는 짧고 방어적인 답변을 사용한다."
+    },
+    {
+      "id": "RR05",
+      "severity": "LOW",
+      "problem": "세라가 보호하는 대상이 너무 추상적이라 선택의 감정적 무게가 약해질 수 있다.",
+      "required_change": "수신자 정체는 숨기되, 명부가 한 사람만이 아니라 전령·은신처·연락책 전체를 노출한다는 구체적 결과를 탈렌과의 대화에서 보여준다."
+    }
+  ],
+  "continuity_constraints": [
+    "왕과 왕국의 고유 이름을 정하지 않는다.",
+    "왕의 정확한 사인과 독살범을 확정하지 않는다.",
+    "봉인명령의 수신자와 전체 내용을 공개하지 않는다.",
+    "세라의 초자연 능력 보유 여부를 확정하지 않는다.",
+    "중심 미스터리의 직접 해답을 제시하지 않는다.",
+    "새 인물·장소·유물을 ledger에 반영하지 않는다."
+  ],
+  "next_allowed_artifact": "script_revised.md",
+  "canon_effect": "NONE"
+}

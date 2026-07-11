@@ -63,3 +63,7 @@ G1 완료 뒤 `arc pitch import`는 world version과 ledger 참조를 검증한 
 ## 실제 story gate·대본 intake
 
 `arc episode script-import E001 --gate <json> --script <markdown>`은 PASS story gate의 identity·필수 check·directive ID와 대본의 최소 장면·발화자 계약을 검증한다. 성공 시 원본을 `story_gate.json`과 `script_draft.md`로 보존하고 `OUTLINE_READY → SCRIPT_DRAFT` 전이를 적용한다. ledger와 review 이후 산출물은 변경하지 않는다.
+
+## 실제 1차 리뷰·단일 수정 intake
+
+`arc episode rewrite-import E001 --review <json> --script <markdown>`은 `REWRITE_ONCE` 리뷰의 RR01~RR05와 수정 대본의 반영 표식을 검증한다. 성공 시 `review_1.json`과 `script_revised.md`를 보존하고 내부적으로 `SCRIPT_DRAFT → REVIEW_1 → REVISED` 전이를 검증한다. ledger와 2차 리뷰 이후 산출물은 변경하지 않는다.
