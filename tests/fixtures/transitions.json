@@ -1,0 +1,24 @@
+{
+  "allowed": [
+    {"from": "PITCHED", "to": "SELECTED", "approvals": ["G2_EPISODE_SELECTION"]},
+    {"from": "PITCHED", "to": "REJECTED", "approvals": ["G2_EPISODE_SELECTION"]},
+    {"from": "SELECTED", "to": "OUTLINE_READY", "approvals": []},
+    {"from": "OUTLINE_READY", "to": "SCRIPT_DRAFT", "approvals": []},
+    {"from": "SCRIPT_DRAFT", "to": "REVIEW_1", "approvals": []},
+    {"from": "REVIEW_1", "to": "REVISED", "approvals": []},
+    {"from": "REVIEW_1", "to": "CONTINUITY_CHECKED", "approvals": []},
+    {"from": "REVIEW_1", "to": "HOLD", "approvals": []},
+    {"from": "REVISED", "to": "REVIEW_2", "approvals": []},
+    {"from": "REVIEW_2", "to": "CONTINUITY_CHECKED", "approvals": []},
+    {"from": "REVIEW_2", "to": "HOLD", "approvals": []},
+    {"from": "CONTINUITY_CHECKED", "to": "AWAITING_APPROVAL", "approvals": []},
+    {"from": "CONTINUITY_CHECKED", "to": "HOLD", "approvals": []},
+    {"from": "AWAITING_APPROVAL", "to": "PRODUCTION_READY", "approvals": ["G3_FINAL_SCRIPT_PRODUCTION"]},
+    {"from": "AWAITING_APPROVAL", "to": "HOLD", "approvals": []},
+    {"from": "AWAITING_APPROVAL", "to": "REJECTED", "approvals": []},
+    {"from": "PRODUCTION_READY", "to": "PUBLISHED", "approvals": ["G4_PUBLICATION_AND_CANON"]},
+    {"from": "PUBLISHED", "to": "CANON_UPDATED", "approvals": ["G4_PUBLICATION_AND_CANON"]},
+    {"from": "HOLD", "to": "SELECTED", "approvals": []},
+    {"from": "HOLD", "to": "REJECTED", "approvals": []}
+  ]
+}

@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "arc"
+version = "0.1.0"
+description = "ARC V0 episode workflow skeleton"
+requires-python = ">=3.11"
+
+[project.scripts]
+arc = "arc.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["arc*"]
