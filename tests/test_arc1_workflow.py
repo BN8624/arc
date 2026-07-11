@@ -24,8 +24,8 @@ class Arc1WorkflowTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def create_and_open_gates(self, scenario="pass"):
-        create_episode(self.project, "E001", scenario)
         self.assertTrue(approve(self.project, None, ApprovalGate.G1_WORLD_CORE))
+        create_episode(self.project, "E001", scenario)
         self.assertTrue(approve(self.project, "E001", ApprovalGate.G2_EPISODE_SELECTION))
 
     def finish_to_ready(self, scenario="pass"):
@@ -97,16 +97,16 @@ class Arc1WorkflowTests(unittest.TestCase):
             self.assertEqual(json.loads((episode / "episode.json").read_text(encoding="utf-8"))["state"], "REVIEW_2")
 
     def test_g1_g2_and_g3_are_required(self):
+        with self.assertRaisesRegex(ValidationError, "G1"):
+            create_episode(self.project, "E001", "pass")
+        self.assertTrue(approve(self.project, None, ApprovalGate.G1_WORLD_CORE))
         create_episode(self.project, "E001", "pass")
         self.assertTrue(approve(self.project, "E001", ApprovalGate.G2_EPISODE_SELECTION))
-        with self.assertRaisesRegex(ValidationError, "G1"):
-            advance(self.project, "E001")
-        self.assertTrue(approve(self.project, None, ApprovalGate.G1_WORLD_CORE))
         with tempfile.TemporaryDirectory() as other:
             project = Path(other) / "kingdom_archive"
             initialise_project(project)
-            create_episode(project, "E001", "pass")
             approve(project, None, ApprovalGate.G1_WORLD_CORE)
+            create_episode(project, "E001", "pass")
             with self.assertRaisesRegex(ValidationError, "G2"):
                 advance(project, "E001")
         state, _ = run_until_blocked(self.project, "E001")
@@ -135,22 +135,23 @@ class Arc1WorkflowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as other:
             project = Path(other) / "kingdom_archive"
             initialise_project(project)
-            create_episode(project, "E001", "hard")
             approve(project, None, ApprovalGate.G1_WORLD_CORE)
+            create_episode(project, "E001", "hard")
             approve(project, "E001", ApprovalGate.G2_EPISODE_SELECTION)
             state, _ = run_until_blocked(project, "E001")
             self.assertEqual(state, EpisodeState.HOLD)
 
     def test_approval_is_idempotent_and_create_never_overwrites(self):
-        create_episode(self.project, "E001", "pass")
         self.assertTrue(approve(self.project, None, ApprovalGate.G1_WORLD_CORE))
         self.assertFalse(approve(self.project, None, ApprovalGate.G1_WORLD_CORE))
+        create_episode(self.project, "E001", "pass")
         with self.assertRaisesRegex(ValidationError, "already exists"):
             create_episode(self.project, "E001", "pass")
 
     def test_status_reports_block_reason_without_mutating(self):
+        approve(self.project, None, ApprovalGate.G1_WORLD_CORE)
         create_episode(self.project, "E001", "pass")
         state, missing, reason = status(self.project, "E001")
         self.assertEqual(state, EpisodeState.PITCHED)
         self.assertEqual(missing, [])
-        self.assertIn("G1", reason)
+        self.assertIn("G2", reason)

@@ -71,6 +71,8 @@ def _project_approvals(project_root: Path) -> set[ApprovalGate]:
 def create_episode(project_root: Path, episode_id: str, scenario: str) -> None:
     if scenario not in {"pass", "rewrite", "hold", "soft", "hard"}:
         raise ValidationError("scenario must be pass, rewrite, hold, soft, or hard")
+    if ApprovalGate.G1_WORLD_CORE not in _project_approvals(project_root):
+        raise ValidationError("G1_WORLD_CORE approval is required before episode creation")
     root = episode_directory(project_root, episode_id)
     if root.exists():
         raise ValidationError(f"episode already exists: {episode_id}")

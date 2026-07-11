@@ -24,7 +24,7 @@
 
 ## 사용자 승인
 
-- G1. WORLD_CORE 승인. `validate_world_core_finalisation`은 이 승인 없이 WORLD_CORE 확정을 거부한다.
+- G1. WORLD_CORE 승인. `kingdom_archive` World Version 1.0은 사용자 승인으로 완료됐으며, `arc status`는 `WORLD_READY`를 표시한다. 다른 프로젝트의 G1 계약은 그대로 사용자 승인을 요구한다.
 - G2. 에피소드 후보 선택 또는 폐기.
 - G3. 최종 대본 제작 승인.
 - G4. 실제 콘텐츠 공개 및 canon 반영 승인.

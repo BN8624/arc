@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 
 from .artifacts import episode_directory, missing_artifacts
-from .project import initialise_project
+from .project import initialise_project, world_readiness
 from .states import ApprovalGate, EpisodeState, TRANSITIONS
 from .validation import ValidationError
 from .workflow import advance, approve, create_episode, run_until_blocked, status as episode_status
@@ -33,6 +33,12 @@ def command_status(args: argparse.Namespace) -> int:
     if not (project_root / "project.json").exists():
         print(f"project not initialized: {project_root}")
         return 1
+    ready, detail = world_readiness(project_root)
+    if ready:
+        print(f"world: WORLD_READY (v{detail})")
+        print("world next allowed work: episode workflow")
+    else:
+        print(f"world: WORLD_CORE_PENDING ({detail})")
     episode_files = sorted(episodes_root.glob("*/episode.json"))
     if not episode_files:
         print("current state: no episodes")

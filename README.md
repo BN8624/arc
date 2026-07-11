@@ -1,6 +1,6 @@
 # arc
 
-`arc`는 V0 에피소드 제작 워크플로우의 상태·산출물·승인 계약을 검증하는 Python 골격입니다. 모델 호출, 창작 생성, 미디어 제작, 웹 UI, 데이터베이스는 포함하지 않습니다.
+`arc`는 멸망 후 137년의 기록보관소가 공개하는 다크 판타지 역사 미스터리 앤솔러지의 V0 워크플로우 골격입니다. 모델 호출, 창작 생성, 미디어 제작, 웹 UI, 데이터베이스는 포함하지 않습니다.
 
 ## 사용법
 
@@ -28,8 +28,8 @@ python -m unittest discover -s tests -v
 
 ```bash
 arc init
-arc episode create E001 --scenario pass
 arc approve G1_WORLD_CORE
+arc episode create E001 --scenario pass
 arc approve E001 G2_EPISODE_SELECTION
 arc episode run E001
 arc approve E001 G3_FINAL_SCRIPT_PRODUCTION

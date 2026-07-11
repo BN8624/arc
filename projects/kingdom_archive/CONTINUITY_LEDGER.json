@@ -1,4 +1,20 @@
 {
   "schema_version": 1,
-  "facts": []
+  "world_version": "1.0",
+  "entities": {
+    "people": [],
+    "places": [],
+    "factions": [],
+    "artifacts": []
+  },
+  "events": [
+    {"id": "EV_FOUNDING", "name": "왕국의 건국", "status": "CANON", "date": null, "details": "OPEN"},
+    {"id": "EV_SILENCE", "name": "신들이 침묵한 날", "status": "CANON", "date": null, "details": "OPEN"},
+    {"id": "EV_SCHISM", "name": "왕실과 교단의 대분열", "status": "CANON", "date": null, "details": "OPEN"},
+    {"id": "EV_FALL", "name": "왕국의 멸망", "status": "CANON", "date": null, "details": "OPEN"}
+  ],
+  "claims": [
+    {"id": "CL_ARCHIVE_137", "subject": "archive_frame", "statement": "기록 공개 시점은 왕국 멸망 후 137년이다.", "status": "CANON"},
+    {"id": "CL_SELF_ERASURE", "subject": "kingdom_fall", "statement": "왕국이 스스로 역사에서 사라지기를 선택했을 가능성이 있다.", "status": "OPEN"}
+  ]
 }

@@ -4,5 +4,11 @@
   "world_core_gate": "G1_WORLD_CORE",
   "approvals": [
     "G1_WORLD_CORE"
-  ]
+  ],
+  "world_version": "1.0",
+  "world_core_approval": {
+    "approved_by": "user",
+    "approved_at": "2026-07-12T02:55:10+09:00",
+    "world_version": "1.0"
+  }
 }
