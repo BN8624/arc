@@ -13,6 +13,13 @@ def _json(path):
 def _hash(path): return hashlib.sha256(path.read_bytes()).hexdigest()
 def import_production(project,episode,packet):
     root=project/"episodes"/episode; mp=root/"episode.json"; manifest=_json(mp)
+    if manifest.get("state")=="PRODUCTION_READY" and "G3_FINAL_SCRIPT_PRODUCTION" in manifest.get("approvals",[]) and (root/"production_packet").exists():
+        with zipfile.ZipFile(packet) as archive:
+            names=archive.namelist()
+            if set(names)!={ROOT+name for name in ALLOWED}: raise ValidationError("different production packet")
+            for name in ALLOWED:
+                if _hash(root/"production_packet"/name)!=hashlib.sha256(archive.read(ROOT+name)).hexdigest(): raise ValidationError("different production packet")
+        return False
     if manifest.get("state")!="AWAITING_APPROVAL" or "G3_FINAL_SCRIPT_PRODUCTION" in manifest.get("approvals",[]): raise ValidationError("production import requires unapproved AWAITING_APPROVAL")
     temp=Path(tempfile.mkdtemp(prefix=".packet-",dir=root))
     try:
