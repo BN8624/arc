@@ -129,14 +129,14 @@ def _transition(root: Path, manifest: dict, target: EpisodeState) -> None:
     _save_episode(root, manifest)
 
 
-def _require_current_artifacts(root: Path, state: EpisodeState) -> None:
+def _require_current_artifacts(root: Path, state: EpisodeState, episode_id: str) -> None:
     missing = missing_artifacts(root, state)
     if missing:
         raise ValidationError(f"missing required artifacts: {', '.join(missing)}")
     for item in (root / name for name in required_artifacts(state) if name.endswith(".json")):
         value = _read_json(item)
-        if item.name != "episode.json" and (value.get("project_id") != PROJECT_ID or value.get("episode_id") is None):
-            raise ValidationError(f"artifact project ID or episode ID mismatch: {item.name}")
+        if item.name != "episode.json" and (value.get("project_id") != PROJECT_ID or value.get("episode_id") != episode_id):
+            raise ValidationError(f"artifact identity mismatch: {item.name}")
 
 
 def advance(project_root: Path, episode_id: str) -> EpisodeState:
@@ -144,7 +144,7 @@ def advance(project_root: Path, episode_id: str) -> EpisodeState:
     state = EpisodeState(manifest["state"])
     if state is EpisodeState.HOLD:
         raise ValidationError("HOLD episodes cannot advance automatically")
-    _require_current_artifacts(root, state)
+    _require_current_artifacts(root, state, manifest["episode_id"])
     scenario = manifest["scenario"]
     if state is EpisodeState.PITCHED:
         if ApprovalGate.G1_WORLD_CORE not in _project_approvals(project_root):
@@ -184,11 +184,14 @@ def advance(project_root: Path, episode_id: str) -> EpisodeState:
         _copy_fixture(review, root / "review_2.json")
         _transition(root, manifest, EpisodeState.REVIEW_2)
     elif state is EpisodeState.REVIEW_2:
-        if _read_json(root / "review_2.json").get("decision") == "PASS":
+        decision = _read_json(root / "review_2.json").get("decision")
+        if decision == "PASS":
             _copy_fixture("continuity_clear.json", root / "continuity_check.json")
             _transition(root, manifest, EpisodeState.CONTINUITY_CHECKED)
-        else:
+        elif decision == "FAIL":
             _transition(root, manifest, EpisodeState.HOLD)
+        else:
+            raise ValidationError("review_2 decision must be PASS or FAIL")
     elif state is EpisodeState.CONTINUITY_CHECKED:
         decision = _read_json(root / "continuity_check.json").get("result")
         if decision in {"CLEAR", "SOFT_CONFLICT"}:

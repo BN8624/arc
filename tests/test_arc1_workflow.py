@@ -39,6 +39,12 @@ class Arc1WorkflowTests(unittest.TestCase):
         self.assertIsNone(reason)
         return self.project / "episodes" / "E001"
 
+    def advance_to_review_2(self, scenario="rewrite"):
+        self.create_and_open_gates(scenario)
+        for _ in range(6):
+            advance(self.project, "E001")
+        return self.project / "episodes" / "E001"
+
     def test_direct_pass_path_creates_only_reached_artifacts_and_preserves_ledger(self):
         episode = self.finish_to_ready("pass")
         self.assertTrue((episode / "production_packet" / "manifest.json").exists())
@@ -52,12 +58,43 @@ class Arc1WorkflowTests(unittest.TestCase):
         self.assertTrue((episode / "review_2.json").exists())
 
     def test_second_review_failure_holds_and_cannot_continue(self):
-        self.create_and_open_gates("hold")
-        state, reason = run_until_blocked(self.project, "E001")
-        self.assertEqual(state, EpisodeState.HOLD)
-        self.assertIsNone(reason)
+        episode = self.advance_to_review_2("hold")
+        self.assertEqual(advance(self.project, "E001"), EpisodeState.HOLD)
+        self.assertEqual(json.loads((episode / "episode.json").read_text(encoding="utf-8"))["state"], "HOLD")
         with self.assertRaises(ValidationError):
             advance(self.project, "E001")
+
+    def test_artifact_episode_and_project_identity_mismatch_are_rejected_without_transition(self):
+        self.create_and_open_gates()
+        advance(self.project, "E001")
+        episode = self.project / "episodes" / "E001"
+        selection = episode / "selection.json"
+        data = json.loads(selection.read_text(encoding="utf-8"))
+        data["episode_id"] = "E999"
+        selection.write_text(json.dumps(data), encoding="utf-8")
+        with self.assertRaisesRegex(ValidationError, "identity mismatch"):
+            advance(self.project, "E001")
+        self.assertEqual(json.loads((episode / "episode.json").read_text(encoding="utf-8"))["state"], "SELECTED")
+        data["episode_id"] = "E001"
+        data["project_id"] = "other_project"
+        selection.write_text(json.dumps(data), encoding="utf-8")
+        with self.assertRaisesRegex(ValidationError, "identity mismatch"):
+            advance(self.project, "E001")
+        self.assertEqual(json.loads((episode / "episode.json").read_text(encoding="utf-8"))["state"], "SELECTED")
+
+    def test_review_2_rejects_unknown_or_missing_decision_without_changing_state(self):
+        episode = self.advance_to_review_2()
+        review = episode / "review_2.json"
+        for decision in ("UNKNOWN", None):
+            data = json.loads(review.read_text(encoding="utf-8"))
+            if decision is None:
+                data.pop("decision")
+            else:
+                data["decision"] = decision
+            review.write_text(json.dumps(data), encoding="utf-8")
+            with self.assertRaisesRegex(ValidationError, "review_2 decision"):
+                advance(self.project, "E001")
+            self.assertEqual(json.loads((episode / "episode.json").read_text(encoding="utf-8"))["state"], "REVIEW_2")
 
     def test_g1_g2_and_g3_are_required(self):
         create_episode(self.project, "E001", "pass")
