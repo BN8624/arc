@@ -3,7 +3,7 @@
 import json
 from pathlib import Path
 
-PROJECT_MANIFEST = {"schema_version": 1, "project": "kingdom_archive", "world_core_gate": "G1_WORLD_CORE"}
+PROJECT_MANIFEST = {"schema_version": 1, "project": "kingdom_archive", "world_core_gate": "G1_WORLD_CORE", "approvals": []}
 SERIES_STATE = {"schema_version": 1, "episodes": {}}
 CONTINUITY_LEDGER = {"schema_version": 1, "facts": []}
 

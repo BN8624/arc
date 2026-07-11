@@ -38,3 +38,16 @@
 ## 산출물 계약
 
 에피소드 디렉터리는 `projects/<project>/episodes/<episode-id>/`이며, 상태별 필요 파일은 `arc.artifacts.STATE_ARTIFACTS`가 정의한다. `arc status`는 현재 상태, 누락 파일, 다음 허용 상태를 표시한다.
+
+## ARC-1 E001 fixture 수직 흐름
+
+`tests/fixtures/arc1/`은 《왕국 기록보관소》의 짧은 결정론적 입력이다. `arc episode create E001 --scenario <pass|rewrite|hold|soft|hard>`는 fixture를 작업 산출물과 구분된 `projects/kingdom_archive/episodes/E001/`에 복사해 시작한다.
+
+- PASS. G1, G2 뒤 `REVIEW_1 PASS`, `CONTINUITY_CHECKED(CLEAR)`, G3를 거쳐 `PRODUCTION_READY`에 도달한다.
+- REWRITE. `REVIEW_1 REWRITE` 뒤 한 번만 `REVISED → REVIEW_2 PASS`를 허용한다.
+- HOLD. 두 번째 리뷰 FAIL 또는 HARD_CONFLICT는 `HOLD`가 되며 자동 진행하지 않는다.
+- SOFT_CONFLICT. `continuity_check.json`의 충돌 근거를 보존한 채 `AWAITING_APPROVAL`로 진행한다.
+
+`arc approve G1_WORLD_CORE`, `arc approve E001 G2_EPISODE_SELECTION`, `arc approve E001 G3_FINAL_SCRIPT_PRODUCTION`으로만 승인 기록을 만든다. 같은 승인은 안전하게 재실행되어 `already recorded`를 반환한다. `arc episode advance E001`은 한 단계, `arc episode run E001`은 승인 또는 차단 지점까지 진행하고, `arc episode status E001`은 상태·누락 산출물·차단 이유를 표시한다.
+
+canon delta는 `canon_delta.json` 후보로만 생성한다. ARC-1은 ledger를 수정하지 않는다.

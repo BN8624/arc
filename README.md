@@ -21,3 +21,20 @@ python -m unittest discover -s tests -v
 - 프로젝트 초기화와 상태 조회 CLI.
 
 상세한 단일 정본은 [ARC_V0_WORKFLOW.md](docs/ARC_V0_WORKFLOW.md)입니다.
+
+## E001 fixture 실행
+
+아래는 결정론적 fixture로 직접 PASS 경로를 `PRODUCTION_READY`까지 진행한다.
+
+```bash
+arc init
+arc episode create E001 --scenario pass
+arc approve G1_WORLD_CORE
+arc approve E001 G2_EPISODE_SELECTION
+arc episode run E001
+arc approve E001 G3_FINAL_SCRIPT_PRODUCTION
+arc episode run E001
+arc episode status E001
+```
+
+`--scenario rewrite`, `hold`, `soft`, `hard`는 각각 한 번 재작성, 두 번째 리뷰 실패, soft conflict, hard conflict 경로를 검증한다. `arc episode run`은 승인 또는 HOLD에서 멈추며, 기존 산출물을 덮어쓰지 않는다.
