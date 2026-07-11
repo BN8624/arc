@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "project_id": "kingdom_archive",
+  "world_version": "1.0",
+  "episode_id": "E001",
+  "source": {
+    "batch_id": "KA_20260712_001",
+    "pitch_id": "P001",
+    "script_artifact": "script_revised.md",
+    "script_sha256": "78183c1c6436b4897d837f45fd9da1a482a5230cb8243a0c519c65b78bfa6362"
+  },
+  "review_round": 2,
+  "verdict": "PASS",
+  "summary": "1차 리뷰의 RR01~RR05가 모두 반영되었다. 알리바이 증거의 법적 구조가 명확해졌고, 세라의 배신은 수신자 변경이 아니라 명부 폐기·전령 변경·공식 경로 이탈로 정리되었다. 반복 심문은 장면별 기능이 분리됐으며 네 인물의 화법도 구분된다. 추가 전면 재작성 없이 연속성 최종 검사로 진행할 수 있다.",
+  "checks": {
+    "RR01_evidence_logic": {
+      "result": "PASS",
+      "evidence": "제출 사본에는 정확한 시각·전령 서명·수신 확인란이 없어 원본과 신원 확인이 필요하다고 명시됐다."
+    },
+    "RR02_receiver_consistency": {
+      "result": "PASS",
+      "evidence": "세라는 수신자 변경을 확정하지 않고 수신자 명부 폐기, 지정 전령 미사용, 공식 경로 이탈만 인정한다."
+    },
+    "RR03_scene_function": {
+      "result": "PASS",
+      "evidence": "장면 2는 증거 거래, 장면 4는 왕실·교단의 권력 충돌, 장면 5는 최종 선택을 담당한다."
+    },
+    "RR04_voice_distinction": {
+      "result": "PASS",
+      "evidence": "베른은 법률적 단문, 로엔은 제도적 문장, 탈렌은 직접 질문, 세라는 짧고 방어적인 답변을 사용한다."
+    },
+    "RR05_human_stakes": {
+      "result": "PASS",
+      "evidence": "명부 공개가 전령·연락책·은신처와 무고할 수도 있는 사람들까지 노출한다는 결과가 구체화됐다."
+    },
+    "standalone_story": {
+      "result": "PASS",
+      "evidence": "세라가 자신을 구할 원본 공개를 직접 막고 배신자로 사형 판결을 받는 독립 재판극으로 완결된다."
+    },
+    "archive_identity": {
+      "result": "PASS",
+      "evidence": "도려낸 제47면, 상충하는 증거물 제9호 기록, 후대 복원 자막이 기록보관소 형식을 유지한다."
+    },
+    "central_mystery_protection": {
+      "result": "PASS",
+      "evidence": "북부 수신자·명령 내용·왕의 사인·독살범은 공개되지 않는다."
+    },
+    "production_feasibility": {
+      "result": "PASS",
+      "evidence": "발화 인물 4명, 주요 장소 2곳, 문서 클로즈업 중심으로 5~8분 제작 범위에 맞는다."
+    }
+  },
+  "strengths_to_preserve": [
+    "세라가 원본 전령대장 공개를 직접 막는 선택",
+    "독살과 왕명 배반을 공식 판결이 하나의 자백으로 축약하는 왜곡",
+    "세라가 보호하는 대상의 선악을 확정하지 않는 도덕적 모호성",
+    "제47면과 증거물 제9호의 상충 기록",
+    "마지막 단서를 북쪽으로 향한 명령의 흔적까지만 제한한 결말"
+  ],
+  "blocking_issues": [],
+  "next_allowed_artifact": "continuity_check.json",
+  "canon_effect": "NONE"
+}

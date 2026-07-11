@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "project_id": "kingdom_archive",
+  "world_version": "1.0",
+  "episode_id": "E001",
+  "source": {
+    "batch_id": "KA_20260712_001",
+    "pitch_id": "P001",
+    "script_artifact": "script_revised.md",
+    "script_sha256": "78183c1c6436b4897d837f45fd9da1a482a5230cb8243a0c519c65b78bfa6362",
+    "continuity_plan_artifact": "continuity_plan.json"
+  },
+  "verdict": "SOFT_CONFLICT",
+  "can_advance": true,
+  "summary": "기존 WORLD_CORE와 ledger의 확정 사실을 침해하는 HARD_CONFLICT는 없다. 공식 판결문은 세라가 독살과 왕명 배반을 모두 자백했다고 기록하지만, 살아남은 대본 기록에서는 왕명 배반만 명시적으로 인정한다. 또한 증거물 제9호의 소각 기록과 북부 별고 이관 기록이 충돌한다. 두 모순은 기록보관소 형식의 의도된 역사적 논쟁으로 보존한다.",
+  "checks": {
+    "world_version_match": "PASS",
+    "episode_identity_match": "PASS",
+    "approved_world_refs_only": "PASS",
+    "unknown_exact_year_not_introduced": "PASS",
+    "kingdom_and_king_name_remain_open": "PASS",
+    "receiver_identity_remains_open": "PASS",
+    "sealed_order_content_remains_open": "PASS",
+    "king_death_cause_remains_open": "PASS",
+    "supernatural_truth_remains_open": "PASS",
+    "central_mystery_not_answered": "PASS",
+    "draft_entities_not_in_ledger": "PASS",
+    "production_constraints_respected": "PASS"
+  },
+  "soft_conflicts": [
+    {
+      "id": "SC01",
+      "subject": "official_verdict_vs_surviving_transcript",
+      "description": "판결문은 세라가 독살과 왕명 배반을 자백했다고 기록하지만, 대본에서 세라는 독살을 반복해서 부인하고 왕명 배반만 인정한다.",
+      "treatment": "CONTESTED",
+      "preserve": true
+    },
+    {
+      "id": "SC02",
+      "subject": "artifact_9_disposition",
+      "description": "증거물 제9호가 소각됐다는 기록과 북부 별고로 이관됐다는 기록이 동시에 존재한다.",
+      "treatment": "CONTESTED",
+      "preserve": true
+    }
+  ],
+  "hard_conflicts": [],
+  "provisional_claims": [
+    {
+      "type": "CLAIM",
+      "summary": "왕이 죽기 직전 북부의 익명 수신자에게 검은 인장의 명령을 보냈다는 재판 기록이 존재한다.",
+      "intended_status": "CONTESTED",
+      "apply_to_ledger_now": false
+    }
+  ],
+  "next_allowed_artifact": "script_final.md",
+  "canon_effect": "NONE"
+}

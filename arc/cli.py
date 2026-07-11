@@ -9,6 +9,7 @@ from .project import initialise_project, world_readiness
 from .outline import import_outline
 from .script import import_script
 from .rewrite import import_rewrite
+from .finalize import import_final
 from .pitches import import_pitch_set, list_pitches, select_pitch
 from .states import ApprovalGate, EpisodeState, TRANSITIONS
 from .validation import ValidationError
@@ -105,6 +106,9 @@ def command_episode_rewrite_import(args: argparse.Namespace) -> int:
     print("rewrite imported" if changed else "rewrite already imported")
     return 0
 
+def command_episode_finalize_import(args: argparse.Namespace) -> int:
+    changed=import_final(Path(args.path),args.episode_id,Path(args.review),Path(args.continuity),Path(args.script)); print("final review imported" if changed else "final review already imported"); return 0
+
 
 def command_approve(args: argparse.Namespace) -> int:
     if len(args.items) == 1:
@@ -191,6 +195,8 @@ def build_parser() -> argparse.ArgumentParser:
     rewrite_import_parser.add_argument("--script", required=True)
     rewrite_import_parser.add_argument("--path", default=default_project_root())
     rewrite_import_parser.set_defaults(func=command_episode_rewrite_import)
+    final_import_parser=episode_subparsers.add_parser("finalize-import",help="import final review, continuity, and final script")
+    final_import_parser.add_argument("episode_id"); final_import_parser.add_argument("--review",required=True); final_import_parser.add_argument("--continuity",required=True); final_import_parser.add_argument("--script",required=True); final_import_parser.add_argument("--path",default=default_project_root()); final_import_parser.set_defaults(func=command_episode_finalize_import)
     pitch_parser = subparsers.add_parser("pitch", help="import and select external pitch batches")
     pitch_subparsers = pitch_parser.add_subparsers(dest="pitch_command", required=True)
     pitch_import_parser = pitch_subparsers.add_parser("import", help="validate and import a pitch set")
