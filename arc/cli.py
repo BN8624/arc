@@ -6,6 +6,7 @@ from pathlib import Path
 
 from .artifacts import episode_directory, missing_artifacts
 from .project import initialise_project, world_readiness
+from .pitches import import_pitch_set, list_pitches, select_pitch
 from .states import ApprovalGate, EpisodeState, TRANSITIONS
 from .validation import ValidationError
 from .workflow import advance, approve, create_episode, run_until_blocked, status as episode_status
@@ -97,6 +98,28 @@ def command_approve(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_pitch_import(args: argparse.Namespace) -> int:
+    warnings = import_pitch_set(Path(args.path), Path(args.json_path))
+    print(f"imported pitch batch with {len(warnings)} warnings")
+    return 0
+
+
+def command_pitch_list(args: argparse.Namespace) -> int:
+    for index, item in enumerate(list_pitches(Path(args.path), args.batch_id), 1):
+        pitch = item["candidate"]
+        print(f"{index}. {pitch['working_title']} - {pitch['logline']}")
+        print(f"   {pitch['era_anchor']} | {pitch['record_form']} | {pitch['protagonist']} | {pitch['human_conflict']}")
+        print(f"   history: {pitch['history_contribution']['summary']}")
+        for warning in item["warnings"]: print(f"   warning: {warning}")
+    return 0
+
+
+def command_pitch_select(args: argparse.Namespace) -> int:
+    changed = select_pitch(Path(args.path), args.batch_id, args.pitch_id, args.episode)
+    print("selected" if changed else "already selected")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="arc")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -129,6 +152,22 @@ def build_parser() -> argparse.ArgumentParser:
     episode_status_parser.add_argument("episode_id")
     episode_status_parser.add_argument("--path", default=default_project_root())
     episode_status_parser.set_defaults(func=command_episode_status)
+    pitch_parser = subparsers.add_parser("pitch", help="import and select external pitch batches")
+    pitch_subparsers = pitch_parser.add_subparsers(dest="pitch_command", required=True)
+    pitch_import_parser = pitch_subparsers.add_parser("import", help="validate and import a pitch set")
+    pitch_import_parser.add_argument("json_path")
+    pitch_import_parser.add_argument("--path", default=default_project_root())
+    pitch_import_parser.set_defaults(func=command_pitch_import)
+    pitch_list_parser = pitch_subparsers.add_parser("list", help="list imported pitches")
+    pitch_list_parser.add_argument("batch_id", nargs="?")
+    pitch_list_parser.add_argument("--path", default=default_project_root())
+    pitch_list_parser.set_defaults(func=command_pitch_list)
+    pitch_select_parser = pitch_subparsers.add_parser("select", help="record a user pitch selection")
+    pitch_select_parser.add_argument("batch_id")
+    pitch_select_parser.add_argument("pitch_id")
+    pitch_select_parser.add_argument("--episode", required=True)
+    pitch_select_parser.add_argument("--path", default=default_project_root())
+    pitch_select_parser.set_defaults(func=command_pitch_select)
     return parser
 
 

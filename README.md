@@ -38,3 +38,15 @@ arc episode status E001
 ```
 
 `--scenario rewrite`, `hold`, `soft`, `hard`는 각각 한 번 재작성, 두 번째 리뷰 실패, soft conflict, hard conflict 경로를 검증한다. `arc episode run`은 승인 또는 HOLD에서 멈추며, 기존 산출물을 덮어쓰지 않는다.
+
+## 외부 pitch batch
+
+외부에서 사람이 작성한 5개 후보 JSON을 검증·가져온 뒤 사용자가 하나를 고른다.
+
+```bash
+arc pitch import /path/to/pitch_set.json
+arc pitch list <batch-id>
+arc pitch select <batch-id> <pitch-id> --episode E001
+```
+
+import와 selection은 ledger를 변경하지 않는다. 후보의 이름과 설정은 DRAFT이며, 실제 첫 후보는 ARC 밖에서 작성해 가져온다.
