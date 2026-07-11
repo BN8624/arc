@@ -2,7 +2,7 @@
   "schema_version": 1,
   "project_id": "kingdom_archive",
   "episode_id": "E001",
-  "state": "SELECTED",
+  "state": "OUTLINE_READY",
   "scenario": "external",
   "approvals": [
     "G2_EPISODE_SELECTION"

@@ -50,3 +50,13 @@ arc pitch select <batch-id> <pitch-id> --episode E001
 ```
 
 import와 selection은 ledger를 변경하지 않는다. 후보의 이름과 설정은 DRAFT이며, 실제 첫 후보는 ARC 밖에서 작성해 가져온다.
+
+## 실제 outline import
+
+선택된 실제 에피소드에는 외부 continuity plan과 outline을 함께 가져온다.
+
+```bash
+arc episode outline-import E001 --plan /path/to/E001_continuity_plan.json --outline /path/to/E001_outline.md
+```
+
+명령은 `SELECTED` 상태와 batch·pitch identity를 검증하고, 두 원본을 그대로 저장한 뒤 `OUTLINE_READY`로 전환한다.

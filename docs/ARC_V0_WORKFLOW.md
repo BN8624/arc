@@ -55,3 +55,7 @@ canon delta는 `canon_delta.json` 후보로만 생성한다. ARC-1은 ledger를 
 ## ARC-3 G2 pitch 선택
 
 G1 완료 뒤 `arc pitch import`는 world version과 ledger 참조를 검증한 정확히 5개의 외부 후보 batch를 `pitches/<batch-id>/`에 보존한다. `arc pitch list`는 간결한 후보 요약과 경고를 표시하며 자동 선택하지 않는다. `arc pitch select <batch-id> <pitch-id> --episode E001`은 사용자 선택으로 G2를 기록하고 E001을 `SELECTED`로 만든다. 이 과정은 pitch source와 선택 기록만 만들며 ledger를 변경하지 않는다.
+
+## 실제 outline intake
+
+`arc episode outline-import E001 --plan <json> --outline <markdown>`은 외부 원본의 project·world·episode·batch·pitch identity, world refs, DRAFT 설정, 제작 제약과 outline의 최소 섹션을 검증한다. 성공 시 원본 바이트를 보존해 `continuity_plan.json`과 `outline.md`로 저장하고 `SELECTED → OUTLINE_READY` 전이를 적용한다. ledger와 이후 단계 산출물은 변경하지 않는다.

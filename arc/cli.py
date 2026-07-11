@@ -6,6 +6,7 @@ from pathlib import Path
 
 from .artifacts import episode_directory, missing_artifacts
 from .project import initialise_project, world_readiness
+from .outline import import_outline
 from .pitches import import_pitch_set, list_pitches, select_pitch
 from .states import ApprovalGate, EpisodeState, TRANSITIONS
 from .validation import ValidationError
@@ -85,6 +86,12 @@ def command_episode_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_episode_outline_import(args: argparse.Namespace) -> int:
+    changed = import_outline(Path(args.path), args.episode_id, Path(args.plan), Path(args.outline))
+    print("outline imported" if changed else "outline already imported")
+    return 0
+
+
 def command_approve(args: argparse.Namespace) -> int:
     if len(args.items) == 1:
         episode_id, gate_value = None, args.items[0]
@@ -152,6 +159,12 @@ def build_parser() -> argparse.ArgumentParser:
     episode_status_parser.add_argument("episode_id")
     episode_status_parser.add_argument("--path", default=default_project_root())
     episode_status_parser.set_defaults(func=command_episode_status)
+    outline_import_parser = episode_subparsers.add_parser("outline-import", help="import an external continuity plan and outline")
+    outline_import_parser.add_argument("episode_id")
+    outline_import_parser.add_argument("--plan", required=True)
+    outline_import_parser.add_argument("--outline", required=True)
+    outline_import_parser.add_argument("--path", default=default_project_root())
+    outline_import_parser.set_defaults(func=command_episode_outline_import)
     pitch_parser = subparsers.add_parser("pitch", help="import and select external pitch batches")
     pitch_subparsers = pitch_parser.add_subparsers(dest="pitch_command", required=True)
     pitch_import_parser = pitch_subparsers.add_parser("import", help="validate and import a pitch set")
