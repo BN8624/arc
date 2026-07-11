@@ -60,3 +60,11 @@ arc episode outline-import E001 --plan /path/to/E001_continuity_plan.json --outl
 ```
 
 명령은 `SELECTED` 상태와 batch·pitch identity를 검증하고, 두 원본을 그대로 저장한 뒤 `OUTLINE_READY`로 전환한다.
+
+## 실제 story gate·대본 import
+
+```bash
+arc episode script-import E001 --gate /path/to/E001_story_gate.json --script /path/to/E001_script_draft.md
+```
+
+명령은 PASS gate와 대본의 최소 계약을 검증한 뒤 두 원본을 보존하고 `SCRIPT_DRAFT`로 전환한다.

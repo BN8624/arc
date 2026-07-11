@@ -59,3 +59,7 @@ G1 완료 뒤 `arc pitch import`는 world version과 ledger 참조를 검증한 
 ## 실제 outline intake
 
 `arc episode outline-import E001 --plan <json> --outline <markdown>`은 외부 원본의 project·world·episode·batch·pitch identity, world refs, DRAFT 설정, 제작 제약과 outline의 최소 섹션을 검증한다. 성공 시 원본 바이트를 보존해 `continuity_plan.json`과 `outline.md`로 저장하고 `SELECTED → OUTLINE_READY` 전이를 적용한다. ledger와 이후 단계 산출물은 변경하지 않는다.
+
+## 실제 story gate·대본 intake
+
+`arc episode script-import E001 --gate <json> --script <markdown>`은 PASS story gate의 identity·필수 check·directive ID와 대본의 최소 장면·발화자 계약을 검증한다. 성공 시 원본을 `story_gate.json`과 `script_draft.md`로 보존하고 `OUTLINE_READY → SCRIPT_DRAFT` 전이를 적용한다. ledger와 review 이후 산출물은 변경하지 않는다.

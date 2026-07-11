@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "project_id": "kingdom_archive",
+  "world_version": "1.0",
+  "episode_id": "E001",
+  "source": {
+    "batch_id": "KA_20260712_001",
+    "pitch_id": "P001",
+    "working_title": "왕을 배신한 성녀의 재판",
+    "outline_artifact": "outline.md"
+  },
+  "verdict": "PASS",
+  "checks": {
+    "standalone_comprehension": {
+      "result": "PASS",
+      "evidence": "세라가 자신의 알리바이를 공개할지, 비밀을 지키고 유죄 판결을 받을지 선택하는 재판극으로 독립 완결된다."
+    },
+    "protagonist_choice": {
+      "result": "PASS",
+      "evidence": "탈렌이 원본 전령대장을 제출하려는 순간 세라가 직접 이를 막는다."
+    },
+    "human_conflict": {
+      "result": "PASS",
+      "evidence": "생존과 약속, 개인의 무죄와 타인의 안전이 충돌한다."
+    },
+    "ending_answers_opening_conflict": {
+      "result": "PASS",
+      "evidence": "세라는 무죄 증거를 포기하고 배신자로 기록되는 결말을 택한다."
+    },
+    "worldbuilding_not_substitute_for_story": {
+      "result": "PASS",
+      "evidence": "신들의 침묵과 대분열은 재판의 압력과 권위 갈등을 만드는 배경으로 제한된다."
+    },
+    "central_mystery_protection": {
+      "result": "PASS",
+      "evidence": "북부 수신자와 명령 내용은 공개하지 않고 존재 가능성만 CONTESTED claim으로 남긴다."
+    },
+    "production_feasibility": {
+      "result": "PASS",
+      "evidence": "주요 장소 2곳, 발화 인물 4명, 문서 클로즈업 중심으로 제작 가능하다."
+    }
+  },
+  "mandatory_script_directives": [
+    {
+      "id": "SD01",
+      "directive": "기록보관소 프레임은 음성 배역을 추가하지 않도록 화면 자막과 문서 클로즈업으로 처리한다.",
+      "reason": "speaking_roles 최대 4 계약을 유지한다."
+    },
+    {
+      "id": "SD02",
+      "directive": "세라의 배신 행위는 구체적으로 드러낸다: 왕의 봉인명령에 딸린 수신자 명부를 없애고, 공식 전령망 대신 등록되지 않은 경로로 문서를 보냈다.",
+      "reason": "독립 에피소드의 핵심 갈등과 유죄 감각이 지나치게 추상적으로 남는 것을 막는다."
+    },
+    {
+      "id": "SD03",
+      "directive": "수신자, 명령의 전체 내용, 왕의 정확한 사인은 공개하지 않는다.",
+      "reason": "중심 미스터리와 후속 역사 조각을 보호한다."
+    },
+    {
+      "id": "SD04",
+      "directive": "신들의 침묵 이후 성녀의 정치적 이용은 장문의 설명이 아니라 로엔·베른·세라의 공방으로 보여준다.",
+      "reason": "설정 설명 영상으로 변질되는 것을 막는다."
+    },
+    {
+      "id": "SD05",
+      "directive": "세라를 무조건적 영웅이나 순교자로 확정하지 않는다. 그녀가 보호한 대상과 선택의 도덕성은 불명확하게 유지한다.",
+      "reason": "기록의 DISPUTED 성격을 유지한다."
+    },
+    {
+      "id": "SD06",
+      "directive": "후대 기록의 마지막 단서는 '왕의 마지막 명령은 북쪽으로' 수준에서 끝내고 결론을 제시하지 않는다.",
+      "reason": "한 편의 여운은 남기되 직접 해답은 금지한다."
+    }
+  ],
+  "blocking_issues": [],
+  "next_allowed_artifact": "script_draft.md",
+  "canon_effect": "NONE"
+}
