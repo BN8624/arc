@@ -2,10 +2,9 @@
   "schema_version": 1,
   "project_id": "kingdom_archive",
   "episode_id": "E001",
-  "state": "PRODUCTION_READY",
-  "scenario": "pass",
+  "state": "SELECTED",
+  "scenario": "external",
   "approvals": [
-    "G2_EPISODE_SELECTION",
-    "G3_FINAL_SCRIPT_PRODUCTION"
+    "G2_EPISODE_SELECTION"
   ]
 }

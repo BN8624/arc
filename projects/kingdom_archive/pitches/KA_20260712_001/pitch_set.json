@@ -1,0 +1,241 @@
+{
+  "schema_version": 1,
+  "project_id": "kingdom_archive",
+  "world_version": "1.0",
+  "batch_id": "KA_20260712_001",
+  "created_by": "GPT + user",
+  "candidates": [
+    {
+      "pitch_id": "P001",
+      "working_title": "왕을 배신한 성녀의 재판",
+      "logline": "왕을 독살했다는 혐의로 재판받는 성녀가 자신의 무죄보다 왕이 죽기 전 남긴 마지막 명령을 숨기는 쪽을 택한다.",
+      "era_anchor": "SCHISM",
+      "location_scope": "수도의 대심문정과 인접한 교단 구금실",
+      "record_form": "훼손된 재판 속기록과 증거목록",
+      "protagonist": "왕실의 기적을 공인하던 성녀",
+      "protagonist_class": "CLERGY",
+      "human_conflict": "자신을 살릴 진실을 밝힐 것인가, 더 큰 피해를 막기 위해 배신자로 죽을 것인가",
+      "domain": "LAW",
+      "ending_shape": "유죄 판결 뒤 기록 한 장이 의도적으로 제거되었음이 드러나는 비극적 결말",
+      "world_refs": [
+        "EV_SCHISM",
+        "EV_SILENCE"
+      ],
+      "history_contribution": {
+        "type": "CLAIM",
+        "summary": "왕은 죽기 직전 북부의 이름 없는 수신자에게 봉인 명령을 보냈다는 재판 증언이 존재한다.",
+        "intended_status": "CONTESTED"
+      },
+      "open_question": "성녀가 끝까지 보호한 수신자는 누구였는가",
+      "central_mystery_relation": "ECHO",
+      "production_shape": {
+        "target_minutes": 7,
+        "speaking_roles": 4,
+        "primary_locations": 2,
+        "estimated_images": 12
+      },
+      "draft_entities": [
+        {
+          "type": "PERSON",
+          "working_name": "성녀 세라",
+          "status": "DRAFT"
+        },
+        {
+          "type": "PLACE",
+          "working_name": "대심문정",
+          "status": "DRAFT"
+        },
+        {
+          "type": "ARTIFACT",
+          "working_name": "검은 인장의 봉인문서",
+          "status": "DRAFT"
+        }
+      ]
+    },
+    {
+      "pitch_id": "P002",
+      "working_title": "침묵 이후의 우체부",
+      "logline": "신들이 침묵한 직후, 한 우체부가 수취인이 모두 죽었다는 마을로 편지를 배달하라는 명령을 받고 마지막 한 통의 주인을 찾아 나선다.",
+      "era_anchor": "AFTER_SILENCE",
+      "location_scope": "폐쇄된 산간 우편로와 지도에서 지워진 작은 마을",
+      "record_form": "배달 장부, 반송 편지, 후대 기록관의 복원 주석",
+      "protagonist": "왕립 우편망의 말단 우체부",
+      "protagonist_class": "COMMONER",
+      "human_conflict": "죽은 사람에게 보낸 편지를 공개해 유가족을 상처 입힐 것인가, 진실을 묻고 임무를 끝낼 것인가",
+      "domain": "ORDINARY_LIFE",
+      "ending_shape": "편지의 수취인이 살아 있었지만 자신이 누구인지 부정하는 조용한 미스터리 결말",
+      "world_refs": [
+        "EV_SILENCE"
+      ],
+      "history_contribution": {
+        "type": "FACT",
+        "summary": "신들의 침묵 직후 특정 산간 우편로가 공식 명령으로 폐쇄되었다.",
+        "intended_status": "PROVISIONAL"
+      },
+      "open_question": "폐쇄 명령은 마을을 보호하기 위한 것이었나, 세상에서 지우기 위한 것이었나",
+      "central_mystery_relation": "NONE",
+      "production_shape": {
+        "target_minutes": 6,
+        "speaking_roles": 3,
+        "primary_locations": 3,
+        "estimated_images": 11
+      },
+      "draft_entities": [
+        {
+          "type": "PERSON",
+          "working_name": "우체부 마렌",
+          "status": "DRAFT"
+        },
+        {
+          "type": "PLACE",
+          "working_name": "회색고개 우편로",
+          "status": "DRAFT"
+        },
+        {
+          "type": "PLACE",
+          "working_name": "무명 마을",
+          "status": "DRAFT"
+        }
+      ]
+    },
+    {
+      "pitch_id": "P003",
+      "working_title": "세 번 죽은 도둑의 자백",
+      "logline": "왕국 말기, 한 도둑이 자신이 이미 두 번 처형되었다고 주장하며 세 번째 사형을 앞두고 서로 다른 세 개의 자백을 남긴다.",
+      "era_anchor": "BEFORE_FALL",
+      "location_scope": "수도 하층 감옥과 처형장",
+      "record_form": "세 장의 상충하는 자백서와 교도관의 근무일지",
+      "protagonist": "왕실 기록 창고를 턴 전과자",
+      "protagonist_class": "CRIMINAL",
+      "human_conflict": "자신의 정체를 지켜 살아남을 것인가, 거짓 이름 아래 죽어 누군가를 보호할 것인가",
+      "domain": "CRIME",
+      "ending_shape": "세 자백 모두 일부만 진실이며 처형 명부에서 이름 자체가 사라지는 불확정 결말",
+      "world_refs": [
+        "EV_FALL",
+        "CL_SELF_ERASURE"
+      ],
+      "history_contribution": {
+        "type": "CONTRADICTION",
+        "summary": "서로 다른 해의 처형 기록 세 건이 동일한 죄수의 특징과 기억을 공유한다.",
+        "intended_status": "CONTESTED"
+      },
+      "open_question": "도둑이 세 번 살아난 것인가, 왕국이 한 사람의 이름을 반복해서 다른 사람에게 덧씌운 것인가",
+      "central_mystery_relation": "INDIRECT",
+      "production_shape": {
+        "target_minutes": 7,
+        "speaking_roles": 3,
+        "primary_locations": 2,
+        "estimated_images": 10
+      },
+      "draft_entities": [
+        {
+          "type": "PERSON",
+          "working_name": "이름 없는 도둑",
+          "status": "DRAFT"
+        },
+        {
+          "type": "PERSON",
+          "working_name": "교도관 오르",
+          "status": "DRAFT"
+        },
+        {
+          "type": "PLACE",
+          "working_name": "서쪽 기록감옥",
+          "status": "DRAFT"
+        }
+      ]
+    },
+    {
+      "pitch_id": "P004",
+      "working_title": "왕국 밖에서 온 지도 제작자",
+      "logline": "건국 직전 고용된 외국인 지도 제작자가 새 왕의 국경선을 그리다가 왕국보다 오래된 경계석과 지워진 왕실 문장을 발견한다.",
+      "era_anchor": "FOUNDING",
+      "location_scope": "건국 전쟁이 끝난 국경 평원과 임시 왕실 천막",
+      "record_form": "탐사일지, 미완성 지도, 고용 계약서",
+      "protagonist": "어느 세력에도 충성하지 않는 외국인 지도 제작자",
+      "protagonist_class": "OUTSIDER",
+      "human_conflict": "사실대로 그려 새 왕의 정통성을 무너뜨릴 것인가, 의뢰대로 역사를 새로 그릴 것인가",
+      "domain": "EXPLORATION",
+      "ending_shape": "공식 지도와 개인 지도가 서로 다른 국경을 남기는 양면적 결말",
+      "world_refs": [
+        "EV_FOUNDING"
+      ],
+      "history_contribution": {
+        "type": "CLAIM",
+        "summary": "건국 이전부터 같은 왕실 문장으로 보이는 표식이 국경 지대에 존재했다는 탐사 기록이 있다.",
+        "intended_status": "OPEN"
+      },
+      "open_question": "새 왕국은 처음 세워진 것인가, 잊힌 옛 왕국을 다시 이름 붙인 것인가",
+      "central_mystery_relation": "ECHO",
+      "production_shape": {
+        "target_minutes": 8,
+        "speaking_roles": 4,
+        "primary_locations": 3,
+        "estimated_images": 15
+      },
+      "draft_entities": [
+        {
+          "type": "PERSON",
+          "working_name": "지도 제작자 일렌",
+          "status": "DRAFT"
+        },
+        {
+          "type": "ARTIFACT",
+          "working_name": "두 겹의 국경지도",
+          "status": "DRAFT"
+        },
+        {
+          "type": "PLACE",
+          "working_name": "무명 국경 평원",
+          "status": "DRAFT"
+        }
+      ]
+    },
+    {
+      "pitch_id": "P005",
+      "working_title": "마지막 밤의 가족 식탁",
+      "logline": "왕국이 무너지던 밤, 피난 명령을 받은 한 가족이 돌아오지 않는 장남을 기다리며 문을 잠글지 열어둘지를 두고 갈라진다.",
+      "era_anchor": "FALL",
+      "location_scope": "수도 외곽의 작은 집과 멀리 보이는 성문",
+      "record_form": "세 생존자의 구술 기록과 집에서 발견된 식탁 배치도",
+      "protagonist": "가족을 지키려는 재봉사 어머니",
+      "protagonist_class": "COMMONER",
+      "human_conflict": "남은 가족을 살리기 위해 떠날 것인가, 한 사람을 기다리다 모두를 위험에 빠뜨릴 것인가",
+      "domain": "FAMILY",
+      "ending_shape": "문은 끝내 열려 있었지만 누가 돌아왔는지는 증언마다 다른 감정적 결말",
+      "world_refs": [
+        "EV_FALL"
+      ],
+      "history_contribution": {
+        "type": "FACT",
+        "summary": "멸망의 밤 수도의 일부 성문은 공격으로 무너진 것이 아니라 내부 명령으로 동시에 열렸다.",
+        "intended_status": "PROVISIONAL"
+      },
+      "open_question": "성문을 연 명령은 항복, 탈출, 혹은 다른 의도를 위한 것이었나",
+      "central_mystery_relation": "INDIRECT",
+      "production_shape": {
+        "target_minutes": 6,
+        "speaking_roles": 4,
+        "primary_locations": 2,
+        "estimated_images": 9
+      },
+      "draft_entities": [
+        {
+          "type": "PERSON",
+          "working_name": "재봉사 어머니",
+          "status": "DRAFT"
+        },
+        {
+          "type": "PLACE",
+          "working_name": "수도 남문 외곽",
+          "status": "DRAFT"
+        },
+        {
+          "type": "ARTIFACT",
+          "working_name": "다섯 자리 식탁 배치도",
+          "status": "DRAFT"
+        }
+      ]
+    }
+  ]
+}
