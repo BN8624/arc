@@ -16,7 +16,8 @@ class ScriptImportTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(); self.project = Path(self.temporary.name) / "kingdom_archive"
         shutil.copytree(ROOT / "projects" / "kingdom_archive", self.project); self.episode = self.project / "episodes" / "E001"
-        for name in ("story_gate.json", "script_draft.md", "review_1.json", "script_revised.md"): (self.episode / name).unlink(missing_ok=True)
+        for name in ("story_gate.json", "script_draft.md", "review_1.json", "script_revised.md", "review_2.json", "continuity_check.json", "script_final.md"): (self.episode / name).unlink(missing_ok=True)
+        shutil.rmtree(self.episode / "production_packet", ignore_errors=True)
         manifest_path = self.episode / "episode.json"; manifest = json.loads(manifest_path.read_text(encoding="utf-8")); manifest["state"] = "OUTLINE_READY"; manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
         self.gate, self.script = Path(self.temporary.name) / "gate.json", Path(self.temporary.name) / "script.md"; self.write_valid_inputs()
         self.ledger_before = (self.project / "CONTINUITY_LEDGER.json").read_bytes()

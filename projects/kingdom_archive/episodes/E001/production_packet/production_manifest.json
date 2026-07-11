@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "project_id": "kingdom_archive",
+  "world_version": "1.0",
+  "episode_id": "E001",
+  "title": "왕을 배신한 성녀의 재판",
+  "packet_version": "1.0",
+  "status": "PRODUCTION_PACKET_DRAFT",
+  "source_artifact": "script_final.md",
+  "g3_decision": "APPROVE",
+  "target_duration_seconds": 420,
+  "target_duration_range_seconds": [
+    300,
+    480
+  ],
+  "aspect_ratio": "16:9",
+  "speaking_roles": [
+    "세라",
+    "로엔",
+    "베른",
+    "탈렌"
+  ],
+  "narrator_role": null,
+  "primary_locations": [
+    "대심문정",
+    "교단 구금실"
+  ],
+  "planned_images": 12,
+  "files": [
+    {
+      "path": "README.md",
+      "sha256": "862659fadbb267443e43f14b47bdb25272468afdb9bb04f8c06c4c6e36a97fce",
+      "size_bytes": 1135
+    },
+    {
+      "path": "g3_approval.json",
+      "sha256": "9d20260656b8a50ec954a23e3a09ea9459985bce3a0a775a5268e8aec62814d9",
+      "size_bytes": 641
+    },
+    {
+      "path": "image_prompts.md",
+      "sha256": "273342647939b501864404687098a12a9a24d0e3b26be50464255271968bb7b9",
+      "size_bytes": 4292
+    },
+    {
+      "path": "shot_list.json",
+      "sha256": "5f3afad69b419853073cbbd39b83d62c55184acc873c430a9072e0298202af4a",
+      "size_bytes": 7011
+    },
+    {
+      "path": "sound_edit_plan.md",
+      "sha256": "16f24ee46e30956439bb8d0a7a251a396ab6b75654224c31a08bf8b996c04995",
+      "size_bytes": 4169
+    },
+    {
+      "path": "subtitles.srt",
+      "sha256": "a6efccb4318d5c9d888d2840c9f8fa2a22b92fa9bef37c9b34154d6e6257b8da",
+      "size_bytes": 4565
+    },
+    {
+      "path": "voice_script.md",
+      "sha256": "52b131ecfde81c8bffcaef44ace0b21aa003daaff83aca6ececf281056a28a3f",
+      "size_bytes": 7241
+    }
+  ],
+  "publication_effect": "NONE",
+  "canon_effect": "NONE",
+  "ledger_apply": false,
+  "archive_frame_location": "후대 기록보관소 문서 탁자",
+  "source_script_sha256": "78183c1c6436b4897d837f45fd9da1a482a5230cb8243a0c519c65b78bfa6362"
+}

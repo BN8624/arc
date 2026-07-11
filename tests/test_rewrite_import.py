@@ -16,7 +16,8 @@ class RewriteImportTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(); self.project = Path(self.temp.name) / "kingdom_archive"; shutil.copytree(ROOT / "projects" / "kingdom_archive", self.project)
         self.episode = self.project / "episodes" / "E001"
-        for name in ("review_1.json", "script_revised.md"): (self.episode / name).unlink(missing_ok=True)
+        for name in ("review_1.json", "script_revised.md", "review_2.json", "continuity_check.json", "script_final.md"): (self.episode / name).unlink(missing_ok=True)
+        shutil.rmtree(self.episode / "production_packet", ignore_errors=True)
         manifest_path = self.episode / "episode.json"; manifest = json.loads(manifest_path.read_text(encoding="utf-8")); manifest["state"] = "SCRIPT_DRAFT"; manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
         self.review, self.script = Path(self.temp.name) / "review.json", Path(self.temp.name) / "revised.md"; self.write_valid()
         self.ledger = (self.project / "CONTINUITY_LEDGER.json").read_bytes()

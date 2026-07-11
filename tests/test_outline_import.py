@@ -19,8 +19,9 @@ class OutlineImportTests(unittest.TestCase):
         self.project = Path(self.temporary.name) / "kingdom_archive"
         shutil.copytree(ROOT / "projects" / "kingdom_archive", self.project)
         self.episode = self.project / "episodes" / "E001"
-        for name in ("continuity_plan.json", "outline.md", "story_gate.json", "script_draft.md", "review_1.json", "script_revised.md"):
+        for name in ("continuity_plan.json", "outline.md", "story_gate.json", "script_draft.md", "review_1.json", "script_revised.md", "review_2.json", "continuity_check.json", "script_final.md"):
             (self.episode / name).unlink(missing_ok=True)
+        shutil.rmtree(self.episode / "production_packet", ignore_errors=True)
         self.episode.joinpath("episode.json").write_text(json.dumps({"schema_version": 1, "project_id": "kingdom_archive", "episode_id": "E001", "state": "SELECTED", "scenario": "external", "approvals": ["G2_EPISODE_SELECTION"]}), encoding="utf-8")
         self.plan = Path(self.temporary.name) / "plan.json"
         self.outline = Path(self.temporary.name) / "outline.md"
