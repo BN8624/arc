@@ -147,3 +147,67 @@ def test_acceptance_partial_resumes_only_missing_dimension(tmp_path: Path) -> No
     resumed = [role for stage, role, _ in resume_client.calls if stage == "pilot_review"]
     assert completed.isdisjoint(resumed)
     assert resumed == ["continuity"]
+
+
+def _transition_resume_state(tmp_path: Path) -> tuple[Path, dict, str]:
+    _, output = run(tmp_path)
+    manifest_path = output / "pilot_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    transition_id = "episode_002_to_episode_003"
+    manifest["status"] = "RUNNING"
+    return output, manifest, transition_id
+
+
+def test_transition_artifact_only_resume_does_not_rebuild(tmp_path: Path) -> None:
+    output, manifest, transition_id = _transition_resume_state(tmp_path)
+    manifest["completed_transitions"].remove(transition_id)
+    manifest["artifact_hashes"].pop("episode_sources/episode_003.json")
+    (output / "episode_sources" / "episode_003.json").unlink()
+    (output / "pilot_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    class Spy(PilotPipeline):
+        def _transition(self, *args, **kwargs):
+            raise AssertionError("transition rebuilt")
+
+    Spy(MockModelClient("pass"), "pass").run(FIXTURE, output)
+    assert (output / "episode_sources" / "episode_003.json").exists()
+
+
+def test_transition_and_source_resume_only_reconciles_manifest(tmp_path: Path) -> None:
+    output, manifest, transition_id = _transition_resume_state(tmp_path)
+    manifest["completed_transitions"].remove(transition_id)
+    (output / "pilot_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    class Spy(PilotPipeline):
+        def _transition(self, *args, **kwargs):
+            raise AssertionError("transition rebuilt")
+
+    Spy(MockModelClient("pass"), "pass").run(FIXTURE, output)
+    assert transition_id in json.loads((output / "pilot_manifest.json").read_text(encoding="utf-8"))["completed_transitions"]
+
+
+def test_completed_transition_is_not_reexecuted(tmp_path: Path) -> None:
+    output, manifest, _ = _transition_resume_state(tmp_path)
+    (output / "pilot_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    class Spy(PilotPipeline):
+        def _transition(self, *args, **kwargs):
+            raise AssertionError("transition rebuilt")
+
+    Spy(MockModelClient("pass"), "pass").run(FIXTURE, output)
+
+
+def test_corrupted_transition_hash_fails_closed(tmp_path: Path) -> None:
+    output, manifest, transition_id = _transition_resume_state(tmp_path)
+    (output / "transitions" / f"{transition_id}.json").write_text("{}", encoding="utf-8")
+    (output / "pilot_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(StorageError):
+        PilotPipeline(MockModelClient("pass"), "pass").run(FIXTURE, output)
+
+
+def test_corrupted_next_source_hash_fails_closed(tmp_path: Path) -> None:
+    output, manifest, _ = _transition_resume_state(tmp_path)
+    (output / "episode_sources" / "episode_003.json").write_text("{}", encoding="utf-8")
+    (output / "pilot_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(StorageError):
+        PilotPipeline(MockModelClient("pass"), "pass").run(FIXTURE, output)

@@ -83,6 +83,8 @@ class PilotPipeline:
                     self._reconcile_transition(run_dir, manifest, transition_id, episode_id, ids[index + 1], source, index)
                     manifest["completed_transitions"].append(transition_id)
                     self._save_manifest(run_dir, manifest)
+                else:
+                    self._verify_completed_transition(run_dir, manifest, transition_id, episode_id, ids[index + 1], source, index)
         if "pilot_acceptance.json" not in manifest["artifact_hashes"]:
             evidence = self._write_evidence_packet(run_dir, manifest)
             workers_path = run_dir / "pilot_review_workers.json"
@@ -147,6 +149,16 @@ class PilotPipeline:
         transition["next_source_hash"] = _json_file_hash(next_source)
         validate_transition(transition, source, next_id, str(run_dir))
         return transition, next_source
+
+    def _verify_completed_transition(self, run_dir: Path, manifest: dict, transition_id: str, episode_id: str, next_id: str, source: dict, index: int) -> None:
+        transition_path = run_dir / "transitions" / f"{transition_id}.json"
+        source_path = run_dir / "episode_sources" / f"{next_id}.json"
+        if not transition_path.exists() or not source_path.exists():
+            raise PilotError("completed transition artifact is missing")
+        transition = read_json(transition_path)
+        validate_transition(transition, source, next_id, str(run_dir))
+        if transition["transition_input_hash"] != self._transition_input_hash(run_dir, manifest, episode_id, next_id, source, index) or transition["next_source_hash"] != sha256_file(source_path):
+            raise PilotError("completed transition hash mismatch")
 
     def _next_source_from_transition(self, run_dir: Path, episode_id: str, transition: dict) -> dict:
         episode_dir = run_dir / "episodes" / episode_id
