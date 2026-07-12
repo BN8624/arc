@@ -3,11 +3,13 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import json
+import shutil
 from pathlib import Path
 
 import pytest
 
 from arc.live_model import AtomicTelemetryStore, GemmaPoolClient, LiveConfig, MODEL_NAME, RoutingStateStore
+from arc.pipeline import PLANNING_ROLES, WaveCheckpoint
 from arc.pilot import PilotPipeline
 from arc.storage import StorageError, read_json, write_json
 
@@ -133,6 +135,72 @@ def _pilot_client(run_dir: Path, root: _PilotProviderRoot | None = None) -> tupl
     state_store = RoutingStateStore(run_dir / "routing_state.json", list(_config().keys))
     telemetry_store = AtomicTelemetryStore(run_dir / "pilot_live_calls.json")
     return GemmaPoolClient(_config(), client_factory=provider_root.factory, state_store=state_store, telemetry_sink=telemetry_store.save), provider_root
+
+
+def _worker(stage: str, role: str) -> dict:
+    evidence = ["final.md"] if stage == "memory" else ["source:current_episode"]
+    return {"worker_id": f"{stage}-{role}", "role": role, "verdict": "OK", "primary_finding": f"synthetic {role} finding", "primary_risk": f"synthetic {role} risk", "evidence_refs": evidence, "proposal": {"role": role}}
+
+
+def _file_bytes(output: Path) -> dict[str, bytes]:
+    return {path.relative_to(output).as_posix(): path.read_bytes() for path in output.rglob("*") if path.is_file()}
+
+
+def _episode_from_prompt(prompt: str) -> str | None:
+    if "Input JSON:\n" not in prompt:
+        return None
+    payload = json.loads(prompt.split("Input JSON:\n", 1)[1])
+    return payload.get("episode_id") or payload.get("context", {}).get("episode_id")
+
+
+def _make_interrupted_episode_output(tmp_path: Path) -> Path:
+    output = tmp_path / "pilot-live"
+    client, _ = _pilot_client(output)
+    PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+
+    manifest = read_json(output / "pilot_manifest.json")
+    episode2 = output / "episodes" / "episode_002"
+    transition_001_002 = read_json(output / "transitions" / "episode_001_to_episode_002.json")
+    for episode_id in ["episode_003", "episode_004", "episode_005"]:
+        shutil.rmtree(output / "episodes" / episode_id, ignore_errors=True)
+        (output / "episode_sources" / f"{episode_id}.json").unlink(missing_ok=True)
+    shutil.rmtree(output / "transitions", ignore_errors=True)
+    transitions = output / "transitions"
+    transitions.mkdir()
+    write_json(transitions / "episode_001_to_episode_002.json", transition_001_002)
+    for name in ["pilot_evidence_packet.json", "pilot_review_workers.json", "pilot_acceptance.json", "pilot_review_workers.partial.json"]:
+        (output / name).unlink(missing_ok=True)
+
+    episode_manifest = read_json(episode2 / "manifest.json")
+    keep = {"manifest.json", "context_packet.json", "planning_workers.partial.json", "live_calls.json"}
+    for path in list(episode2.iterdir()):
+        if path.is_file() and path.name not in keep:
+            path.unlink()
+    episode_manifest.update({"status": "RUNNING", "completed_stages": ["CONTEXT_ASSEMBLED"], "artifact_hashes": {"context_packet.json": episode_manifest["artifact_hashes"]["context_packet.json"]}, "writer_call_count": 0, "revision_count": 0, "review_verdict": None, "last_error": None, "live_call_count": 2})
+
+    root_telemetry = read_json(output / "pilot_live_calls.json")
+    keep_scopes = {"episode:episode_001"}
+    kept_calls = [call for call in root_telemetry["calls"] if call["scope_id"] in keep_scopes or call["desk_id"] in {"episode:episode_002:planning:event", "episode:episode_002:planning:protagonist_action"}]
+    root_telemetry["calls"] = kept_calls
+    episode2_projection = {**root_telemetry, "calls": [call for call in kept_calls if call["scope_id"] == "episode:episode_002"]}
+    episode_manifest["artifact_hashes"]["live_calls.json"] = write_json(episode2 / "live_calls.json", episode2_projection)
+    write_json(episode2 / "manifest.json", episode_manifest)
+
+    checkpoint = WaveCheckpoint(episode2 / "planning_workers.partial.json", "planning", read_json(episode2 / "context_packet.json"), PLANNING_ROLES)
+    checkpoint.save("event", _worker("planning", "event"))
+    checkpoint.save("protagonist_action", _worker("planning", "protagonist_action"))
+
+    root_hash = write_json(output / "pilot_live_calls.json", root_telemetry)
+    routing_state = read_json(output / "routing_state.json")
+    max_lease = max(call["lease_sequence"] for call in kept_calls)
+    routing_state["next_lease_sequence"] = max_lease + 1
+    write_json(output / "routing_state.json", routing_state)
+
+    manifest.update({"status": "RUNNING", "completed_episodes": ["episode_001"], "completed_transitions": ["episode_001_to_episode_002"], "active_episode_id": "episode_002", "episode_records": manifest["episode_records"][:1], "acceptance_verdict": None, "last_error": None, "pilot_live_call_count": len(kept_calls)})
+    manifest["artifact_hashes"] = {key: value for key, value in manifest["artifact_hashes"].items() if key in {"episode_sources/episode_001.json", "episode_sources/episode_002.json", "transitions/episode_001_to_episode_002.json"}}
+    manifest["artifact_hashes"]["pilot_live_calls.json"] = root_hash
+    write_json(output / "pilot_manifest.json", manifest)
+    return output
 
 
 def test_scoped_clients_share_one_dynamic_key_pool(tmp_path):
@@ -298,16 +366,59 @@ def test_live_pilot_preserves_pool_cursor_between_episodes(tmp_path):
 
 
 def test_live_pilot_resumes_interrupted_episode_without_recalling_completed_desks(tmp_path):
-    output = tmp_path / "pilot-live"
-    client, _ = _pilot_client(output)
-    PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
-    before = len(read_json(output / "pilot_live_calls.json")["calls"])
+    output = _make_interrupted_episode_output(tmp_path)
+    before_calls = read_json(output / "pilot_live_calls.json")["calls"]
+    before_call_ids = {call["call_id"] for call in before_calls}
+
+    fresh_client, provider_root = _pilot_client(output)
+    result = PilotPipeline(fresh_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    resumed = read_json(output / "pilot_live_calls.json")["calls"]
+    resumed_prompts = {(_episode_from_prompt(prompt), marker) for _, marker, prompt in provider_root.provider_calls}
+
+    assert result["no_op"] is False
+    assert result["manifest"]["status"] == "COMPLETE"
+    assert ("episode_001", "writer:canonical") not in resumed_prompts
+    assert ("episode_002", "planning:event") not in resumed_prompts
+    assert ("episode_002", "planning:protagonist_action") not in resumed_prompts
+    assert {role for episode, marker in resumed_prompts if episode == "episode_002" and marker.startswith("planning:") for role in [marker.split(":", 1)[1]]} == {"relationship", "continuity", "readability_weight", "reader_payoff"}
+    assert {"episode_003", "episode_004", "episode_005"}.issubset({episode for episode, _ in resumed_prompts})
+    assert before_call_ids.issubset({call["call_id"] for call in resumed})
+    assert len({call["call_id"] for call in resumed}) == len(resumed)
+    assert len({call["lease_sequence"] for call in resumed}) == len(resumed)
+    assert all(call["error_class"] is None for call in resumed if call["call_id"] in before_call_ids)
+    episode2_projection = read_json(output / "episodes" / "episode_002" / "live_calls.json")["calls"]
+    assert episode2_projection == [call for call in resumed if call["scope_id"] == "episode:episode_002"]
+
+
+def test_live_pilot_interrupted_episode_preserves_global_attempt_and_lease_sequence(tmp_path):
+    output = _make_interrupted_episode_output(tmp_path)
+    before = read_json(output / "pilot_live_calls.json")["calls"]
+    max_lease = max(call["lease_sequence"] for call in before)
 
     fresh_client, _ = _pilot_client(output)
-    result = PilotPipeline(fresh_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    PilotPipeline(fresh_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    after = read_json(output / "pilot_live_calls.json")["calls"]
+    new_calls = [call for call in after if call["lease_sequence"] > max_lease]
 
-    assert result["no_op"] is True
-    assert len(read_json(output / "pilot_live_calls.json")["calls"]) == before
+    assert min(call["lease_sequence"] for call in new_calls) == max_lease + 1
+    assert [call["attempt"] for call in after if call["desk_id"] == "episode:episode_002:planning:event"] == [1]
+    assert [call["attempt"] for call in after if call["desk_id"] == "episode:episode_002:planning:relationship"][0] == 1
+    assert sorted(call["lease_sequence"] for call in after) == list(range(1, len(after) + 1))
+
+
+def test_live_pilot_interrupted_episode_rejects_root_projection_mismatch(tmp_path):
+    output = _make_interrupted_episode_output(tmp_path)
+    episode_path = output / "episodes" / "episode_002" / "live_calls.json"
+    episode_calls = read_json(episode_path)
+    episode_calls["calls"] = []
+    digest = write_json(episode_path, episode_calls)
+    episode_manifest = read_json(output / "episodes" / "episode_002" / "manifest.json")
+    episode_manifest["artifact_hashes"]["live_calls.json"] = digest
+    write_json(output / "episodes" / "episode_002" / "manifest.json", episode_manifest)
+
+    fresh_client, _ = _pilot_client(output)
+    with pytest.raises(StorageError, match="telemetry projection mismatch"):
+        PilotPipeline(fresh_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
 
 
 def test_live_pilot_rejects_root_and_episode_telemetry_mismatch(tmp_path):

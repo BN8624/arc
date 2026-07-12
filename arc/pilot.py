@@ -321,7 +321,11 @@ def _verify_live_telemetry_projections(run_dir: Path, manifest: dict) -> None:
     root_by_scope = {}
     for call in root.get("calls", []):
         root_by_scope.setdefault(call.get("scope_id"), []).append(call)
-    for episode_id in manifest["completed_episodes"]:
+    checked = list(manifest["completed_episodes"])
+    active_episode_id = manifest.get("active_episode_id")
+    if active_episode_id and (run_dir / "episodes" / active_episode_id / "live_calls.json").exists():
+        checked.append(active_episode_id)
+    for episode_id in checked:
         episode_calls = read_json(run_dir / "episodes" / episode_id / "live_calls.json").get("calls", [])
         scope_id = f"episode:{episode_id}"
         if episode_calls != root_by_scope.get(scope_id, []):
