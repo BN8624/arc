@@ -384,17 +384,17 @@ Validate long-horizon drift and memory integrity.
 Current phase:
 
 ```text
-PHASE_0_CANON
+PHASE_1_MOCK_VERTICAL_LOOP
 ```
 
 Next deliverable:
 
 ```text
-Review and approve ARC_CANON.md.
+Implement and validate the mock vertical loop.
 ```
 
 Next implementation after approval:
 
 ```text
-PHASE_1_MOCK_VERTICAL_LOOP
+PHASE_2_LIVE_SINGLE_EPISODE_VALIDATION
 ```

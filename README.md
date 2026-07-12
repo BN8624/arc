@@ -29,13 +29,21 @@ Before planning, implementing, reviewing, or modifying ARC:
 
 ## Current Phase
 
-`PHASE_0_CANON`
+`PHASE_1_MOCK_VERTICAL_LOOP`
+
+This phase validates one synthetic episode vertical loop with an injected mock model. It does not call a real model or generate a real work.
+
+Mock validation commands:
+
+```bash
+arc mock-run tests/fixtures/synthetic_work.json --output .tmp/phase1-pass --scenario pass
+arc mock-status .tmp/phase1-pass
+```
+
+The mock CLI is only for Phase 1 validation. `ARC_CANON.md` remains the canonical contract.
 
 Current deliverables:
 
 - `README.md`
 - `ARC_CANON.md`
-
-No generation engine is authorized in this phase.
-
-The next implementation phase begins only after the canon is reviewed and explicitly approved.
+- mock vertical-loop validation
