@@ -8,11 +8,13 @@
   },
   "world_rules": [{"id": "WR1", "text": "synthetic rule"}],
   "characters": [{"id": "CHAR1", "name": "Synthetic Character", "stable_traits": ["synthetic trait"]}],
-  "confirmed_facts": [],
-  "relationship_state": [],
-  "open_conflicts": [],
-  "episode_summaries": [],
-  "important_excerpts": [],
+  "confirmed_facts": ["synthetic existing fact"],
+  "relationship_state": ["synthetic existing relationship"],
+  "open_conflicts": ["synthetic resolved conflict"],
+  "promises": ["synthetic existing promise"],
+  "episode_summaries": ["synthetic existing summary"],
+  "important_excerpts": ["synthetic existing excerpt"],
   "rolling_plan": {"near_horizon": [], "immediate_horizon": []},
+  "required_next_episode_continuity": ["synthetic existing continuity"],
   "current_episode": {"episode_id": "SYN001", "importance": "ordinary", "required_role": "synthetic episode role"}
 }

@@ -19,3 +19,4 @@ def test_cli_run_and_status(tmp_path: Path) -> None:
     assert json.loads(second.stdout)["no_op"] is True
     state = subprocess.run([sys.executable, "-m", "arc", "mock-status", str(run)], check=True, capture_output=True, text=True)
     assert json.loads(state.stdout)["memory_merged"] is True
+    assert json.loads(state.stdout)["memory_applied"] is True

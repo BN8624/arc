@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from typing import Protocol
 
 
@@ -16,7 +17,7 @@ class ModelClient(Protocol):
 REQUIRED_FIXTURE_KEYS = {
     "fixture_id", "series_compass", "world_rules", "characters", "confirmed_facts",
     "relationship_state", "open_conflicts", "episode_summaries", "important_excerpts",
-    "rolling_plan", "current_episode",
+    "promises", "required_next_episode_continuity", "rolling_plan", "current_episode",
 }
 
 
@@ -36,8 +37,11 @@ def validate_fixture(source: dict) -> None:
         raise ContractError(f"fixture missing: {sorted(missing)}")
     if not source["fixture_id"] or not source["current_episode"].get("episode_id"):
         raise ContractError("fixture identity is required")
-    if not isinstance(source["confirmed_facts"], list) or not isinstance(source["episode_summaries"], list):
-        raise ContractError("facts and summaries must be separate lists")
+    list_fields = REQUIRED_FIXTURE_KEYS & {"world_rules", "characters", "confirmed_facts", "relationship_state", "open_conflicts", "promises", "episode_summaries", "important_excerpts", "required_next_episode_continuity"}
+    if any(not isinstance(source[field], list) for field in list_fields):
+        raise ContractError("persistent collections must be lists")
+    if not isinstance(source["rolling_plan"], dict):
+        raise ContractError("rolling plan must be an object")
 
 
 def validate_worker(value: dict, worker_id: str, role: str) -> dict:
@@ -80,8 +84,73 @@ def validate_review(value: dict) -> dict:
 
 def validate_memory(value: dict, episode_id: str) -> dict:
     required = {"episode_id", "confirmed_facts_added", "relationship_changes", "conflicts_resolved", "conflicts_opened", "promises_added", "important_excerpts_added", "episode_summary", "required_next_episode_continuity", "evidence_refs"}
-    if set(value) != required or value["episode_id"] != episode_id or "final.md" not in value["evidence_refs"]:
+    if set(value) != required or value["episode_id"] != episode_id:
         raise ContractError("invalid memory update")
-    if not value["episode_summary"]:
+    list_fields = required - {"episode_id", "episode_summary"}
+    if any(not isinstance(value[field], list) for field in list_fields):
+        raise ContractError("memory collections must be lists")
+    if not all(isinstance(item, str) and item for field in list_fields for item in value[field]):
+        raise ContractError("memory collection entries must be non-empty strings")
+    if any(len(value[field]) != len(set(value[field])) for field in list_fields):
+        raise ContractError("duplicate memory update entries")
+    if not isinstance(value["episode_summary"], str) or not value["episode_summary"]:
         raise ContractError("memory summary is required")
+    if "final.md" not in value["evidence_refs"]:
+        raise ContractError("memory evidence must cite final.md")
     return value
+
+
+def apply_memory_update(source: dict, update: dict) -> dict:
+    """Return a complete, deterministic memory state without mutating source."""
+    validate_fixture(source)
+    validate_memory(update, source["current_episode"]["episode_id"])
+    additions = {
+        "confirmed_facts": update["confirmed_facts_added"],
+        "relationship_state": update["relationship_changes"],
+        "promises": update["promises_added"],
+        "important_excerpts": update["important_excerpts_added"],
+        "required_next_episode_continuity": update["required_next_episode_continuity"],
+    }
+    for field, values in additions.items():
+        if set(source[field]) & set(values):
+            raise ContractError(f"memory update duplicates existing {field}")
+    if update["episode_summary"] in source["episode_summaries"]:
+        raise ContractError("memory update duplicates existing episode summary")
+    future_values = _strings_in(source["rolling_plan"])
+    if set(update["confirmed_facts_added"]) & future_values:
+        raise ContractError("future plan cannot become a confirmed fact")
+    resolved, opened = update["conflicts_resolved"], update["conflicts_opened"]
+    if set(resolved) - set(source["open_conflicts"]):
+        raise ContractError("cannot resolve missing conflict")
+    if set(resolved) & set(opened) or set(source["open_conflicts"]) & set(opened):
+        raise ContractError("invalid conflict update")
+    result = deepcopy(source)
+    result["confirmed_facts"] += additions["confirmed_facts"]
+    result["relationship_state"] += additions["relationship_state"]
+    result["open_conflicts"] = [item for item in source["open_conflicts"] if item not in resolved] + opened
+    result["promises"] += additions["promises"]
+    result["important_excerpts"] += additions["important_excerpts"]
+    result["episode_summaries"] += [update["episode_summary"]]
+    result["required_next_episode_continuity"] += additions["required_next_episode_continuity"]
+    result["last_completed_episode_id"] = update["episode_id"]
+    _validate_memory_after(source, result)
+    return result
+
+
+def _strings_in(value: object) -> set[str]:
+    if isinstance(value, str):
+        return {value}
+    if isinstance(value, dict):
+        return set().union(*(_strings_in(item) for item in value.values())) if value else set()
+    if isinstance(value, list):
+        return set().union(*(_strings_in(item) for item in value)) if value else set()
+    return set()
+
+
+def _validate_memory_after(source: dict, result: dict) -> None:
+    for field in ("fixture_id", "series_compass", "world_rules", "characters", "rolling_plan"):
+        if result[field] != source[field]:
+            raise ContractError(f"stable memory field changed: {field}")
+    for field in ("confirmed_facts", "relationship_state", "open_conflicts", "promises", "episode_summaries", "important_excerpts", "required_next_episode_continuity"):
+        if not isinstance(result[field], list) or len(result[field]) != len(set(result[field])):
+            raise ContractError(f"invalid memory state: {field}")

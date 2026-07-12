@@ -29,6 +29,10 @@ def test_scenarios(tmp_path: Path, scenario: str, verdict: str, final_exists: bo
         source = run / ("revised.md" if scenario == "revise" else "draft.md")
         assert source.read_bytes() == (run / "final.md").read_bytes()
         assert current["memory_merged"] is True
+        assert current["memory_applied"] is True
+    else:
+        assert current["memory_merged"] is False
+        assert current["memory_applied"] is False
 
 
 def test_context_separates_facts_and_future_plan(tmp_path: Path) -> None:

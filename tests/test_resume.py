@@ -43,6 +43,22 @@ def test_tampered_artifact_is_rejected(tmp_path: Path) -> None:
         MockPipeline(MockModelClient("pass")).run(FIXTURE, run, "pass")
 
 
+def test_orphan_artifact_is_rejected_and_atomic_temps_do_not_remain(tmp_path: Path) -> None:
+    run = tmp_path / "run"
+    MockPipeline(MockModelClient("pass")).run(FIXTURE, run, "pass")
+    assert not list(run.glob(".*.tmp"))
+    (run / "unexpected.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(StorageError):
+        MockPipeline(MockModelClient("pass")).run(FIXTURE, run, "pass")
+
+
+def test_scenario_change_is_rejected(tmp_path: Path) -> None:
+    run = tmp_path / "run"
+    MockPipeline(MockModelClient("pass")).run(FIXTURE, run, "pass")
+    with pytest.raises(PipelineError):
+        MockPipeline(MockModelClient("hold")).run(FIXTURE, run, "hold")
+
+
 @pytest.mark.parametrize("failed_stage", ["planning", "writer", "review", "revision"])
 def test_failure_resumes_without_repeating_completed_writer(tmp_path: Path, failed_stage: str) -> None:
     run = tmp_path / failed_stage

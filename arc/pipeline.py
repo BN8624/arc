@@ -5,7 +5,7 @@ import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from .contracts import ContractError, ModelClient, parse_object, validate_fixture, validate_memory, validate_plan, validate_review, validate_worker
+from .contracts import ContractError, ModelClient, apply_memory_update, parse_object, validate_fixture, validate_memory, validate_plan, validate_review, validate_worker
 from .storage import StorageError, read_json, sha256_bytes, sha256_file, verify_artifacts, write_json, write_text
 
 PLANNING_ROLES = ["event", "protagonist_action", "relationship", "continuity", "readability_weight", "reader_payoff"]
@@ -102,8 +102,10 @@ class MockPipeline:
         if "MEMORY_MERGED" not in manifest["completed_stages"]:
             update = validate_memory(parse_object(self.client.generate(stage="memory_merge", role="merge", prompt=json.dumps({"final": final, "workers": memory_workers}))), manifest["episode_id"])
             self._commit(run_dir, manifest, "memory_update.json", update, "MEMORY_MERGED")
-            memory_after = {"confirmed_facts": source["confirmed_facts"] + update["confirmed_facts_added"], "relationship_state": source["relationship_state"] + update["relationship_changes"], "open_conflicts": source["open_conflicts"] + update["conflicts_opened"], "episode_summaries": source["episode_summaries"] + [update["episode_summary"]]}
-            self._commit_artifact(run_dir, manifest, "memory_after.json", memory_after)
+        update = read_json(run_dir / "memory_update.json")
+        if "MEMORY_APPLIED" not in manifest["completed_stages"]:
+            memory_after = apply_memory_update(source, update)
+            self._commit(run_dir, manifest, "memory_after.json", memory_after, "MEMORY_APPLIED")
         manifest["status"] = "COMPLETE"
         manifest["last_error"] = None
         self._save_manifest(run_dir, manifest)
@@ -135,4 +137,6 @@ class MockPipeline:
 def status(run_dir: Path) -> dict:
     manifest = read_json(run_dir / "manifest.json")
     verify_artifacts(run_dir, manifest)
-    return {"fixture_id": manifest["fixture_id"], "episode_id": manifest["episode_id"], "status": manifest["status"], "completed_stages": manifest["completed_stages"], "review_verdict": manifest["review_verdict"], "writer_call_count": manifest["writer_call_count"], "revision_count": manifest["revision_count"], "final_exists": (run_dir / "final.md").exists(), "memory_merged": "MEMORY_MERGED" in manifest["completed_stages"], "last_error": manifest["last_error"]}
+    if manifest["status"] == "COMPLETE" and "MEMORY_APPLIED" not in manifest["completed_stages"]:
+        raise StorageError("COMPLETE without MEMORY_APPLIED")
+    return {"fixture_id": manifest["fixture_id"], "episode_id": manifest["episode_id"], "status": manifest["status"], "completed_stages": manifest["completed_stages"], "review_verdict": manifest["review_verdict"], "writer_call_count": manifest["writer_call_count"], "revision_count": manifest["revision_count"], "final_exists": (run_dir / "final.md").exists(), "memory_merged": "MEMORY_MERGED" in manifest["completed_stages"], "memory_applied": "MEMORY_APPLIED" in manifest["completed_stages"], "last_error": manifest["last_error"]}

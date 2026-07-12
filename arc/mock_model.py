@@ -50,5 +50,5 @@ class MockModelClient:
         if stage == "revision":
             return {"text": "A synthetic character makes one revised synthetic choice.\n"}
         if stage == "memory_merge":
-            return {"episode_id": "SYN001", "confirmed_facts_added": ["synthetic fact"], "relationship_changes": [], "conflicts_resolved": [], "conflicts_opened": ["synthetic promise"], "promises_added": ["synthetic promise"], "important_excerpts_added": ["synthetic choice"], "episode_summary": "synthetic episode summary", "required_next_episode_continuity": ["synthetic fact"], "evidence_refs": ["final.md"]}
+            return {"episode_id": "SYN001", "confirmed_facts_added": ["synthetic fact"], "relationship_changes": ["synthetic relationship change"], "conflicts_resolved": ["synthetic resolved conflict"], "conflicts_opened": ["synthetic opened conflict"], "promises_added": ["synthetic promise"], "important_excerpts_added": ["synthetic choice"], "episode_summary": "synthetic episode summary", "required_next_episode_continuity": ["synthetic next continuity"], "evidence_refs": ["final.md"]}
         raise RuntimeError(f"unknown mock stage: {stage}")
