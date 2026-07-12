@@ -470,3 +470,115 @@ def test_acceptance_calls_exist_only_in_pilot_root_telemetry(tmp_path):
     assert any(call["scope_id"] == "pilot:acceptance" for call in root_calls)
     for episode_file in (output / "episodes").glob("*/live_calls.json"):
         assert all(call["scope_id"] != "pilot:acceptance" for call in read_json(episode_file)["calls"])
+
+
+def _accepted_preflight(path: Path) -> Path:
+    preflight = path / "preflight.json"
+    write_json(preflight, {"status": "PASS", "live_run_allowed": True})
+    return preflight
+
+
+def _replace_root_telemetry(output: Path, telemetry: dict) -> None:
+    digest = write_json(output / "pilot_live_calls.json", telemetry)
+    manifest = read_json(output / "pilot_manifest.json")
+    manifest["artifact_hashes"]["pilot_live_calls.json"] = digest
+    write_json(output / "pilot_manifest.json", manifest)
+
+
+def test_pilot_live_run_requires_accepted_preflight(tmp_path, monkeypatch):
+    from arc.cli import _load_live_client
+
+    monkeypatch.setenv("MODEL", MODEL_NAME)
+    monkeypatch.setenv("ARC_LAUNCH_INTERVAL_SECONDS", "1")
+    for index in range(1, 12):
+        monkeypatch.setenv(f"GOOGLE_API_KEY_{index}", f"key-{index:02d}")
+    preflight = tmp_path / "preflight.json"
+    write_json(preflight, {"status": "FAIL", "live_run_allowed": False})
+
+    with pytest.raises(ValueError, match="preflight does not allow"):
+        _load_live_client(preflight, tmp_path / "run", tmp_path / "run" / "pilot_live_calls.json")
+
+
+def test_pilot_live_run_builds_one_root_runtime(tmp_path):
+    output = tmp_path / "pilot-live"
+    client, _ = _pilot_client(output)
+
+    PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+
+    assert (output / "routing_state.json").exists()
+    assert (output / "pilot_live_calls.json").exists()
+    assert not list((output / "episodes").glob("*/routing_state.json"))
+
+
+def test_pilot_live_status_validates_telemetry_projections(tmp_path):
+    from arc.pilot import pilot_status
+
+    output = tmp_path / "pilot-live"
+    client, _ = _pilot_client(output)
+    PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+
+    current = pilot_status(output)
+    assert current["pilot_live_call_count"] == len(read_json(output / "pilot_live_calls.json")["calls"])
+    assert current["acceptance_call_count"] == 7
+
+
+def test_pilot_live_status_detects_duplicate_call_ids(tmp_path):
+    from arc.pilot import pilot_status
+
+    output = tmp_path / "pilot-live"
+    client, _ = _pilot_client(output)
+    PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    telemetry = read_json(output / "pilot_live_calls.json")
+    telemetry["calls"][1]["call_id"] = telemetry["calls"][0]["call_id"]
+    _replace_root_telemetry(output, telemetry)
+
+    with pytest.raises(StorageError, match="duplicate pilot live call id"):
+        pilot_status(output)
+
+
+def test_pilot_live_status_detects_duplicate_lease_sequences(tmp_path):
+    from arc.pilot import pilot_status
+
+    output = tmp_path / "pilot-live"
+    client, _ = _pilot_client(output)
+    PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    telemetry = read_json(output / "pilot_live_calls.json")
+    telemetry["calls"][1]["lease_sequence"] = telemetry["calls"][0]["lease_sequence"]
+    _replace_root_telemetry(output, telemetry)
+
+    with pytest.raises(StorageError, match="duplicate pilot live lease sequence"):
+        pilot_status(output)
+
+
+def test_pilot_live_status_rejects_unknown_operational_file(tmp_path):
+    from arc.pilot import pilot_status
+
+    output = tmp_path / "pilot-live"
+    client, _ = _pilot_client(output)
+    PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    write_json(output / "unexpected.partial.json", {"bad": True})
+
+    with pytest.raises(StorageError, match="unknown pilot artifact"):
+        pilot_status(output)
+
+
+def test_mock_and_live_outputs_cannot_be_reused(tmp_path):
+    output = tmp_path / "pilot"
+    PilotPipeline(__import__("arc.mock_model", fromlist=["MockModelClient"]).MockModelClient("pass"), "pass").run(PILOT_FIXTURE, output)
+    client, _ = _pilot_client(output)
+
+    with pytest.raises(Exception, match="pilot input changed"):
+        PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+
+
+def test_pilot_live_complete_noop_preserves_all_hashes(tmp_path):
+    output = tmp_path / "pilot-live"
+    client, _ = _pilot_client(output)
+    PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    before = {path.relative_to(output).as_posix(): path.read_bytes() for path in output.rglob("*") if path.is_file()}
+
+    fresh_client, _ = _pilot_client(output)
+    PilotPipeline(fresh_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    after = {path.relative_to(output).as_posix(): path.read_bytes() for path in output.rglob("*") if path.is_file()}
+
+    assert after == before

@@ -43,9 +43,11 @@ arc live-run tests/fixtures/live_synthetic_work.json --output .tmp/phase2-live
 arc live-status .tmp/phase2-live
 arc pilot-mock-run tests/fixtures/pilot_synthetic_work.json --output .tmp/phase3a-pilot-pass --scenario pass
 arc pilot-status .tmp/phase3a-pilot-pass
+arc pilot-live-run tests/fixtures/pilot_synthetic_work.json --output .tmp/phase3b-pilot-live --preflight .tmp/phase2-preflight/preflight.json
+arc pilot-live-status .tmp/phase3b-pilot-live
 ```
 
-The live commands above are historical Phase 2 validation commands. The pilot commands are mock-only Phase 3A validation commands. `ARC_CANON.md` remains the canonical contract.
+The single-episode live commands above are historical Phase 2 validation commands. The pilot live commands use fake-test-covered runtime integration and still require a separate real validation issue before Phase 4. `ARC_CANON.md` remains the canonical contract.
 
 Current deliverables:
 

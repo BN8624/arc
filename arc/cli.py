@@ -37,17 +37,18 @@ def classify_preflight(results: list[dict]) -> dict:
     return {"categories": categories, "live_run_allowed": allowed, "degraded_admission": degraded, "admission_reason": "at_least_one_pass_and_no_global_blocker" if allowed else "missing_pass_or_blocking_preflight_result", "status": "DEGRADED_PASS" if degraded else "PASS" if allowed else "FAIL"}
 
 
-def _load_live_client(preflight: Path | None = None, run_dir: Path | None = None):
+def _load_live_client(preflight: Path | None = None, run_dir: Path | None = None, telemetry_path: Path | None = None):
     load_dotenv(override=False)
-    from .live_model import GemmaPoolClient, LiveConfig, RoutingStateStore
+    from .live_model import AtomicTelemetryStore, GemmaPoolClient, LiveConfig, RoutingStateStore
     config = LiveConfig.from_environment()
     state_store = RoutingStateStore(run_dir / "routing_state.json", list(config.keys)) if run_dir else None
+    telemetry_sink = AtomicTelemetryStore(telemetry_path).save if telemetry_path else None
     if preflight is None:
-        return GemmaPoolClient(config, state_store=state_store)
+        return GemmaPoolClient(config, state_store=state_store, telemetry_sink=telemetry_sink)
     document = json.loads(preflight.read_text(encoding="utf-8"))
     if document.get("status") not in {"PASS", "DEGRADED_PASS"} or not document.get("live_run_allowed"):
         raise ValueError("preflight does not allow a live run")
-    return GemmaPoolClient(config, state_store=state_store)
+    return GemmaPoolClient(config, state_store=state_store, telemetry_sink=telemetry_sink)
 
 
 def _preflight(output: Path) -> dict:
@@ -102,6 +103,12 @@ def main() -> None:
     pilot_run.add_argument("--scenario", choices=["pass", "episode_hold", "pilot_hold"], required=True)
     pilot_state = commands.add_parser("pilot-status")
     pilot_state.add_argument("output", type=Path)
+    pilot_live = commands.add_parser("pilot-live-run")
+    pilot_live.add_argument("fixture", type=Path)
+    pilot_live.add_argument("--output", type=Path, required=True)
+    pilot_live.add_argument("--preflight", type=Path, required=True)
+    pilot_live_state = commands.add_parser("pilot-live-status")
+    pilot_live_state.add_argument("output", type=Path)
     args = parser.parse_args()
     if args.command == "mock-run":
         result = MockPipeline(MockModelClient(args.scenario)).run(args.fixture, args.output, args.scenario)
@@ -122,6 +129,15 @@ def main() -> None:
         result = PilotPipeline(client, args.scenario).run(args.fixture, args.output)
         print(json.dumps({"no_op": result["no_op"], **pilot_status(args.output)}, ensure_ascii=False))
     elif args.command == "pilot-status":
+        print(json.dumps(pilot_status(args.output), ensure_ascii=False))
+    elif args.command == "pilot-live-run":
+        client = _load_live_client(args.preflight, args.output, args.output / "pilot_live_calls.json")
+        try:
+            result = PilotPipeline(client, scenario=None, mode="live").run(args.fixture, args.output)
+            print(json.dumps({"no_op": result["no_op"], **pilot_status(args.output)}, ensure_ascii=False))
+        finally:
+            client.close()
+    elif args.command == "pilot-live-status":
         print(json.dumps(pilot_status(args.output), ensure_ascii=False))
     else:
         print(json.dumps(status(args.output), ensure_ascii=False))

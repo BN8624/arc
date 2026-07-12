@@ -32,6 +32,14 @@ The acceptance review has seven logical dimensions: readability, character consi
 
 `pilot-mock-run` supports `pass`, `episode_hold`, and `pilot_hold`. The pass proof completes five episodes, four transitions, a valid memory chain, rolling-plan adaptation, and acceptance PASS. The HOLD proofs preserve completed artifacts and no-op on repeat execution. These commands make no live provider call.
 
-## Deferred Phase 3B Scope
+## Phase 3B Shared Live Runtime
 
-Phase 3B may connect the pilot boundary to one shared live runtime, routing state, and full pilot telemetry. It must not introduce fixed key assignment, a new model, automatic extra revision, a database, UI, Phase 4 implementation, or ARC's first real work without a separate approved issue.
+`pilot-live-run` connects the five-episode pilot to one base `GemmaPoolClient`. The five episode scopes and the `pilot:acceptance` scope share the same dynamic key pool, launch pacer, provider client cache, cooldown state, routing state, and close lifecycle. The pilot root owns the only `routing_state.json`.
+
+Live pilot telemetry is stored at the pilot root in `pilot_live_calls.json`. Each episode still writes `live_calls.json`, but that file is a deterministic projection of only that episode scope. Acceptance calls exist only in the pilot root telemetry. Status rejects duplicate call IDs, duplicate lease sequences, projection mismatch, and unknown root operational files.
+
+Live acceptance prompts include the canonical pilot evidence packet, dimension question, PASS/HOLD contract, evidence-reference contract, and strict output schema. The prompt is canonical JSON and deterministic for the same evidence packet and dimension.
+
+`pilot-live-run` requires an accepted existing `live-preflight` artifact and does not create a new pilot-specific preflight. `pilot-live-status` validates root telemetry, episode projections, routing state presence, canonical artifacts, memory chain, and acceptance call counts.
+
+This is a pre-live integration proof. Actual Phase 3 live validation, ARC's first real work, and Phase 4 remain separate work.

@@ -312,6 +312,12 @@ def _episode_files(path: Path) -> list[str]:
 
 def _verify_live_telemetry_projections(run_dir: Path, manifest: dict) -> None:
     root = read_json(run_dir / "pilot_live_calls.json")
+    call_ids = [call.get("call_id") for call in root.get("calls", [])]
+    lease_sequences = [call.get("lease_sequence") for call in root.get("calls", [])]
+    if len(call_ids) != len(set(call_ids)):
+        raise StorageError("duplicate pilot live call id")
+    if len(lease_sequences) != len(set(lease_sequences)):
+        raise StorageError("duplicate pilot live lease sequence")
     root_by_scope = {}
     for call in root.get("calls", []):
         root_by_scope.setdefault(call.get("scope_id"), []).append(call)
@@ -328,7 +334,15 @@ def pilot_status(run_dir: Path) -> dict:
     episodes = {episode_id: status(run_dir / "episodes" / episode_id)["status"] for episode_id in manifest["completed_episodes"]}
     finals = all((run_dir / "episodes" / episode_id / "final.md").exists() for episode_id in manifest["completed_episodes"])
     sources = [episode_id for episode_id in manifest["episode_ids"] if (run_dir / "episode_sources" / f"{episode_id}.json").exists()]
-    return {"pilot_id": manifest["pilot_id"], "status": manifest["status"], "episode_count": len(manifest["episode_ids"]), "completed_episode_count": len(manifest["completed_episodes"]), "completed_transition_count": len(manifest["completed_transitions"]), "active_episode_id": manifest["active_episode_id"], "episode_statuses": episodes, "writer_call_count": sum(item["writer_call_count"] for item in manifest["episode_records"]), "revision_count": sum(item["revision_count"] for item in manifest["episode_records"]), "acceptance_verdict": manifest["acceptance_verdict"], "finals_exist": finals, "memory_chain_valid": _memory_chain_valid(run_dir, manifest), "rolling_plan_adapted": len({sha256_bytes(canonical_bytes(read_json(run_dir / "episode_sources" / f"{episode_id}.json")["rolling_plan"])) for episode_id in sources}) > 1}
+    result = {"mode": manifest.get("mode", "mock"), "pilot_id": manifest["pilot_id"], "status": manifest["status"], "episode_count": len(manifest["episode_ids"]), "completed_episode_count": len(manifest["completed_episodes"]), "completed_transition_count": len(manifest["completed_transitions"]), "active_episode_id": manifest["active_episode_id"], "episode_statuses": episodes, "writer_call_count": sum(item["writer_call_count"] for item in manifest["episode_records"]), "revision_count": sum(item["revision_count"] for item in manifest["episode_records"]), "acceptance_verdict": manifest["acceptance_verdict"], "finals_exist": finals, "memory_chain_valid": _memory_chain_valid(run_dir, manifest), "rolling_plan_adapted": len({sha256_bytes(canonical_bytes(read_json(run_dir / "episode_sources" / f"{episode_id}.json")["rolling_plan"])) for episode_id in sources}) > 1}
+    if result["mode"] == "live":
+        telemetry = read_json(run_dir / "pilot_live_calls.json")
+        calls = telemetry.get("calls", [])
+        call_ids = [call.get("call_id") for call in calls]
+        lease_sequences = [call.get("lease_sequence") for call in calls]
+        acceptance_calls = [call for call in calls if call.get("scope_id") == "pilot:acceptance"]
+        result.update({"model": manifest["model"], "key_pool_size": manifest["key_pool_size"], "configured_max_live": manifest["max_live"], "telemetry_schema_version": telemetry["schema_version"], "pilot_live_call_count": len(calls), "successful_live_calls": sum(call["status"] == "PASS" for call in calls), "failed_live_calls": sum(call["status"] == "FAIL" for call in calls), "transient_failure_count": sum(call["status"] == "FAIL" and call.get("error_class") in {"RATE_LIMITED", "PROVIDER_5XX", "TIMEOUT", "NETWORK_ERROR"} for call in calls), "contract_failure_count": len(telemetry.get("contract_failures", [])), "used_key_slots": sorted({call["key_slot"] for call in calls}), "rotation_count": sum(1 for call in calls if call["status"] == "FAIL" and call.get("error_class")), "episode_call_counts": {episode_id: len(read_json(run_dir / "episodes" / episode_id / "live_calls.json")["calls"]) for episode_id in manifest["completed_episodes"]}, "acceptance_call_count": len(acceptance_calls), "acceptance_pass_calls": sum(call["status"] == "PASS" for call in acceptance_calls), "call_ids_unique": len(call_ids) == len(set(call_ids)), "lease_sequences_unique": len(lease_sequences) == len(set(lease_sequences))})
+    return result
 
 
 def _memory_chain_valid(run_dir: Path, manifest: dict) -> bool:
