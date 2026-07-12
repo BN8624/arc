@@ -10,6 +10,7 @@ import pytest
 
 from arc.live_model import AtomicTelemetryStore, GemmaPoolClient, LiveConfig, MODEL_NAME, RoutingStateStore
 from arc.pipeline import PLANNING_ROLES, WaveCheckpoint
+from arc.pilot_contracts import PILOT_REVIEW_ROLES
 from arc.pilot import PilotPipeline
 from arc.storage import StorageError, read_json, write_json
 
@@ -61,7 +62,7 @@ class _PilotModels:
         if marker == self.owner.root.fail_once_at and marker not in self.owner.root.failed:
             self.owner.root.failed.add(marker)
             error = RuntimeError("injected transient")
-            error.status_code = 500
+            error.status_code = self.owner.root.fail_status_code
             raise error
         return _Response(self.owner.root.response(stage, role, payload))
 
@@ -78,9 +79,10 @@ class _PilotProvider:
 
 
 class _PilotProviderRoot:
-    def __init__(self, fail_once_at: str | None = None, hold_episode: str | None = None):
+    def __init__(self, fail_once_at: str | None = None, hold_episode: str | None = None, fail_status_code: int = 500):
         self.fail_once_at = fail_once_at
         self.hold_episode = hold_episode
+        self.fail_status_code = fail_status_code
         self.malformed_once_at: str | None = None
         self.failed: set[str] = set()
         self.malformed: set[str] = set()
@@ -198,6 +200,45 @@ def _make_interrupted_episode_output(tmp_path: Path) -> Path:
 
     manifest.update({"status": "RUNNING", "completed_episodes": ["episode_001"], "completed_transitions": ["episode_001_to_episode_002"], "active_episode_id": "episode_002", "episode_records": manifest["episode_records"][:1], "acceptance_verdict": None, "last_error": None, "pilot_live_call_count": len(kept_calls)})
     manifest["artifact_hashes"] = {key: value for key, value in manifest["artifact_hashes"].items() if key in {"episode_sources/episode_001.json", "episode_sources/episode_002.json", "transitions/episode_001_to_episode_002.json"}}
+    manifest["artifact_hashes"]["pilot_live_calls.json"] = root_hash
+    write_json(output / "pilot_manifest.json", manifest)
+    return output
+
+
+def _acceptance_worker(role: str) -> dict:
+    return {"worker_id": f"pilot_review-{role}", "role": role, "verdict": "OK", "primary_finding": f"synthetic {role} finding", "primary_risk": f"synthetic {role} risk", "evidence_refs": ["pilot_evidence_packet.json"], "proposal": {"dimension_result": "PASS", "critical_finding": None}}
+
+
+def _make_acceptance_partial_output(tmp_path: Path) -> Path:
+    output = tmp_path / "pilot-live"
+    client, _ = _pilot_client(output)
+    PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+
+    manifest = read_json(output / "pilot_manifest.json")
+    completed_roles = ["readability", "character_consistency", "continuity"]
+    (output / "pilot_review_workers.json").unlink(missing_ok=True)
+    (output / "pilot_acceptance.json").unlink(missing_ok=True)
+
+    checkpoint = WaveCheckpoint(
+        output / "pilot_review_workers.partial.json",
+        "pilot_review",
+        {"pilot_id": manifest["pilot_id"], "mode": manifest["mode"], "scenario": manifest["scenario"], "episode_ids": manifest["episode_ids"], "evidence_packet_hash": manifest["artifact_hashes"]["pilot_evidence_packet.json"]},
+        PILOT_REVIEW_ROLES,
+    )
+    for role in completed_roles:
+        checkpoint.save(role, _acceptance_worker(role))
+
+    telemetry = read_json(output / "pilot_live_calls.json")
+    kept_calls = [call for call in telemetry["calls"] if call["scope_id"] != "pilot:acceptance" or call["role"] in completed_roles]
+    telemetry["calls"] = kept_calls
+    root_hash = write_json(output / "pilot_live_calls.json", telemetry)
+    routing_state = read_json(output / "routing_state.json")
+    routing_state["next_lease_sequence"] = max(call["lease_sequence"] for call in kept_calls) + 1
+    write_json(output / "routing_state.json", routing_state)
+
+    manifest.update({"status": "RUNNING", "active_episode_id": None, "acceptance_verdict": None, "last_error": None, "pilot_live_call_count": len(kept_calls)})
+    manifest["artifact_hashes"].pop("pilot_review_workers.json", None)
+    manifest["artifact_hashes"].pop("pilot_acceptance.json", None)
     manifest["artifact_hashes"]["pilot_live_calls.json"] = root_hash
     write_json(output / "pilot_manifest.json", manifest)
     return output
@@ -528,17 +569,67 @@ def test_live_acceptance_calls_seven_scoped_desks(tmp_path):
 
 
 def test_live_acceptance_resume_calls_only_missing_dimensions(tmp_path):
-    output = tmp_path / "pilot-live"
-    client, _ = _pilot_client(output)
-    PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
-    before = len([call for call in read_json(output / "pilot_live_calls.json")["calls"] if call["scope_id"] == "pilot:acceptance"])
+    output = _make_acceptance_partial_output(tmp_path)
+    before_calls = read_json(output / "pilot_live_calls.json")["calls"]
+    before_acceptance = [call for call in before_calls if call["scope_id"] == "pilot:acceptance"]
 
     fresh_client, fresh_root = _pilot_client(output)
     result = PilotPipeline(fresh_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    markers = [marker for _, marker, _ in fresh_root.provider_calls]
 
-    assert result["no_op"] is True
-    assert fresh_root.provider_calls == []
-    assert len([call for call in read_json(output / "pilot_live_calls.json")["calls"] if call["scope_id"] == "pilot:acceptance"]) == before
+    assert result["no_op"] is False
+    assert result["manifest"]["status"] == "COMPLETE"
+    assert not any(_episode_from_prompt(prompt) for _, _, prompt in fresh_root.provider_calls)
+    assert not {"pilot_review:readability", "pilot_review:character_consistency", "pilot_review:continuity"} & set(markers)
+    assert {marker for marker in markers if marker.startswith("pilot_review:")} == {"pilot_review:rolling_plan_adaptation", "pilot_review:memory_correctness", "pilot_review:narrative_weight", "pilot_review:episode_to_episode_interest"}
+    after_acceptance = [call for call in read_json(output / "pilot_live_calls.json")["calls"] if call["scope_id"] == "pilot:acceptance"]
+    assert {call["call_id"] for call in before_acceptance}.issubset({call["call_id"] for call in after_acceptance})
+    assert not (output / "pilot_review_workers.partial.json").exists()
+    assert (output / "pilot_review_workers.json").exists()
+    assert (output / "pilot_acceptance.json").exists()
+
+
+def test_live_acceptance_partial_resume_preserves_existing_telemetry(tmp_path):
+    output = _make_acceptance_partial_output(tmp_path)
+    before_calls = read_json(output / "pilot_live_calls.json")["calls"]
+    before_completed = [call for call in before_calls if call["scope_id"] == "pilot:acceptance"]
+
+    fresh_client, _ = _pilot_client(output)
+    PilotPipeline(fresh_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    after_calls = read_json(output / "pilot_live_calls.json")["calls"]
+
+    for call in before_completed:
+        assert call in after_calls
+    assert len({call["call_id"] for call in after_calls}) == len(after_calls)
+    assert len({call["lease_sequence"] for call in after_calls}) == len(after_calls)
+
+
+def test_live_acceptance_partial_resume_rotates_key_for_missing_dimension(tmp_path):
+    output = _make_acceptance_partial_output(tmp_path)
+    provider_root = _PilotProviderRoot(fail_once_at="pilot_review:memory_correctness", fail_status_code=429)
+    fresh_client, _ = _pilot_client(output, provider_root)
+
+    PilotPipeline(fresh_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+
+    calls = [call for call in read_json(output / "pilot_live_calls.json")["calls"] if call["desk_id"] == "pilot:acceptance:pilot_review:memory_correctness"]
+    prompts = [prompt for _, marker, prompt in provider_root.provider_calls if marker == "pilot_review:memory_correctness"]
+    assert [call["status"] for call in calls] == ["FAIL", "PASS"]
+    assert [call["attempt"] for call in calls] == [1, 2]
+    assert calls[0]["error_class"] == "RATE_LIMITED"
+    assert calls[0]["key_slot"] != calls[1]["key_slot"]
+    assert prompts[0] == prompts[1]
+    assert read_json(output / "pilot_manifest.json")["status"] == "COMPLETE"
+
+
+def test_live_acceptance_partial_resume_rejects_evidence_hash_mismatch(tmp_path):
+    output = _make_acceptance_partial_output(tmp_path)
+    partial = read_json(output / "pilot_review_workers.partial.json")
+    partial["wave_input_hash"] = "0" * 64
+    write_json(output / "pilot_review_workers.partial.json", partial)
+
+    fresh_client, _ = _pilot_client(output)
+    with pytest.raises(Exception, match="invalid wave checkpoint"):
+        PilotPipeline(fresh_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
 
 
 def test_live_acceptance_429_rotates_key_and_preserves_prompt(tmp_path):
