@@ -211,3 +211,45 @@ def test_corrupted_next_source_hash_fails_closed(tmp_path: Path) -> None:
     (output / "pilot_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     with pytest.raises(StorageError):
         PilotPipeline(MockModelClient("pass"), "pass").run(FIXTURE, output)
+
+
+def test_canonical_review_workers_resume_without_client_calls(tmp_path: Path) -> None:
+    _, output = run(tmp_path)
+    manifest_path = output / "pilot_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["status"] = "RUNNING"
+    manifest["acceptance_verdict"] = None
+    manifest["artifact_hashes"].pop("pilot_acceptance.json")
+    (output / "pilot_acceptance.json").unlink()
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    client = MockModelClient("pass")
+    PilotPipeline(client, "pass").run(FIXTURE, output)
+    assert not [call for call in client.calls if call[0] == "pilot_review"]
+    assert pilot_status(output)["status"] == "COMPLETE"
+
+
+def test_acceptance_exists_manifest_unfinalized_reconciles(tmp_path: Path) -> None:
+    _, output = run(tmp_path)
+    manifest_path = output / "pilot_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["status"] = "RUNNING"
+    manifest["acceptance_verdict"] = None
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    client = MockModelClient("pass")
+    PilotPipeline(client, "pass").run(FIXTURE, output)
+    assert client.calls == []
+    assert pilot_status(output)["acceptance_verdict"] == "PASS"
+
+
+def test_corrupted_canonical_review_workers_fails_closed(tmp_path: Path) -> None:
+    _, output = run(tmp_path)
+    (output / "pilot_review_workers.json").write_text("[]", encoding="utf-8")
+    with pytest.raises(StorageError):
+        PilotPipeline(MockModelClient("pass"), "pass").run(FIXTURE, output)
+
+
+def test_corrupted_pilot_acceptance_fails_closed(tmp_path: Path) -> None:
+    _, output = run(tmp_path)
+    (output / "pilot_acceptance.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(StorageError):
+        PilotPipeline(MockModelClient("pass"), "pass").run(FIXTURE, output)

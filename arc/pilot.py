@@ -102,6 +102,10 @@ class PilotPipeline:
             acceptance = self._acceptance(evidence, workers)
             self._write_artifact(run_dir, manifest, "pilot_acceptance.json", acceptance)
             manifest["acceptance_verdict"] = acceptance["verdict"]
+        else:
+            acceptance = read_json(run_dir / "pilot_acceptance.json")
+            validate_pilot_acceptance(acceptance, self._evidence_refs(manifest))
+            manifest["acceptance_verdict"] = acceptance["verdict"]
         manifest["status"] = "COMPLETE" if manifest["acceptance_verdict"] == "PASS" else "HOLD"
         manifest["active_episode_id"] = None
         self._save_manifest(run_dir, manifest)
@@ -187,6 +191,14 @@ class PilotPipeline:
             evidence["transitions"].append(read_json(run_dir / name))
             refs.append(name)
         self._write_artifact(run_dir, manifest, "pilot_evidence_packet.json", evidence)
+        return refs
+
+    def _evidence_refs(self, manifest: dict) -> list[str]:
+        refs = []
+        for episode_id in manifest["episode_ids"]:
+            refs.extend([f"episodes/{episode_id}/final.md", f"episodes/{episode_id}/memory_after.json"])
+        for episode_id, next_id in zip(manifest["episode_ids"], manifest["episode_ids"][1:]):
+            refs.append(f"transitions/{episode_id}_to_{next_id}.json")
         return refs
 
     def _review_workers(self, run_dir: Path, manifest: dict, evidence_refs: list[str]) -> list[dict]:
