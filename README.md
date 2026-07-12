@@ -29,9 +29,9 @@ Before planning, implementing, reviewing, or modifying ARC:
 
 ## Current Phase
 
-`PHASE_2_LIVE_SINGLE_EPISODE_VALIDATION`
+`PHASE_3_FIVE_EPISODE_PILOT`
 
-This phase validates one disposable synthetic episode with live `gemma-4-31b-it` calls and an 11-key pool. It never creates the first real work.
+This phase validates five sequential episodes for one disposable synthetic test work. It tests continuity, rolling-plan adaptation, memory correctness, readability, and episode-to-episode interest. It does not create ARC's first real work.
 
 Mock validation commands:
 
@@ -43,7 +43,7 @@ arc live-run tests/fixtures/live_synthetic_work.json --output .tmp/phase2-live
 arc live-status .tmp/phase2-live
 ```
 
-Live commands use real keys, quota, and cost only for the synthetic Phase 2 validation. `ARC_CANON.md` remains the canonical contract.
+The live commands above are historical Phase 2 validation commands. `ARC_CANON.md` remains the canonical contract.
 
 Current deliverables:
 

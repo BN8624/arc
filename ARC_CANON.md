@@ -390,13 +390,26 @@ Validate long-horizon drift and memory integrity.
 Current phase:
 
 ```text
-PHASE_2_LIVE_SINGLE_EPISODE_VALIDATION
+PHASE_3_FIVE_EPISODE_PILOT
+```
+
+Previous phase result:
+
+```text
+PHASE_2_COMPLETE
+```
+
+Phase 2 evidence:
+
+```text
+PHASE_2_COMPLETION_REVIEW.md
+implementation baseline: a094dd9
 ```
 
 Next deliverable:
 
 ```text
-Implement and validate one live synthetic episode with the 11-key Gemma pool.
+Implement and validate five sequential episodes for one disposable synthetic test work while preserving shared memory, continuity, and rolling-plan adaptation.
 ```
 
 Next implementation after approval:
