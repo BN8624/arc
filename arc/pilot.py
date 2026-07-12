@@ -31,6 +31,7 @@ class PilotPipeline:
                 raise PilotError("pilot input changed; refusing reuse")
             verify_pilot_artifacts(run_dir, manifest)
             if manifest["status"] in {"COMPLETE", "HOLD"}:
+                (run_dir / "pilot_review_workers.partial.json").unlink(missing_ok=True)
                 return {"no_op": True, "manifest": manifest}
         else:
             run_dir.mkdir(parents=True, exist_ok=True)

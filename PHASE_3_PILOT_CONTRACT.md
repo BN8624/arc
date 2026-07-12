@@ -22,6 +22,8 @@ Completed episodes and transitions are never rerun. A current episode delegates 
 
 The seven acceptance dimensions execute through `client.generate(stage="pilot_review", role=dimension, prompt=canonical_prompt)`. Their validated successes are atomically stored in `pilot_review_workers.partial.json`. Restart reuses completed dimensions and calls only missing ones. Terminal desk errors preserve other successful partial results. Canonical review workers and acceptance artifacts are committed before the partial checkpoint is removed.
 
+Malformed, hash-mismatched, unknown, or duplicate acceptance partial dimensions fail closed. COMPLETE and both HOLD no-op reruns make no episode, transition, or pilot-review calls and preserve canonical artifact hashes. A stale partial after a verified terminal pilot state is removed without changing canonical artifacts.
+
 ## Pilot Acceptance
 
 The acceptance review has seven logical dimensions: readability, character consistency, continuity, rolling-plan adaptation, memory correctness, narrative weight, and episode-to-episode interest. All seven must PASS for pilot PASS. A HOLD dimension requires at least one unique critical finding, and PASS may not contain a critical finding. The review does not automatically enter Phase 4.

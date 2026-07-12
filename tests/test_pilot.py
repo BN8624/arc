@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,8 @@ from arc.mock_model import MockModelClient
 from arc.pilot import PilotError, PilotPipeline, pilot_status
 from arc.pilot_contracts import validate_pilot_fixture
 from arc.storage import StorageError
+from arc.pipeline import WaveCheckpoint
+from arc.pilot_contracts import PILOT_REVIEW_ROLES
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "pilot_synthetic_work.json"
@@ -253,3 +256,89 @@ def test_corrupted_pilot_acceptance_fails_closed(tmp_path: Path) -> None:
     (output / "pilot_acceptance.json").write_text("{}", encoding="utf-8")
     with pytest.raises(StorageError):
         PilotPipeline(MockModelClient("pass"), "pass").run(FIXTURE, output)
+
+
+def _acceptance_restart(tmp_path: Path) -> tuple[Path, dict]:
+    _, output = run(tmp_path)
+    manifest_path = output / "pilot_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["status"] = "RUNNING"
+    manifest["acceptance_verdict"] = None
+    for name in ("pilot_review_workers.json", "pilot_acceptance.json"):
+        manifest["artifact_hashes"].pop(name)
+        (output / name).unlink()
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    return output, manifest
+
+
+def _review_input(manifest: dict) -> dict:
+    return {"pilot_id": manifest["pilot_id"], "mode": manifest["mode"], "scenario": manifest["scenario"], "episode_ids": manifest["episode_ids"], "evidence_packet_hash": manifest["artifact_hashes"]["pilot_evidence_packet.json"]}
+
+
+def _review_worker(role: str) -> dict:
+    return {"worker_id": f"pilot_review-{role}", "role": role, "verdict": "OK", "primary_finding": "f", "primary_risk": "r", "evidence_refs": ["pilot_evidence_packet.json"], "proposal": {"dimension_result": "PASS", "critical_finding": None}}
+
+
+def test_malformed_acceptance_partial_fails_closed(tmp_path: Path) -> None:
+    output, _ = _acceptance_restart(tmp_path)
+    (output / "pilot_review_workers.partial.json").write_text("{", encoding="utf-8")
+    with pytest.raises(Exception):
+        PilotPipeline(MockModelClient("pass"), "pass").run(FIXTURE, output)
+
+
+def test_acceptance_partial_result_hash_mismatch_fails_closed(tmp_path: Path) -> None:
+    output, manifest = _acceptance_restart(tmp_path)
+    checkpoint = WaveCheckpoint(output / "pilot_review_workers.partial.json", "pilot_review", _review_input(manifest), PILOT_REVIEW_ROLES)
+    checkpoint.save("readability", _review_worker("readability"))
+    partial = json.loads((output / "pilot_review_workers.partial.json").read_text(encoding="utf-8"))
+    partial["completed_desks"]["pilot_review:readability"]["result_sha256"] = "bad"
+    (output / "pilot_review_workers.partial.json").write_text(json.dumps(partial), encoding="utf-8")
+    with pytest.raises(Exception):
+        PilotPipeline(MockModelClient("pass"), "pass").run(FIXTURE, output)
+
+
+def test_acceptance_partial_unknown_dimension_fails_closed(tmp_path: Path) -> None:
+    output, manifest = _acceptance_restart(tmp_path)
+    checkpoint = WaveCheckpoint(output / "pilot_review_workers.partial.json", "pilot_review", _review_input(manifest), PILOT_REVIEW_ROLES)
+    checkpoint.save("readability", _review_worker("readability"))
+    partial = json.loads((output / "pilot_review_workers.partial.json").read_text(encoding="utf-8"))
+    partial["completed_desks"]["pilot_review:unknown"] = partial["completed_desks"].pop("pilot_review:readability")
+    (output / "pilot_review_workers.partial.json").write_text(json.dumps(partial), encoding="utf-8")
+    with pytest.raises(Exception):
+        PilotPipeline(MockModelClient("pass"), "pass").run(FIXTURE, output)
+
+
+def test_acceptance_partial_duplicate_dimension_fails_closed(tmp_path: Path) -> None:
+    output, manifest = _acceptance_restart(tmp_path)
+    checkpoint = WaveCheckpoint(output / "pilot_review_workers.partial.json", "pilot_review", _review_input(manifest), PILOT_REVIEW_ROLES)
+    checkpoint.save("readability", _review_worker("readability"))
+    partial = json.loads((output / "pilot_review_workers.partial.json").read_text(encoding="utf-8"))
+    partial["expected_desks"].append("pilot_review:readability")
+    (output / "pilot_review_workers.partial.json").write_text(json.dumps(partial), encoding="utf-8")
+    with pytest.raises(Exception):
+        PilotPipeline(MockModelClient("pass"), "pass").run(FIXTURE, output)
+
+
+@pytest.mark.parametrize("scenario", ["pass", "episode_hold", "pilot_hold"])
+def test_complete_rerun_is_noop(tmp_path: Path, scenario: str) -> None:
+    client, output = run(tmp_path, scenario)
+    before = {path.relative_to(output).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest() for path in output.rglob("*") if path.is_file()}
+    calls = len(client.calls)
+
+    class Spy(PilotPipeline):
+        def _transition(self, *args, **kwargs):
+            raise AssertionError("transition rerun")
+
+    result = Spy(client, scenario).run(FIXTURE, output)
+    after = {path.relative_to(output).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest() for path in output.rglob("*") if path.is_file()}
+    assert result["no_op"] is True
+    assert len(client.calls) == calls
+    assert before == after
+
+
+def test_episode_hold_rerun_is_noop(tmp_path: Path) -> None:
+    test_complete_rerun_is_noop(tmp_path, "episode_hold")
+
+
+def test_pilot_hold_rerun_is_noop(tmp_path: Path) -> None:
+    test_complete_rerun_is_noop(tmp_path, "pilot_hold")
