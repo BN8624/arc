@@ -100,12 +100,6 @@ class PilotPipeline:
                     self._save_manifest(run_dir, manifest)
                 else:
                     self._verify_completed_transition(run_dir, manifest, transition_id, episode_id, ids[index + 1], source, index)
-        if self.mode == "live":
-            manifest["active_episode_id"] = None
-            manifest["status"] = "COMPLETE"
-            self._save_pilot_live_calls(run_dir, manifest)
-            self._save_manifest(run_dir, manifest)
-            return
         if "pilot_acceptance.json" not in manifest["artifact_hashes"]:
             evidence = self._write_evidence_packet(run_dir, manifest)
             workers_path = run_dir / "pilot_review_workers.json"
@@ -119,6 +113,7 @@ class PilotPipeline:
                     self._review_worker_contract(worker, worker["role"])
             else:
                 workers = self._review_workers(run_dir, manifest, evidence)
+                self._save_pilot_live_calls(run_dir, manifest)
                 self._write_artifact(run_dir, manifest, "pilot_review_workers.json", workers)
             acceptance = self._acceptance(evidence, workers)
             self._write_artifact(run_dir, manifest, "pilot_acceptance.json", acceptance)
@@ -229,7 +224,7 @@ class PilotPipeline:
         first_error = None
         from concurrent.futures import ThreadPoolExecutor, as_completed
         with ThreadPoolExecutor(max_workers=len(PILOT_REVIEW_ROLES)) as executor:
-            futures = {executor.submit(self._review_worker, manifest, role, evidence_hash): role for role in PILOT_REVIEW_ROLES if not checkpoint.result(role)}
+            futures = {executor.submit(self._review_worker, run_dir, manifest, role, evidence_hash): role for role in PILOT_REVIEW_ROLES if not checkpoint.result(role)}
             for future in as_completed(futures):
                 try:
                     worker = future.result()
@@ -241,10 +236,19 @@ class PilotPipeline:
             raise first_error
         return sorted(workers, key=lambda worker: PILOT_REVIEW_ROLES.index(worker["role"]))
 
-    def _review_worker(self, manifest: dict, role: str, evidence_hash: str) -> dict:
-        prompt = json.dumps({"pilot_id": manifest["pilot_id"], "mode": manifest["mode"], "scenario": self.scenario, "episode_ids": manifest["episode_ids"], "evidence_packet_hash": evidence_hash, "dimension": role, "allowed_evidence_refs": ["pilot_evidence_packet.json"], "contract": "proposal.dimension_result is PASS or HOLD; HOLD requires proposal.critical_finding"}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        value = parse_object(self.client.generate(stage="pilot_review", role=role, prompt=prompt))
-        return self._review_worker_contract(value, role)
+    def _review_worker(self, run_dir: Path, manifest: dict, role: str, evidence_hash: str) -> dict:
+        payload = {"pilot_id": manifest["pilot_id"], "mode": manifest["mode"], "scenario": self.scenario, "episode_ids": manifest["episode_ids"], "evidence_packet_hash": evidence_hash, "dimension": role, "allowed_evidence_refs": ["pilot_evidence_packet.json"], "contract": "proposal.dimension_result is PASS or HOLD; HOLD requires proposal.critical_finding"}
+        if self.mode == "live":
+            payload.update({"pilot_evidence_packet": read_json(run_dir / "pilot_evidence_packet.json"), "dimension_question": f"Evaluate pilot dimension: {role}.", "strict_output_schema": {"worker_id": f"pilot_review-{role}", "role": role, "verdict": "OK", "primary_finding": "string", "primary_risk": "string", "evidence_refs": ["pilot_evidence_packet.json"], "proposal": {"dimension_result": "PASS|HOLD", "critical_finding": "string|null"}}})
+        prompt = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        client = self._acceptance_client() if self.mode == "live" else self.client
+        try:
+            value = parse_object(client.generate(stage="pilot_review", role=role, prompt=prompt))
+            return self._review_worker_contract(value, role)
+        except ContractError:
+            if self.mode == "live":
+                client.record_contract_failure("pilot_review", role, "UNKNOWN")
+            raise
 
     def _review_worker_contract(self, value: dict, role: str) -> dict:
         worker = validate_worker(value, f"pilot_review-{role}", role)
@@ -264,6 +268,9 @@ class PilotPipeline:
 
     def _episode_client(self, episode_id: str, index: int):
         return self.client.scope(scope_id=f"episode:{episode_id}", logical_order_base=index * 100)
+
+    def _acceptance_client(self):
+        return self.client.scope(scope_id="pilot:acceptance", logical_order_base=500)
 
     def _save_pilot_live_calls(self, run_dir: Path, manifest: dict) -> None:
         if self.mode == "live":

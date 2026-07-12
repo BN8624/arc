@@ -24,6 +24,7 @@ DESK_ORDER = (
     ("memory", "confirmed_facts"), ("memory", "relationships"), ("memory", "conflicts_and_promises"), ("memory", "important_excerpts"), ("memory_merge", "merge"),
 )
 LIVE_LOGICAL_ORDER = {desk: index for index, desk in enumerate(DESK_ORDER, start=1)}
+PILOT_ACCEPTANCE_ORDER = {("pilot_review", role): index for index, role in enumerate(("readability", "character_consistency", "continuity", "rolling_plan_adaptation", "memory_correctness", "narrative_weight", "episode_to_episode_interest"), start=1)}
 
 
 class LiveConfigError(ValueError):
@@ -51,11 +52,12 @@ def logical_desk(stage: str, role: str) -> LogicalDesk:
 
 
 def scoped_logical_desk(scope_id: str, logical_order_base: int, stage: str, role: str) -> LogicalDesk:
+    order = LIVE_LOGICAL_ORDER[(stage, role)] if (stage, role) in LIVE_LOGICAL_ORDER else PILOT_ACCEPTANCE_ORDER[(stage, role)]
     return LogicalDesk(
         f"{scope_id}:{stage}:{role}",
         stage,
         role,
-        logical_order_base + LIVE_LOGICAL_ORDER[(stage, role)],
+        logical_order_base + order,
         scope_id,
     )
 
@@ -240,7 +242,7 @@ class ScopedGemmaPoolClient:
         return self.base.generate_for_desk(desk=scoped_logical_desk(self.scope_id, self.logical_order_base, desk.stage, desk.role), prompt=prompt)
 
     def generate(self, *, stage: str, role: str, prompt: str) -> str:
-        return self.generate_for_desk(desk=logical_desk(stage, role), prompt=prompt)
+        return self.base.generate_for_desk(desk=scoped_logical_desk(self.scope_id, self.logical_order_base, stage, role), prompt=prompt)
 
     @property
     def sdk_version(self) -> str:

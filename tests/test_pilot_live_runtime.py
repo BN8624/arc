@@ -46,9 +46,14 @@ class _PilotModels:
         self.owner = owner
 
     def generate_content(self, *, model: str, contents: str, config: dict) -> _Response:
-        stage = contents.split("Stage: ", 1)[1].split("\n", 1)[0]
-        role = contents.split("Role: ", 1)[1].split("\n", 1)[0]
-        payload = json.loads(contents.split("Input JSON:\n", 1)[1])
+        if "Input JSON:\n" in contents:
+            stage = contents.split("Stage: ", 1)[1].split("\n", 1)[0]
+            role = contents.split("Role: ", 1)[1].split("\n", 1)[0]
+            payload = json.loads(contents.split("Input JSON:\n", 1)[1])
+        else:
+            payload = json.loads(contents)
+            stage = "pilot_review"
+            role = payload["dimension"]
         marker = f"{stage}:{role}"
         self.owner.root.provider_calls.append((self.owner.slot, marker, contents))
         if marker == self.owner.root.fail_once_at and marker not in self.owner.root.failed:
@@ -74,7 +79,9 @@ class _PilotProviderRoot:
     def __init__(self, fail_once_at: str | None = None, hold_episode: str | None = None):
         self.fail_once_at = fail_once_at
         self.hold_episode = hold_episode
+        self.malformed_once_at: str | None = None
         self.failed: set[str] = set()
+        self.malformed: set[str] = set()
         self.provider_calls: list[tuple[str, str, str]] = []
 
     def factory(self, key: str) -> _PilotProvider:
@@ -85,6 +92,12 @@ class _PilotProviderRoot:
         if stage in {"planning", "review", "memory"}:
             evidence = ["final.md"] if stage == "memory" else ["source:current_episode"]
             return json.dumps({"worker_id": f"{stage}-{role}", "role": role, "verdict": "OK", "primary_finding": f"synthetic {role} finding", "primary_risk": f"synthetic {role} risk", "evidence_refs": evidence, "proposal": {"role": role}})
+        if stage == "pilot_review":
+            marker = f"{stage}:{role}"
+            if marker == self.malformed_once_at and marker not in self.malformed:
+                self.malformed.add(marker)
+                return "{malformed"
+            return json.dumps({"worker_id": f"pilot_review-{role}", "role": role, "verdict": "OK", "primary_finding": f"synthetic {role} finding", "primary_risk": f"synthetic {role} risk", "evidence_refs": ["pilot_evidence_packet.json"], "proposal": {"dimension_result": "PASS", "critical_finding": None}})
         if stage == "planning_merge":
             return json.dumps({"episode_id": episode_id, "immediate_objective": "synthetic objective", "obstacle": "synthetic obstacle", "protagonist_action": "synthetic action", "meaningful_change": "synthetic change", "episode_ending": "synthetic ending", "selected_worker_ids": ["planning-event"], "continuity_constraints": ["synthetic constraint"]})
         if stage == "writer":
@@ -248,7 +261,8 @@ def test_live_pilot_runs_five_episodes_with_one_base_client(tmp_path):
     assert manifest["status"] == "COMPLETE"
     assert manifest["completed_episodes"] == manifest["episode_ids"]
     assert manifest["pilot_live_call_count"] == len(read_json(output / "pilot_live_calls.json")["calls"])
-    assert len({call["scope_id"] for call in read_json(output / "pilot_live_calls.json")["calls"]}) == 5
+    episode_scopes = {call["scope_id"] for call in read_json(output / "pilot_live_calls.json")["calls"] if call["scope_id"].startswith("episode:")}
+    assert len(episode_scopes) == 5
     assert provider_root.provider_calls
 
 
@@ -279,7 +293,7 @@ def test_live_pilot_preserves_pool_cursor_between_episodes(tmp_path):
 
     calls = read_json(output / "pilot_live_calls.json")["calls"]
     lease_sequences = [call["lease_sequence"] for call in calls]
-    assert lease_sequences == sorted(lease_sequences)
+    assert sorted(lease_sequences) == list(range(1, len(calls) + 1))
     assert max(lease_sequences) == len(calls)
 
 
@@ -351,3 +365,108 @@ def test_live_pilot_hold_rerun_is_noop(tmp_path):
     assert result["no_op"] is True
     assert provider_root.provider_calls == []
     assert len(read_json(output / "pilot_live_calls.json")["calls"]) == before
+
+
+def _acceptance_prompts(provider_root: _PilotProviderRoot) -> list[str]:
+    return [prompt for _, marker, prompt in provider_root.provider_calls if marker.startswith("pilot_review:")]
+
+
+def test_live_acceptance_prompt_contains_canonical_evidence(tmp_path):
+    output = tmp_path / "pilot-live"
+    client, provider_root = _pilot_client(output)
+
+    PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+
+    prompt = json.loads(_acceptance_prompts(provider_root)[0])
+    assert prompt["pilot_id"] == read_json(output / "pilot_manifest.json")["pilot_id"]
+    assert len(prompt["pilot_evidence_packet"]["episodes"]) == 5
+    assert "final" in prompt["pilot_evidence_packet"]["episodes"][0]
+
+
+def test_live_acceptance_prompt_is_deterministic(tmp_path):
+    first_output = tmp_path / "first"
+    first_client, first_root = _pilot_client(first_output)
+    PilotPipeline(first_client, scenario=None, mode="live").run(PILOT_FIXTURE, first_output)
+
+    second_output = tmp_path / "second"
+    second_client, second_root = _pilot_client(second_output)
+    PilotPipeline(second_client, scenario=None, mode="live").run(PILOT_FIXTURE, second_output)
+
+    assert sorted(_acceptance_prompts(first_root)) == sorted(_acceptance_prompts(second_root))
+
+
+def test_live_acceptance_uses_shared_base_client(tmp_path):
+    output = tmp_path / "pilot-live"
+    client, _ = _pilot_client(output)
+
+    PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+
+    calls = read_json(output / "pilot_live_calls.json")["calls"]
+    assert {call["scope_id"] for call in calls if call["scope_id"] == "pilot:acceptance"} == {"pilot:acceptance"}
+    assert client.scope(scope_id="pilot:acceptance", logical_order_base=500).pool is client.pool
+
+
+def test_live_acceptance_calls_seven_scoped_desks(tmp_path):
+    output = tmp_path / "pilot-live"
+    client, _ = _pilot_client(output)
+
+    PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+
+    calls = [call for call in read_json(output / "pilot_live_calls.json")["calls"] if call["scope_id"] == "pilot:acceptance" and call["status"] == "PASS"]
+    assert [call["role"] for call in calls] == ["readability", "character_consistency", "continuity", "rolling_plan_adaptation", "memory_correctness", "narrative_weight", "episode_to_episode_interest"]
+
+
+def test_live_acceptance_resume_calls_only_missing_dimensions(tmp_path):
+    output = tmp_path / "pilot-live"
+    client, _ = _pilot_client(output)
+    PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    before = len([call for call in read_json(output / "pilot_live_calls.json")["calls"] if call["scope_id"] == "pilot:acceptance"])
+
+    fresh_client, fresh_root = _pilot_client(output)
+    result = PilotPipeline(fresh_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+
+    assert result["no_op"] is True
+    assert fresh_root.provider_calls == []
+    assert len([call for call in read_json(output / "pilot_live_calls.json")["calls"] if call["scope_id"] == "pilot:acceptance"]) == before
+
+
+def test_live_acceptance_429_rotates_key_and_preserves_prompt(tmp_path):
+    output = tmp_path / "pilot-live"
+    provider_root = _PilotProviderRoot(fail_once_at="pilot_review:continuity")
+    client, _ = _pilot_client(output, provider_root)
+
+    PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+
+    calls = [call for call in read_json(output / "pilot_live_calls.json")["calls"] if call["desk_id"] == "pilot:acceptance:pilot_review:continuity"]
+    prompts = [prompt for _, marker, prompt in provider_root.provider_calls if marker == "pilot_review:continuity"]
+    assert [call["attempt"] for call in calls[:2]] == [1, 2]
+    assert [call["status"] for call in calls[:2]] == ["FAIL", "PASS"]
+    assert calls[0]["key_slot"] != calls[1]["key_slot"]
+    assert prompts[0] == prompts[1]
+
+
+def test_live_acceptance_terminal_error_preserves_other_successes(tmp_path):
+    output = tmp_path / "pilot-live"
+    provider_root = _PilotProviderRoot()
+    provider_root.malformed_once_at = "pilot_review:continuity"
+    client, _ = _pilot_client(output, provider_root)
+
+    with pytest.raises(Exception):
+        PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+
+    partial = read_json(output / "pilot_review_workers.partial.json")
+    assert partial["completed_desks"]
+    assert "pilot_acceptance.json" not in read_json(output / "pilot_manifest.json")["artifact_hashes"]
+    assert read_json(output / "pilot_live_calls.json")["contract_failures"]
+
+
+def test_acceptance_calls_exist_only_in_pilot_root_telemetry(tmp_path):
+    output = tmp_path / "pilot-live"
+    client, _ = _pilot_client(output)
+
+    PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+
+    root_calls = read_json(output / "pilot_live_calls.json")["calls"]
+    assert any(call["scope_id"] == "pilot:acceptance" for call in root_calls)
+    for episode_file in (output / "episodes").glob("*/live_calls.json"):
+        assert all(call["scope_id"] != "pilot:acceptance" for call in read_json(episode_file)["calls"])
