@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 from copy import deepcopy
 from typing import Protocol
 
@@ -98,6 +99,30 @@ def validate_memory(value: dict, episode_id: str) -> dict:
     if "final.md" not in value["evidence_refs"]:
         raise ContractError("memory evidence must cite final.md")
     return value
+
+
+def conflict_options(open_conflicts: list[str]) -> dict[str, str]:
+    return {f"OC{index:03d}": conflict for index, conflict in enumerate(open_conflicts, start=1)}
+
+
+def apply_conflict_selectors(value: dict, open_conflicts: list[str]) -> dict:
+    canonical_fields = {"episode_id", "confirmed_facts_added", "relationship_changes", "conflicts_resolved", "conflicts_opened", "promises_added", "important_excerpts_added", "episode_summary", "required_next_episode_continuity", "evidence_refs"}
+    provider_fields = canonical_fields - {"conflicts_resolved"} | {"conflict_ids_resolved"}
+    if set(value) != provider_fields:
+        raise ContractError("memory selector response fields are invalid")
+    selected = value["conflict_ids_resolved"]
+    if not isinstance(selected, list) or any(not isinstance(item, str) or not re.fullmatch(r"OC\d{3}", item) for item in selected):
+        raise ContractError("memory selector IDs are invalid")
+    if len(selected) != len(set(selected)):
+        raise ContractError("memory selector IDs are duplicated")
+    options = conflict_options(open_conflicts)
+    if set(selected) - options.keys():
+        raise ContractError("memory selector ID is unknown")
+    resolved = [conflict for identifier, conflict in options.items() if identifier in selected]
+    canonical = dict(value)
+    canonical.pop("conflict_ids_resolved")
+    canonical["conflicts_resolved"] = resolved
+    return canonical
 
 
 def apply_memory_update(source: dict, update: dict) -> dict:

@@ -29,18 +29,21 @@ Before planning, implementing, reviewing, or modifying ARC:
 
 ## Current Phase
 
-`PHASE_1_MOCK_VERTICAL_LOOP`
+`PHASE_2_LIVE_SINGLE_EPISODE_VALIDATION`
 
-This phase validates one synthetic episode vertical loop with an injected mock model. It does not call a real model or generate a real work.
+This phase validates one disposable synthetic episode with live `gemma-4-31b-it` calls and an 11-key pool. It never creates the first real work.
 
 Mock validation commands:
 
 ```bash
 arc mock-run tests/fixtures/synthetic_work.json --output .tmp/phase1-pass --scenario pass
 arc mock-status .tmp/phase1-pass
+arc live-preflight --output .tmp/phase2-preflight
+arc live-run tests/fixtures/live_synthetic_work.json --output .tmp/phase2-live
+arc live-status .tmp/phase2-live
 ```
 
-The mock CLI is only for Phase 1 validation. `ARC_CANON.md` remains the canonical contract.
+Live commands use real keys, quota, and cost only for the synthetic Phase 2 validation. `ARC_CANON.md` remains the canonical contract.
 
 Current deliverables:
 

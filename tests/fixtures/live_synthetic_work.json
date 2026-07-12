@@ -1,0 +1,26 @@
+{
+  "fixture_id": "live_synthetic_work_v1",
+  "series_compass": {
+    "reader_promise": "작은 선택이 도시의 빛을 바꾸는 합성 연작",
+    "protagonist_drive": "기록을 지키려는 견습 수리공의 책임",
+    "major_direction": "빛의 규칙을 둘러싼 신뢰 회복",
+    "possible_ending_direction": "공동 기록소의 재개"
+  },
+  "world_rules": [{"id": "WR1", "text": "새벽 종이 울리기 전에는 등불의 기억을 복제할 수 없다."}],
+  "characters": [
+    {"id": "CHAR1", "name": "연우", "stable_traits": ["신중함", "수리 기술"]},
+    {"id": "CHAR2", "name": "도윤", "stable_traits": ["솔직함", "성급함"]}
+  ],
+  "confirmed_facts": ["연우는 중앙 기록소의 견습 수리공이다."],
+  "relationship_state": ["연우와 도윤은 함께 야간 점검을 맡지만 최근의 실수로 어색하다."],
+  "open_conflicts": ["어젯밤 사라진 등불 기록의 원인을 두 사람이 서로 다르게 추측한다."],
+  "promises": ["연우는 오늘 새벽 전까지 도윤에게 사실을 숨기지 않겠다고 약속했다."],
+  "episode_summaries": ["합성 도시의 기록소에서 야간 점검이 시작되었다."],
+  "important_excerpts": ["등불은 빛보다 먼저 약속을 기억한다."],
+  "rolling_plan": {
+    "near_horizon": ["사라진 기록의 원인을 확인한다."],
+    "immediate_horizon": ["연우가 고장 난 등불 하나를 직접 수리한다."]
+  },
+  "required_next_episode_continuity": ["도윤이 연우의 판단을 아직 완전히 믿지 못한다."],
+  "current_episode": {"episode_id": "LIVE001", "importance": "ordinary", "required_role": "야간 점검 중 사라진 기록 하나를 되돌리고 관계의 작은 균열을 드러낸다."}
+}

@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import json
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from .contracts import ContractError, ModelClient, apply_memory_update, parse_object, validate_fixture, validate_memory, validate_plan, validate_review, validate_worker
+from .contracts import ContractError, ModelClient, apply_conflict_selectors, apply_memory_update, parse_object, validate_fixture, validate_memory, validate_plan, validate_review, validate_worker
 from .storage import StorageError, read_json, sha256_bytes, sha256_file, verify_artifacts, write_json, write_text
 
 PLANNING_ROLES = ["event", "protagonist_action", "relationship", "continuity", "readability_weight", "reader_payoff"]
@@ -18,11 +19,11 @@ class PipelineError(RuntimeError):
 
 
 class MockPipeline:
-    def __init__(self, client: ModelClient):
-        self.client = client
+    def __init__(self, client: ModelClient, mode: str = "mock"):
+        self.client, self.mode = client, mode
 
-    def run(self, fixture_path: Path, run_dir: Path, scenario: str) -> dict:
-        if scenario not in {"pass", "revise", "hold"}:
+    def run(self, fixture_path: Path, run_dir: Path, scenario: str | None) -> dict:
+        if self.mode == "mock" and scenario not in {"pass", "revise", "hold"}:
             raise PipelineError("unknown scenario")
         raw = fixture_path.read_bytes()
         source = json.loads(raw.decode("utf-8"))
@@ -31,27 +32,33 @@ class MockPipeline:
         manifest_path = run_dir / "manifest.json"
         if manifest_path.exists():
             manifest = read_json(manifest_path)
-            if manifest["source_hash"] != source_hash or manifest["scenario"] != scenario:
+            if manifest["source_hash"] != source_hash or manifest["scenario"] != scenario or manifest.get("mode", "mock") != self.mode:
                 raise PipelineError("source or scenario changed; refusing reuse")
             verify_artifacts(run_dir, manifest)
+            if self.mode == "live" and (run_dir / "live_calls.json").exists():
+                self.client.restore_telemetry(read_json(run_dir / "live_calls.json"))
+                self._reconcile_invalid_memory_merge(source, run_dir, manifest)
             if manifest["status"] in {"COMPLETE", "HOLD"}:
                 return {"no_op": True, "manifest": manifest}
         else:
             run_dir.mkdir(parents=True, exist_ok=True)
-            manifest = {"schema_version": 1, "fixture_id": source["fixture_id"], "episode_id": source["current_episode"]["episode_id"], "scenario": scenario, "status": "RUNNING", "completed_stages": [], "source_hash": source_hash, "artifact_hashes": {}, "writer_call_count": 0, "revision_count": 0, "review_verdict": None, "last_error": None}
+            manifest = {"schema_version": 1, "mode": self.mode, "fixture_id": source["fixture_id"], "episode_id": source["current_episode"]["episode_id"], "scenario": scenario, "status": "RUNNING", "completed_stages": [], "source_hash": source_hash, "artifact_hashes": {}, "writer_call_count": 0, "revision_count": 0, "review_verdict": None, "last_error": None}
+            if self.mode == "live":
+                manifest.update({"provider": "gemini_developer_api", "model": self.client.config.model, "sdk_version": self.client.sdk_version, "key_pool_size": 11, "max_live": self.client.config.max_live, "live_call_count": 0})
             write_json(manifest_path, manifest)
         try:
             self._advance(source, run_dir, manifest)
         except Exception as error:
             manifest["status"] = "ERROR"
-            manifest["last_error"] = str(error)
+            manifest["last_error"] = self._error_record(error)
+            self._save_live_calls(run_dir, manifest)
             write_json(manifest_path, manifest)
             raise
         return {"no_op": False, "manifest": manifest}
 
     def _advance(self, source: dict, run_dir: Path, manifest: dict) -> None:
         if "CONTEXT_ASSEMBLED" not in manifest["completed_stages"]:
-            context = {"fixture_id": source["fixture_id"], "episode_id": source["current_episode"]["episode_id"], "current_episode": source["current_episode"], "series_compass": source["series_compass"], "world_rules": source["world_rules"], "characters": source["characters"], "confirmed_facts": source["confirmed_facts"], "relationship_state": source["relationship_state"], "open_conflicts": source["open_conflicts"], "recent_summaries": source["episode_summaries"], "important_excerpts": source["important_excerpts"], "rolling_plan": source["rolling_plan"], "source_hash": manifest["source_hash"]}
+            context = {"fixture_id": source["fixture_id"], "episode_id": source["current_episode"]["episode_id"], "current_episode": source["current_episode"], "series_compass": source["series_compass"], "world_rules": source["world_rules"], "characters": source["characters"], "confirmed_facts": source["confirmed_facts"], "relationship_state": source["relationship_state"], "open_conflicts": source["open_conflicts"], "promises": source["promises"], "recent_summaries": source["episode_summaries"], "important_excerpts": source["important_excerpts"], "rolling_plan": source["rolling_plan"], "required_next_episode_continuity": source["required_next_episode_continuity"], "source_hash": manifest["source_hash"]}
             self._commit(run_dir, manifest, "context_packet.json", context, "CONTEXT_ASSEMBLED")
         context = read_json(run_dir / "context_packet.json")
         if "PLANNING_WAVE_COMPLETED" not in manifest["completed_stages"]:
@@ -59,12 +66,11 @@ class MockPipeline:
             self._commit(run_dir, manifest, "planning_workers.json", workers, "PLANNING_WAVE_COMPLETED")
         planning = read_json(run_dir / "planning_workers.json")
         if "PLAN_MERGED" not in manifest["completed_stages"]:
-            value = validate_plan(parse_object(self.client.generate(stage="planning_merge", role="merge", prompt=json.dumps({"context": context, "workers": planning}))), manifest["episode_id"])
+            value = validate_plan(parse_object(self._request("planning_merge", "merge", {"context": context, "workers": planning})), manifest["episode_id"])
             self._commit(run_dir, manifest, "episode_plan.json", value, "PLAN_MERGED")
         plan = read_json(run_dir / "episode_plan.json")
         if "DRAFT_COMPLETED" not in manifest["completed_stages"]:
-            value = parse_object(self.client.generate(stage="writer", role="canonical", prompt=json.dumps({"context": context, "plan": plan})))
-            text = value.get("text")
+            text = self._prose("writer", {"context": context, "plan": plan})
             if not isinstance(text, str) or not text.strip() or text.lstrip().startswith(("{", "[")):
                 raise ContractError("invalid canonical draft")
             manifest["writer_call_count"] += 1
@@ -75,18 +81,18 @@ class MockPipeline:
             self._commit(run_dir, manifest, "review_workers.json", workers, "REVIEW_WAVE_COMPLETED")
         review_workers = read_json(run_dir / "review_workers.json")
         if "REVIEW_MERGED" not in manifest["completed_stages"]:
-            decision = validate_review(parse_object(self.client.generate(stage="review_merge", role="merge", prompt=json.dumps({"context": context, "plan": plan, "draft": draft, "workers": review_workers}))))
+            decision = validate_review(parse_object(self._request("review_merge", "merge", {"context": context, "plan": plan, "draft": draft, "workers": review_workers})))
             manifest["review_verdict"] = decision["verdict"]
             self._commit(run_dir, manifest, "review_decision.json", decision, "REVIEW_MERGED")
         decision = read_json(run_dir / "review_decision.json")
         if decision["verdict"] == "HOLD":
             manifest["status"] = "HOLD"
             manifest["last_error"] = None
+            self._save_live_calls(run_dir, manifest)
             self._save_manifest(run_dir, manifest)
             return
         if decision["verdict"] == "REVISE_ONCE" and "REVISION_COMPLETED" not in manifest["completed_stages"]:
-            value = parse_object(self.client.generate(stage="revision", role="canonical", prompt=json.dumps({"context": context, "plan": plan, "draft": draft, "decision": decision})))
-            text = value.get("text")
+            text = self._prose("revision", {"context": context, "plan": plan, "draft": draft, "decision": decision})
             if not isinstance(text, str) or not text.strip():
                 raise ContractError("invalid revision")
             manifest["revision_count"] = 1
@@ -100,24 +106,83 @@ class MockPipeline:
             self._commit(run_dir, manifest, "memory_workers.json", workers, "MEMORY_WAVE_COMPLETED")
         memory_workers = read_json(run_dir / "memory_workers.json")
         if "MEMORY_MERGED" not in manifest["completed_stages"]:
-            update = validate_memory(parse_object(self.client.generate(stage="memory_merge", role="merge", prompt=json.dumps({"final": final, "workers": memory_workers}))), manifest["episode_id"])
+            try:
+                provider_update = parse_object(self._request("memory_merge", "merge", {"episode_id": manifest["episode_id"], "open_conflicts": source["open_conflicts"], "final": final, "workers": memory_workers}))
+                canonical_update = apply_conflict_selectors(provider_update, source["open_conflicts"]) if self.mode == "live" else provider_update
+                update = validate_memory(canonical_update, manifest["episode_id"])
+                apply_memory_update(source, update)
+            except ContractError:
+                if self.mode == "live":
+                    from .live_model import LiveCallError
+                    raise LiveCallError("CONTRACT_ERROR", "memory_merge", "merge", "K11", "memory merge contract failed") from None
+                raise
             self._commit(run_dir, manifest, "memory_update.json", update, "MEMORY_MERGED")
         update = read_json(run_dir / "memory_update.json")
         if "MEMORY_APPLIED" not in manifest["completed_stages"]:
             memory_after = apply_memory_update(source, update)
             self._commit(run_dir, manifest, "memory_after.json", memory_after, "MEMORY_APPLIED")
+        self._save_live_calls(run_dir, manifest)
         manifest["status"] = "COMPLETE"
         manifest["last_error"] = None
         self._save_manifest(run_dir, manifest)
 
     def _wave(self, stage: str, roles: list[str], payload: dict) -> list[dict]:
         def one(role: str) -> dict:
-            value = parse_object(self.client.generate(stage=stage, role=role, prompt=json.dumps(payload)))
+            value = parse_object(self._request(stage, role, payload))
             return validate_worker(value, f"{stage}-{role}", role)
         with ThreadPoolExecutor(max_workers=min(11, len(roles))) as executor:
             futures = [executor.submit(one, role) for role in roles]
             results = [future.result() for future in as_completed(futures)]
         return sorted(results, key=lambda item: roles.index(item["role"]))
+
+    def _request(self, stage: str, role: str, payload: dict) -> str:
+        if self.mode == "live":
+            from .prompts import build_prompt
+            prompt = build_prompt(stage, role, payload)
+        else:
+            prompt = json.dumps(payload)
+        return self.client.generate(stage=stage, role=role, prompt=prompt)
+
+    def _prose(self, stage: str, payload: dict) -> str:
+        raw = self._request(stage, "canonical", payload)
+        text = raw if self.mode == "live" else parse_object(raw).get("text")
+        if not isinstance(text, str) or not text.strip() or text.lstrip().startswith(("{", "[")):
+            raise ContractError("invalid canonical prose")
+        if self.mode == "live" and (not 4000 <= len(text) <= 8000 or any(marker in text for marker in ("[화면]", "[음향]", "[카메라]", "장면 1", "장면 2", "SCENE 1", "CUT TO:", "```"))):
+            raise ContractError("live prose contract failed")
+        return text
+
+    def _save_live_calls(self, run_dir: Path, manifest: dict) -> None:
+        if self.mode == "live":
+            telemetry = self.client.telemetry()
+            manifest["live_call_count"] = len(telemetry["calls"])
+            self._commit_artifact(run_dir, manifest, "live_calls.json", telemetry)
+
+    def _reconcile_invalid_memory_merge(self, source: dict, run_dir: Path, manifest: dict) -> None:
+        if "MEMORY_MERGED" not in manifest["completed_stages"]:
+            return
+        try:
+            apply_memory_update(source, read_json(run_dir / "memory_update.json"))
+            return
+        except ContractError:
+            rejected = run_dir / "memory_update.rejected.json"
+            current = run_dir / "memory_update.json"
+            if rejected.exists():
+                raise PipelineError("invalid memory update reconciliation already exists")
+            os.replace(current, rejected)
+            manifest["artifact_hashes"].pop("memory_update.json")
+            manifest["artifact_hashes"][rejected.name] = sha256_file(rejected)
+            manifest["completed_stages"].remove("MEMORY_MERGED")
+            manifest["status"] = "ERROR"
+            manifest["last_error"] = {"error_class": "CONTRACT_ERROR", "stage": "memory_merge", "role": "merge", "key_slot": "K11", "http_status": None, "provider_code": None, "message": "preserved invalid memory update"}
+            self.client.record_contract_failure("memory_merge", "merge", "K11")
+            self._save_live_calls(run_dir, manifest)
+            self._save_manifest(run_dir, manifest)
+
+    def _error_record(self, error: Exception) -> dict | str:
+        if hasattr(error, "error_class"):
+            return {"error_class": error.error_class, "stage": error.stage, "role": error.role, "key_slot": error.slot, "http_status": error.http_status, "provider_code": error.provider_code, "message": "sanitized provider failure"}
+        return str(error)
 
     def _commit(self, run_dir: Path, manifest: dict, filename: str, value: dict | list | str, stage: str, text: bool = False) -> None:
         self._commit_artifact(run_dir, manifest, filename, value, text)
@@ -139,4 +204,8 @@ def status(run_dir: Path) -> dict:
     verify_artifacts(run_dir, manifest)
     if manifest["status"] == "COMPLETE" and "MEMORY_APPLIED" not in manifest["completed_stages"]:
         raise StorageError("COMPLETE without MEMORY_APPLIED")
-    return {"fixture_id": manifest["fixture_id"], "episode_id": manifest["episode_id"], "status": manifest["status"], "completed_stages": manifest["completed_stages"], "review_verdict": manifest["review_verdict"], "writer_call_count": manifest["writer_call_count"], "revision_count": manifest["revision_count"], "final_exists": (run_dir / "final.md").exists(), "memory_merged": "MEMORY_MERGED" in manifest["completed_stages"], "memory_applied": "MEMORY_APPLIED" in manifest["completed_stages"], "last_error": manifest["last_error"]}
+    result = {"mode": manifest.get("mode", "mock"), "fixture_id": manifest["fixture_id"], "episode_id": manifest["episode_id"], "status": manifest["status"], "completed_stages": manifest["completed_stages"], "review_verdict": manifest["review_verdict"], "writer_call_count": manifest["writer_call_count"], "revision_count": manifest["revision_count"], "final_exists": (run_dir / "final.md").exists(), "memory_merged": "MEMORY_MERGED" in manifest["completed_stages"], "memory_applied": "MEMORY_APPLIED" in manifest["completed_stages"], "last_error": manifest["last_error"]}
+    if result["mode"] == "live":
+        calls = read_json(run_dir / "live_calls.json")["calls"]
+        result.update({"model": manifest["model"], "key_pool_size": manifest["key_pool_size"], "live_call_count": len(calls), "successful_live_calls": sum(call["status"] == "PASS" for call in calls), "failed_live_calls": sum(call["status"] == "FAIL" for call in calls), "used_key_slots": sorted({call["key_slot"] for call in calls}), "per_wave_max_active_calls": read_json(run_dir / "live_calls.json")["max_active_by_stage"], "final_character_count": len((run_dir / "final.md").read_text(encoding="utf-8")) if (run_dir / "final.md").exists() else 0})
+    return result

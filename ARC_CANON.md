@@ -384,17 +384,17 @@ Validate long-horizon drift and memory integrity.
 Current phase:
 
 ```text
-PHASE_1_MOCK_VERTICAL_LOOP
+PHASE_2_LIVE_SINGLE_EPISODE_VALIDATION
 ```
 
 Next deliverable:
 
 ```text
-Implement and validate the mock vertical loop.
+Implement and validate one live synthetic episode with the 11-key Gemma pool.
 ```
 
 Next implementation after approval:
 
 ```text
-PHASE_2_LIVE_SINGLE_EPISODE_VALIDATION
+PHASE_3_FIVE_EPISODE_PILOT
 ```
