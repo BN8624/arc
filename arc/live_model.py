@@ -8,6 +8,7 @@ import threading
 import time
 import socket
 import math
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Callable
@@ -42,10 +43,21 @@ class LogicalDesk:
     stage: str
     role: str
     logical_order: int
+    scope_id: str | None = None
 
 
 def logical_desk(stage: str, role: str) -> LogicalDesk:
     return LogicalDesk(f"{stage}:{role}", stage, role, LIVE_LOGICAL_ORDER[(stage, role)])
+
+
+def scoped_logical_desk(scope_id: str, logical_order_base: int, stage: str, role: str) -> LogicalDesk:
+    return LogicalDesk(
+        f"{scope_id}:{stage}:{role}",
+        stage,
+        role,
+        logical_order_base + LIVE_LOGICAL_ORDER[(stage, role)],
+        scope_id,
+    )
 
 
 class KeyState(str, Enum):
@@ -141,6 +153,31 @@ class RoutingStateStore:
         return data
 
 
+class AtomicTelemetryStore:
+    def __init__(self, path: Path):
+        self.path = path
+        self._lock = threading.Lock()
+
+    def save(self, telemetry: dict) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self._lock:
+            fd, tmp_name = tempfile.mkstemp(prefix=f".{self.path.name}.", suffix=".tmp", dir=self.path.parent)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    json.dump(telemetry, handle, ensure_ascii=False, indent=2, sort_keys=True)
+                    handle.write("\n")
+                os.replace(tmp_name, self.path)
+            except Exception:
+                try:
+                    os.unlink(tmp_name)
+                except FileNotFoundError:
+                    pass
+                raise
+
+    def load(self) -> dict:
+        return json.loads(self.path.read_text(encoding="utf-8"))
+
+
 @dataclass(frozen=True)
 class LiveConfig:
     model: str
@@ -190,9 +227,40 @@ class LaunchPacer:
         return sequence, scheduled, self.monotonic()
 
 
+class ScopedGemmaPoolClient:
+    def __init__(self, base: "GemmaPoolClient", scope_id: str, logical_order_base: int):
+        self.base = base
+        self.scope_id = scope_id
+        self.logical_order_base = logical_order_base
+        self.config = base.config
+        self.pool = base.pool
+        self.pacer = base.pacer
+
+    def generate_for_desk(self, *, desk: LogicalDesk, prompt: str) -> str:
+        return self.base.generate_for_desk(desk=scoped_logical_desk(self.scope_id, self.logical_order_base, desk.stage, desk.role), prompt=prompt)
+
+    def generate(self, *, stage: str, role: str, prompt: str) -> str:
+        return self.generate_for_desk(desk=logical_desk(stage, role), prompt=prompt)
+
+    def telemetry(self) -> dict:
+        return self.base.telemetry(scope_id=self.scope_id)
+
+    def restore_telemetry(self, telemetry: dict) -> None:
+        invalid = [call.get("desk_id") for call in telemetry.get("calls", []) if call.get("scope_id") != self.scope_id]
+        if invalid:
+            raise ValueError(f"telemetry projection contains calls outside {self.scope_id}: {invalid[:3]}")
+
+    def record_contract_failure(self, stage: str, role: str, slot: str) -> None:
+        self.base.record_contract_failure(stage, role, slot, scope_id=self.scope_id)
+
+    def close(self) -> None:
+        return None
+
+
 class GemmaPoolClient:
-    def __init__(self, config: LiveConfig, client_factory: Callable[[str], object] | None = None, state_store: RoutingStateStore | None = None):
+    def __init__(self, config: LiveConfig, client_factory: Callable[[str], object] | None = None, state_store: RoutingStateStore | None = None, telemetry_sink: Callable[[dict], None] | None = None):
         self.config, self._lock, self.calls = config, threading.Lock(), []
+        self._telemetry_sink = telemetry_sink
         self.pacer = LaunchPacer(config.launch_interval)
         self.pool = DynamicKeyPool(list(config.keys), state_store=state_store)
         self.contract_failures: list[dict] = []
@@ -214,6 +282,9 @@ class GemmaPoolClient:
     def probe_key(self, *, key_slot: str, prompt: str) -> str:
         return self._invoke(key_slot, LogicalDesk(f"preflight:{key_slot}", "preflight", key_slot, 0), prompt)
 
+    def scope(self, *, scope_id: str, logical_order_base: int) -> ScopedGemmaPoolClient:
+        return ScopedGemmaPoolClient(self, scope_id, logical_order_base)
+
     def generate_for_desk(self, *, desk: LogicalDesk, prompt: str) -> str:
         while True:
             slot, lease_sequence = self.pool.lease()
@@ -234,8 +305,8 @@ class GemmaPoolClient:
         started, tick = datetime.now(timezone.utc), time.perf_counter()
         stage, role, logical_order = desk.stage, desk.role, desk.logical_order
         with self._lock:
-            attempt = 1 + sum(call["stage"] == stage and call["role"] == role for call in self.calls)
-            reservation = {"call_id": f"L{logical_order:03d}-A{attempt:03d}", "logical_order": logical_order, "attempt": attempt, "lease_sequence": lease_sequence}
+            attempt = 1 + sum(call.get("desk_id", f"{call['stage']}:{call['role']}") == desk.desk_id for call in self.calls)
+            reservation = {"call_id": f"L{logical_order:03d}-A{attempt:03d}", "scope_id": desk.scope_id, "desk_id": desk.desk_id, "logical_order": logical_order, "attempt": attempt, "lease_sequence": lease_sequence}
             self.active_by_stage[stage] = self.active_by_stage.get(stage, 0) + 1
             self.max_active_by_stage[stage] = max(self.max_active_by_stage.get(stage, 0), self.active_by_stage[stage])
         try:
@@ -270,20 +341,30 @@ class GemmaPoolClient:
         with self._lock:
             previous = max((call.get("provider_started_monotonic", 0.0) for call in self.calls), default=0.0)
             self.calls.append({**(reservation or {}), "stage": stage, "role": role, "key_slot": slot, "status": status, "started_at": datetime.now(timezone.utc).isoformat(), "provider_started_at": datetime.now(timezone.utc).isoformat(), "provider_started_monotonic": provider_start, "scheduled_start_at": scheduled, "launch_sequence": launch_sequence, "launch_wait_ms": round(max(0, (provider_start or 0)-(scheduled or 0))*1000), "previous_launch_gap_ms": None if not previous or provider_start is None else round((provider_start-previous)*1000), "finished_at": datetime.now(timezone.utc).isoformat(), "latency_ms": round((time.perf_counter() - tick) * 1000), "input_characters": len(prompt), "output_characters": len(text), "prompt_tokens": getattr(usage, "prompt_token_count", None), "output_tokens": getattr(usage, "candidates_token_count", None), "total_tokens": getattr(usage, "total_token_count", None), "response_sha256": hashlib.sha256(text.encode()).hexdigest() if text else None, "error_class": error_class, "http_status": http_status, "provider_code": None})
+            if self._telemetry_sink:
+                self._telemetry_sink(self._telemetry_snapshot())
 
-    def telemetry(self) -> dict:
-        calls = sorted(self.calls, key=lambda call: (call.get("logical_order", 0), call.get("attempt", 0)))
+    def _telemetry_snapshot(self, scope_id: str | None = None) -> dict:
+        calls = [call for call in self.calls if scope_id is None or call.get("scope_id") == scope_id]
+        calls = sorted(calls, key=lambda call: (call.get("logical_order", 0), call.get("attempt", 0)))
         return {"schema_version": 2, "provider": "gemini_developer_api", "model": self.config.model, "calls": calls, "contract_failures": self.contract_failures, "max_active_by_stage": self.max_active_by_stage}
 
-    def restore_telemetry(self, telemetry: dict) -> None:
-        self.calls = list(telemetry["calls"])
-        self.contract_failures = list(telemetry.get("contract_failures", []))
-        self.max_active_by_stage = dict(telemetry.get("max_active_by_stage", {}))
+    def telemetry(self, scope_id: str | None = None) -> dict:
+        with self._lock:
+            return self._telemetry_snapshot(scope_id)
 
-    def record_contract_failure(self, stage: str, role: str, slot: str) -> None:
+    def restore_telemetry(self, telemetry: dict) -> None:
+        with self._lock:
+            self.calls = list(telemetry["calls"])
+            self.contract_failures = list(telemetry.get("contract_failures", []))
+            self.max_active_by_stage = dict(telemetry.get("max_active_by_stage", {}))
+
+    def record_contract_failure(self, stage: str, role: str, slot: str, scope_id: str | None = None) -> None:
         now = datetime.now(timezone.utc).isoformat()
         with self._lock:
-            self.contract_failures.append({"event_id": f"CF{len(self.contract_failures)+1:03d}", "stage": stage, "role": role, "key_slot": slot, "error_class": "CONTRACT_ERROR", "created_at": now, "message": "sanitized contract failure"})
+            self.contract_failures.append({"event_id": f"CF{len(self.contract_failures)+1:03d}", "scope_id": scope_id, "stage": stage, "role": role, "key_slot": slot, "error_class": "CONTRACT_ERROR", "created_at": now, "message": "sanitized contract failure"})
+            if self._telemetry_sink:
+                self._telemetry_sink(self._telemetry_snapshot())
 
     def close(self) -> None:
         for client in self._clients.values():
