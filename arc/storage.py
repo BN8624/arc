@@ -45,12 +45,12 @@ def read_json(path: Path) -> dict | list:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def verify_artifacts(run_dir: Path, manifest: dict) -> None:
+def verify_artifacts(run_dir: Path, manifest: dict, allowed_operational_files: set[str] | None = None) -> None:
     for name, expected in manifest["artifact_hashes"].items():
         path = run_dir / name
         if not path.exists() or sha256_file(path) != expected:
             raise StorageError(f"artifact hash mismatch: {name}")
-    known = set(manifest["artifact_hashes"]) | {"manifest.json"}
+    known = set(manifest["artifact_hashes"]) | {"manifest.json"} | (allowed_operational_files or set())
     actual = {path.name for path in run_dir.iterdir() if path.is_file() and not path.name.startswith(".")}
     if actual - known:
         raise StorageError(f"orphan artifact: {sorted(actual - known)}")

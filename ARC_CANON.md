@@ -84,6 +84,12 @@ Maximum concurrent live calls:
 
 The system must not fill all slots without need.
 
+Workers are fixed logical desks identified by stage and role. API keys are fungible physical execution resources leased from the active key pool; no desk permanently owns a key. On HTTP 408, HTTP 429, HTTP 5xx, timeout, network, or transport failure, only the affected key enters cooldown and another available key continues the same desk. Such transient key failures do not terminate an episode run.
+
+Successful planning, review, and memory desks are saved in persistent partial checkpoints. After process interruption, ARC validates the checkpoint and resumes only unfinished desks.
+
+Live admission requires at least one directly probed PASS key and no global configuration blocker. Transient or credential failures make admission degraded; they do not impose a fixed minimum healthy-key threshold.
+
 Recommended worker count:
 
 - ordinary episode: 4–7
@@ -339,7 +345,7 @@ Validate:
 
 - actual parallel calls
 - deterministic result ordering
-- key assignment
+- dynamic key leasing
 - timeout and error classification
 - malformed-output handling
 - context assembly

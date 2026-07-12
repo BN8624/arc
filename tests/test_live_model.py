@@ -4,7 +4,7 @@ from __future__ import annotations
 import pytest
 
 from arc.contracts import ContractError, apply_conflict_selectors, conflict_options, validate_memory
-from arc.live_model import LiveConfig, LiveConfigError, SLOT_MAP
+from arc.live_model import DESK_ORDER, LiveConfig, LiveConfigError
 from arc.prompts import build_prompt
 
 
@@ -59,7 +59,7 @@ def test_live_config_requires_distinct_slots() -> None:
         LiveConfig.from_environment(env)
 
 
-def test_slot_mapping_has_all_live_slots() -> None:
-    assert SLOT_MAP[("planning", "event")] == "K01"
-    assert SLOT_MAP[("writer", "canonical")] == "K08"
-    assert SLOT_MAP[("memory_merge", "merge")] == "K11"
+def test_logical_desk_order_has_all_pipeline_desks() -> None:
+    assert DESK_ORDER[0] == ("planning", "event")
+    assert ("writer", "canonical") in DESK_ORDER
+    assert DESK_ORDER[-1] == ("memory_merge", "merge")

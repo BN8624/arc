@@ -9,29 +9,20 @@ import time
 import socket
 import math
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Callable
+import json
+from pathlib import Path
+from enum import Enum
 
 
 MODEL_NAME = "gemma-4-31b-it"
-SLOT_MAP = {
-    ("planning", "event"): "K01", ("planning", "protagonist_action"): "K02", ("planning", "relationship"): "K03", ("planning", "continuity"): "K04", ("planning", "readability_weight"): "K05", ("planning", "reader_payoff"): "K06", ("planning_merge", "merge"): "K07", ("writer", "canonical"): "K08",
-    ("review", "causality"): "K09", ("review", "protagonist_agency"): "K10", ("review", "character_consistency"): "K11", ("review", "continuity"): "K01", ("review", "readability"): "K02", ("review", "narrative_weight"): "K03", ("review", "payoff_and_hook"): "K04", ("review_merge", "merge"): "K05", ("revision", "canonical"): "K06",
-    ("memory", "confirmed_facts"): "K07", ("memory", "relationships"): "K08", ("memory", "conflicts_and_promises"): "K09", ("memory", "important_excerpts"): "K10", ("memory_merge", "merge"): "K11",
-}
-LIVE_LOGICAL_ORDER = {key: index for index, key in enumerate(SLOT_MAP, start=1)}
-MIN_HEALTHY_SLOTS = 7
-
-
-def slot_number(slot: str) -> int:
-    return int(slot[1:])
-
-
-def build_health_assignment(healthy_slots: list[str]) -> dict[tuple[str, str], str]:
-    slots = sorted(healthy_slots, key=slot_number)
-    if len(slots) < MIN_HEALTHY_SLOTS:
-        raise LiveConfigError("fewer than seven healthy slots")
-    return {key: slots[(order - 1) % len(slots)] for key, order in LIVE_LOGICAL_ORDER.items()}
+DESK_ORDER = (
+    ("planning", "event"), ("planning", "protagonist_action"), ("planning", "relationship"), ("planning", "continuity"), ("planning", "readability_weight"), ("planning", "reader_payoff"), ("planning_merge", "merge"), ("writer", "canonical"),
+    ("review", "causality"), ("review", "protagonist_agency"), ("review", "character_consistency"), ("review", "continuity"), ("review", "readability"), ("review", "narrative_weight"), ("review", "payoff_and_hook"), ("review_merge", "merge"), ("revision", "canonical"),
+    ("memory", "confirmed_facts"), ("memory", "relationships"), ("memory", "conflicts_and_promises"), ("memory", "important_excerpts"), ("memory_merge", "merge"),
+)
+LIVE_LOGICAL_ORDER = {desk: index for index, desk in enumerate(DESK_ORDER, start=1)}
 
 
 class LiveConfigError(ValueError):
@@ -43,6 +34,111 @@ class LiveCallError(RuntimeError):
         super().__init__(message)
         self.error_class, self.stage, self.role, self.slot = error_class, stage, role, slot
         self.http_status, self.provider_code = http_status, provider_code
+
+
+@dataclass(frozen=True)
+class LogicalDesk:
+    desk_id: str
+    stage: str
+    role: str
+    logical_order: int
+
+
+def logical_desk(stage: str, role: str) -> LogicalDesk:
+    return LogicalDesk(f"{stage}:{role}", stage, role, LIVE_LOGICAL_ORDER[(stage, role)])
+
+
+class KeyState(str, Enum):
+    AVAILABLE = "AVAILABLE"
+    IN_USE = "IN_USE"
+    COOLDOWN = "COOLDOWN"
+    DISABLED = "DISABLED"
+
+
+class DynamicKeyPool:
+    """Lease fungible API-key slots to logical desks."""
+    def __init__(self, slots: list[str], monotonic: Callable[[], float] = time.monotonic, state_store: "RoutingStateStore | None" = None, utcnow: Callable[[], datetime] = lambda: datetime.now(timezone.utc)):
+        self._clock, self._lock, self._slots, self._cursor, self._sequence, self._store = monotonic, threading.Condition(), {slot: {"state": KeyState.AVAILABLE, "failures": 0, "cooldown": 0.0, "lease": 0} for slot in slots}, 0, 0, state_store
+        self._utcnow = utcnow
+        if state_store and state_store.path.exists():
+            state = state_store.load()
+            self._cursor, self._sequence = state["next_round_robin_cursor"], state["next_lease_sequence"] - 1
+            for slot, saved in state["keys"].items():
+                cooldown = saved["cooldown_until"]
+                remaining = max(0.0, (datetime.fromisoformat(cooldown) - self._utcnow()).total_seconds()) if cooldown else 0.0
+                self._slots[slot] = {"state": KeyState.AVAILABLE if saved["state"] == KeyState.COOLDOWN and not remaining else KeyState(saved["state"]), "failures": saved["consecutive_transient_failures"], "cooldown": self._clock() + remaining, "lease": saved["last_lease_sequence"]}
+
+    def _persist(self) -> None:
+        if self._store:
+            self._store.save(cursor=self._cursor % len(self._slots), lease_sequence=self._sequence + 1, keys={slot: {"state": item["state"], "consecutive_transient_failures": item["failures"], "cooldown_until": (self._utcnow() + timedelta(seconds=max(0.0, item["cooldown"] - self._clock()))).isoformat() if item["state"] == KeyState.COOLDOWN else None, "last_lease_sequence": item["lease"]} for slot, item in self._slots.items()})
+
+    def lease(self) -> tuple[str, int]:
+        with self._lock:
+            while True:
+                now = self._clock()
+                for item in self._slots.values():
+                    if item["state"] == KeyState.COOLDOWN and item["cooldown"] <= now:
+                        item["state"] = KeyState.AVAILABLE
+                names = list(self._slots)
+                for offset in range(len(names)):
+                    index = (self._cursor + offset) % len(names)
+                    slot, item = names[index], self._slots[names[index]]
+                    if item["state"] == KeyState.AVAILABLE:
+                        self._cursor, self._sequence, item["state"], item["lease"] = index + 1, self._sequence + 1, KeyState.IN_USE, self._sequence + 1
+                        self._persist()
+                        return slot, item["lease"]
+                waits = [item["cooldown"] - now for item in self._slots.values() if item["state"] == KeyState.COOLDOWN]
+                if not waits:
+                    raise LiveConfigError("all key slots are disabled")
+                self._lock.wait(timeout=max(0.0, min(waits)))
+
+    def release(self, slot: str, error_class: str | None = None) -> None:
+        with self._lock:
+            item = self._slots[slot]
+            if error_class in {"AUTH_ERROR", "PERMISSION_ERROR"}:
+                item["state"] = KeyState.DISABLED
+            elif error_class in {"RATE_LIMITED", "PROVIDER_5XX", "TIMEOUT", "NETWORK_ERROR"}:
+                item["failures"] += 1
+                item["cooldown"] = self._clock() + (10.0 if item["failures"] == 1 else 30.0)
+                item["state"] = KeyState.COOLDOWN
+            else:
+                item["failures"], item["state"] = 0, KeyState.AVAILABLE
+            self._persist()
+            self._lock.notify_all()
+
+
+class RoutingStateStore:
+    """Persists dynamic pool state without secrets or process-local objects."""
+    def __init__(self, path: Path, slots: list[str]):
+        self.path, self.slots = path, slots
+
+    def save(self, *, cursor: int, lease_sequence: int, keys: dict) -> None:
+        from .storage import write_json
+        write_json(self.path, {"routing_schema_version": 2, "routing_mode": "dynamic_key_pool", "next_round_robin_cursor": cursor, "next_lease_sequence": lease_sequence, "keys": keys})
+
+    def load(self) -> dict:
+        from .storage import read_json
+        data = read_json(self.path)
+        if data.get("routing_schema_version") != 2 or data.get("routing_mode") != "dynamic_key_pool" or set(data.get("keys", {})) != set(self.slots) or not isinstance(data.get("next_lease_sequence"), int) or data["next_lease_sequence"] < 1:
+            raise LiveConfigError("invalid routing state")
+        if not isinstance(data.get("next_round_robin_cursor"), int) or not 0 <= data["next_round_robin_cursor"] < len(self.slots):
+            raise LiveConfigError("invalid routing cursor")
+        for item in data["keys"].values():
+            if set(item) != {"state", "consecutive_transient_failures", "cooldown_until", "last_lease_sequence"} or item["state"] not in set(KeyState) or not isinstance(item["consecutive_transient_failures"], int) or item["consecutive_transient_failures"] < 0 or not isinstance(item["last_lease_sequence"], int) or item["last_lease_sequence"] < 0:
+                raise LiveConfigError("invalid routing key state")
+            cooldown = item["cooldown_until"]
+            if (cooldown is None) != (item["state"] != KeyState.COOLDOWN):
+                raise LiveConfigError("invalid routing cooldown")
+            if cooldown:
+                try:
+                    parsed = datetime.fromisoformat(cooldown)
+                except (TypeError, ValueError) as error:
+                    raise LiveConfigError("invalid routing cooldown") from error
+                if parsed.tzinfo is None:
+                    raise LiveConfigError("invalid routing cooldown")
+            if item.get("state") == KeyState.IN_USE:
+                item["state"] = KeyState.AVAILABLE
+        return data
 
 
 @dataclass(frozen=True)
@@ -95,10 +191,10 @@ class LaunchPacer:
 
 
 class GemmaPoolClient:
-    def __init__(self, config: LiveConfig, client_factory: Callable[[str], object] | None = None, assignments: dict[tuple[str, str], str] | None = None):
+    def __init__(self, config: LiveConfig, client_factory: Callable[[str], object] | None = None, state_store: RoutingStateStore | None = None):
         self.config, self._lock, self.calls = config, threading.Lock(), []
         self.pacer = LaunchPacer(config.launch_interval)
-        self.assignments = assignments or SLOT_MAP
+        self.pool = DynamicKeyPool(list(config.keys), state_store=state_store)
         self.contract_failures: list[dict] = []
         self.active_by_stage: dict[str, int] = {}
         self.max_active_by_stage: dict[str, int] = {}
@@ -115,12 +211,31 @@ class GemmaPoolClient:
     def sdk_version(self) -> str:
         return importlib.metadata.version("google-genai")
 
+    def probe_key(self, *, key_slot: str, prompt: str) -> str:
+        return self._invoke(key_slot, LogicalDesk(f"preflight:{key_slot}", "preflight", key_slot, 0), prompt)
+
+    def generate_for_desk(self, *, desk: LogicalDesk, prompt: str) -> str:
+        while True:
+            slot, lease_sequence = self.pool.lease()
+            try:
+                text = self._invoke(slot, desk, prompt, lease_sequence)
+                self.pool.release(slot)
+                return text
+            except LiveCallError as error:
+                self.pool.release(slot, error.error_class)
+                if error.error_class in {"RATE_LIMITED", "PROVIDER_5XX", "TIMEOUT", "NETWORK_ERROR", "AUTH_ERROR", "PERMISSION_ERROR"}:
+                    continue
+                raise
+
     def generate(self, *, stage: str, role: str, prompt: str) -> str:
-        slot, started, tick = (role if stage == "preflight" else self.assignments[(stage, role)]), datetime.now(timezone.utc), time.perf_counter()
-        logical_order = 0 if stage == "preflight" else LIVE_LOGICAL_ORDER[(stage, role)]
+        return self.generate_for_desk(desk=logical_desk(stage, role), prompt=prompt)
+
+    def _invoke(self, slot: str, desk: LogicalDesk, prompt: str, lease_sequence: int | None = None) -> str:
+        started, tick = datetime.now(timezone.utc), time.perf_counter()
+        stage, role, logical_order = desk.stage, desk.role, desk.logical_order
         with self._lock:
             attempt = 1 + sum(call["stage"] == stage and call["role"] == role for call in self.calls)
-            reservation = {"call_id": f"L{logical_order:03d}-A{attempt:03d}", "logical_order": logical_order, "attempt": attempt}
+            reservation = {"call_id": f"L{logical_order:03d}-A{attempt:03d}", "logical_order": logical_order, "attempt": attempt, "lease_sequence": lease_sequence}
             self.active_by_stage[stage] = self.active_by_stage.get(stage, 0) + 1
             self.max_active_by_stage[stage] = max(self.max_active_by_stage.get(stage, 0), self.active_by_stage[stage])
         try:
