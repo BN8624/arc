@@ -415,5 +415,5 @@ Implement and validate five sequential episodes for one disposable synthetic tes
 Next implementation after approval:
 
 ```text
-PHASE_3_FIVE_EPISODE_PILOT
+PHASE_4_TWENTY_EPISODE_VALIDATION
 ```

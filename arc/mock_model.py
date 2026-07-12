@@ -29,18 +29,20 @@ class MockModelClient:
                 raise RuntimeError(f"injected failure at {marker}")
             if self.malformed_at in {stage, marker}:
                 return "{malformed"
-            return json.dumps(self._response(stage, role))
+            return json.dumps(self._response(stage, role, prompt))
         finally:
             with self._lock:
                 self.active -= 1
                 self.active_by_stage[stage] -= 1
 
-    def _response(self, stage: str, role: str) -> dict:
+    def _response(self, stage: str, role: str, prompt: str) -> dict:
+        payload = json.loads(prompt)
+        episode_id = payload.get("episode_id") or payload.get("context", {}).get("episode_id") or "SYN001"
         if stage in {"planning", "review", "memory"}:
             evidence = ["final.md"] if stage == "memory" else ["source:current_episode"]
             return {"worker_id": f"{stage}-{role}", "role": role, "verdict": "OK", "primary_finding": f"synthetic {role} finding", "primary_risk": f"synthetic {role} risk", "evidence_refs": evidence, "proposal": {"role": role}}
         if stage == "planning_merge":
-            return {"episode_id": "SYN001", "immediate_objective": "synthetic objective", "obstacle": "synthetic obstacle", "protagonist_action": "synthetic action", "meaningful_change": "synthetic change", "episode_ending": "synthetic ending", "selected_worker_ids": ["planning-event"], "continuity_constraints": ["synthetic constraint"]}
+            return {"episode_id": episode_id, "immediate_objective": "synthetic objective", "obstacle": "synthetic obstacle", "protagonist_action": "synthetic action", "meaningful_change": "synthetic change", "episode_ending": "synthetic ending", "selected_worker_ids": ["planning-event"], "continuity_constraints": ["synthetic constraint"]}
         if stage == "writer":
             return {"text": "A synthetic character makes one synthetic choice.\n"}
         if stage == "review_merge":
@@ -50,5 +52,5 @@ class MockModelClient:
         if stage == "revision":
             return {"text": "A synthetic character makes one revised synthetic choice.\n"}
         if stage == "memory_merge":
-            return {"episode_id": "SYN001", "confirmed_facts_added": ["synthetic fact"], "relationship_changes": ["synthetic relationship change"], "conflicts_resolved": ["synthetic resolved conflict"], "conflicts_opened": ["synthetic opened conflict"], "promises_added": ["synthetic promise"], "important_excerpts_added": ["synthetic choice"], "episode_summary": "synthetic episode summary", "required_next_episode_continuity": ["synthetic next continuity"], "evidence_refs": ["final.md"]}
+            return {"episode_id": episode_id, "confirmed_facts_added": [f"synthetic fact {episode_id}"], "relationship_changes": [f"synthetic relationship change {episode_id}"], "conflicts_resolved": ["synthetic resolved conflict"] if "synthetic resolved conflict" in payload.get("open_conflicts", []) else [], "conflicts_opened": [f"synthetic opened conflict {episode_id}"], "promises_added": [f"synthetic promise {episode_id}"], "important_excerpts_added": [f"synthetic choice {episode_id}"], "episode_summary": f"synthetic episode summary {episode_id}", "required_next_episode_continuity": [f"synthetic next continuity {episode_id}"], "evidence_refs": ["final.md"]}
         raise RuntimeError(f"unknown mock stage: {stage}")

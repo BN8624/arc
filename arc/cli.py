@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 
 from .mock_model import MockModelClient
 from .pipeline import MockPipeline, status
+from .pilot import PilotPipeline, pilot_status
 from .storage import write_json
 
 
@@ -95,6 +96,12 @@ def main() -> None:
     live.add_argument("--preflight", type=Path, required=True)
     live_state = commands.add_parser("live-status")
     live_state.add_argument("output", type=Path)
+    pilot_run = commands.add_parser("pilot-mock-run")
+    pilot_run.add_argument("fixture", type=Path)
+    pilot_run.add_argument("--output", type=Path, required=True)
+    pilot_run.add_argument("--scenario", choices=["pass", "episode_hold", "pilot_hold"], required=True)
+    pilot_state = commands.add_parser("pilot-status")
+    pilot_state.add_argument("output", type=Path)
     args = parser.parse_args()
     if args.command == "mock-run":
         result = MockPipeline(MockModelClient(args.scenario)).run(args.fixture, args.output, args.scenario)
@@ -110,5 +117,11 @@ def main() -> None:
             print(json.dumps({"no_op": result["no_op"], **status(args.output)}, ensure_ascii=False))
         finally:
             client.close()
+    elif args.command == "pilot-mock-run":
+        client = MockModelClient("pass")
+        result = PilotPipeline(client, args.scenario).run(args.fixture, args.output)
+        print(json.dumps({"no_op": result["no_op"], **pilot_status(args.output)}, ensure_ascii=False))
+    elif args.command == "pilot-status":
+        print(json.dumps(pilot_status(args.output), ensure_ascii=False))
     else:
         print(json.dumps(status(args.output), ensure_ascii=False))

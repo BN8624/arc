@@ -1,0 +1,19 @@
+{
+  "pilot_id": "pilot_synthetic_work_v1",
+  "episode_ids": ["episode_001", "episode_002", "episode_003", "episode_004", "episode_005"],
+  "initial_source": {
+    "fixture_id": "pilot_synthetic_work_v1",
+    "series_compass": {"reader_promise": "synthetic value", "protagonist_drive": "synthetic value", "major_direction": "synthetic value", "possible_ending_direction": "synthetic value"},
+    "world_rules": [{"id": "WR1", "text": "synthetic rule"}],
+    "characters": [{"id": "CHAR1", "name": "Synthetic Character", "stable_traits": ["synthetic trait"]}],
+    "confirmed_facts": ["synthetic existing fact"],
+    "relationship_state": ["synthetic existing relationship"],
+    "open_conflicts": ["synthetic resolved conflict"],
+    "promises": ["synthetic existing promise"],
+    "episode_summaries": ["synthetic existing summary"],
+    "important_excerpts": ["synthetic existing excerpt"],
+    "rolling_plan": {"near_horizon": [], "immediate_horizon": []},
+    "required_next_episode_continuity": ["synthetic existing continuity"],
+    "current_episode": {"episode_id": "episode_001", "importance": "ordinary", "required_role": "synthetic pilot role"}
+  }
+}
