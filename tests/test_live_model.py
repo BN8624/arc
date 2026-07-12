@@ -52,7 +52,7 @@ def test_conflict_selector_rejects_direct_conflict_text() -> None:
 
 
 def test_live_config_requires_distinct_slots() -> None:
-    env = {"MODEL": "gemma-4-31b-it", **{f"GOOGLE_API_KEY_{index}": f"key-{index}" for index in range(1, 12)}}
+    env = {"MODEL": "gemma-4-31b-it", "ARC_LAUNCH_INTERVAL_SECONDS": "2.0", **{f"GOOGLE_API_KEY_{index}": f"key-{index}" for index in range(1, 12)}}
     assert LiveConfig.from_environment(env).keys["K11"] == "key-11"
     env["GOOGLE_API_KEY_11"] = "key-10"
     with pytest.raises(LiveConfigError):

@@ -12,6 +12,7 @@ from .storage import StorageError, read_json, sha256_bytes, sha256_file, verify_
 PLANNING_ROLES = ["event", "protagonist_action", "relationship", "continuity", "readability_weight", "reader_payoff"]
 REVIEW_ROLES = ["causality", "protagonist_agency", "character_consistency", "continuity", "readability", "narrative_weight", "payoff_and_hook"]
 MEMORY_ROLES = ["confirmed_facts", "relationships", "conflicts_and_promises", "important_excerpts"]
+MEMORY_FIELDS = ("series_compass", "world_rules", "characters", "confirmed_facts", "relationship_state", "open_conflicts", "promises", "episode_summaries", "important_excerpts", "rolling_plan", "required_next_episode_continuity")
 
 
 class PipelineError(RuntimeError):
@@ -102,12 +103,14 @@ class MockPipeline:
             self._commit(run_dir, manifest, "final.md", source_path.read_text(encoding="utf-8"), "FINALIZED", text=True)
         final = (run_dir / "final.md").read_text(encoding="utf-8")
         if "MEMORY_WAVE_COMPLETED" not in manifest["completed_stages"]:
-            workers = self._wave("memory", MEMORY_ROLES, {"final": final})
+            memory_before = build_memory_before(source)
+            workers = self._wave("memory", MEMORY_ROLES, {"episode_id": manifest["episode_id"], "final": final, "memory_before": memory_before})
             self._commit(run_dir, manifest, "memory_workers.json", workers, "MEMORY_WAVE_COMPLETED")
         memory_workers = read_json(run_dir / "memory_workers.json")
         if "MEMORY_MERGED" not in manifest["completed_stages"]:
             try:
-                provider_update = parse_object(self._request("memory_merge", "merge", {"episode_id": manifest["episode_id"], "open_conflicts": source["open_conflicts"], "final": final, "workers": memory_workers}))
+                memory_before = build_memory_before(source)
+                provider_update = parse_object(self._request("memory_merge", "merge", {"episode_id": manifest["episode_id"], "memory_before": memory_before, "open_conflicts": source["open_conflicts"], "final": final, "workers": memory_workers}))
                 canonical_update = apply_conflict_selectors(provider_update, source["open_conflicts"]) if self.mode == "live" else provider_update
                 update = validate_memory(canonical_update, manifest["episode_id"])
                 apply_memory_update(source, update)
@@ -128,12 +131,16 @@ class MockPipeline:
 
     def _wave(self, stage: str, roles: list[str], payload: dict) -> list[dict]:
         def one(role: str) -> dict:
-            value = parse_object(self._request(stage, role, payload))
+            request_payload = build_memory_worker_payload(role, episode_id=payload["episode_id"], final=payload["final"], memory_before=payload["memory_before"]) if stage == "memory" else payload
+            value = parse_object(self._request(stage, role, request_payload))
             return validate_worker(value, f"{stage}-{role}", role)
-        with ThreadPoolExecutor(max_workers=min(11, len(roles))) as executor:
+        with ThreadPoolExecutor(max_workers=self._wave_max_workers(len(roles))) as executor:
             futures = [executor.submit(one, role) for role in roles]
             results = [future.result() for future in as_completed(futures)]
         return sorted(results, key=lambda item: roles.index(item["role"]))
+
+    def _wave_max_workers(self, role_count: int) -> int:
+        return min(self.client.config.max_live, role_count) if self.mode == "live" else min(11, role_count)
 
     def _request(self, stage: str, role: str, payload: dict) -> str:
         if self.mode == "live":
@@ -206,6 +213,21 @@ def status(run_dir: Path) -> dict:
         raise StorageError("COMPLETE without MEMORY_APPLIED")
     result = {"mode": manifest.get("mode", "mock"), "fixture_id": manifest["fixture_id"], "episode_id": manifest["episode_id"], "status": manifest["status"], "completed_stages": manifest["completed_stages"], "review_verdict": manifest["review_verdict"], "writer_call_count": manifest["writer_call_count"], "revision_count": manifest["revision_count"], "final_exists": (run_dir / "final.md").exists(), "memory_merged": "MEMORY_MERGED" in manifest["completed_stages"], "memory_applied": "MEMORY_APPLIED" in manifest["completed_stages"], "last_error": manifest["last_error"]}
     if result["mode"] == "live":
-        calls = read_json(run_dir / "live_calls.json")["calls"]
-        result.update({"model": manifest["model"], "key_pool_size": manifest["key_pool_size"], "live_call_count": len(calls), "successful_live_calls": sum(call["status"] == "PASS" for call in calls), "failed_live_calls": sum(call["status"] == "FAIL" for call in calls), "used_key_slots": sorted({call["key_slot"] for call in calls}), "per_wave_max_active_calls": read_json(run_dir / "live_calls.json")["max_active_by_stage"], "final_character_count": len((run_dir / "final.md").read_text(encoding="utf-8")) if (run_dir / "final.md").exists() else 0})
+        telemetry = read_json(run_dir / "live_calls.json")
+        calls = telemetry["calls"]
+        result.update({"model": manifest["model"], "key_pool_size": manifest["key_pool_size"], "configured_max_live": manifest["max_live"], "telemetry_schema_version": telemetry["schema_version"], "live_call_count": len(calls), "successful_live_calls": sum(call["status"] == "PASS" for call in calls), "failed_live_calls": sum(call["status"] == "FAIL" for call in calls), "contract_failure_count": len(telemetry.get("contract_failures", [])), "used_key_slots": sorted({call["key_slot"] for call in calls}), "per_wave_max_active_calls": telemetry["max_active_by_stage"], "final_character_count": len((run_dir / "final.md").read_text(encoding="utf-8")) if (run_dir / "final.md").exists() else 0})
     return result
+
+
+def build_memory_before(source: dict) -> dict:
+    missing = set(MEMORY_FIELDS) - source.keys()
+    if missing:
+        raise ContractError("memory source fields are missing")
+    return json.loads(json.dumps({field: source[field] for field in MEMORY_FIELDS}, ensure_ascii=False))
+
+
+def build_memory_worker_payload(role: str, *, episode_id: str, final: str, memory_before: dict) -> dict:
+    sections = {"confirmed_facts": ("series_compass", "world_rules", "characters", "confirmed_facts", "episode_summaries"), "relationships": ("characters", "relationship_state", "confirmed_facts", "episode_summaries"), "conflicts_and_promises": ("open_conflicts", "promises", "required_next_episode_continuity", "episode_summaries"), "important_excerpts": ("important_excerpts", "characters", "relationship_state")}
+    if role not in sections:
+        raise ContractError("unknown memory role")
+    return {"episode_id": episode_id, "final": final, "memory_before": {name: memory_before[name] for name in sections[role]}}
