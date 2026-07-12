@@ -79,10 +79,11 @@ class _PilotProvider:
 
 
 class _PilotProviderRoot:
-    def __init__(self, fail_once_at: str | None = None, hold_episode: str | None = None, fail_status_code: int = 500):
+    def __init__(self, fail_once_at: str | None = None, hold_episode: str | None = None, fail_status_code: int = 500, hold_dimension: str | None = None):
         self.fail_once_at = fail_once_at
         self.hold_episode = hold_episode
         self.fail_status_code = fail_status_code
+        self.hold_dimension = hold_dimension
         self.malformed_once_at: str | None = None
         self.failed: set[str] = set()
         self.malformed: set[str] = set()
@@ -101,7 +102,8 @@ class _PilotProviderRoot:
             if marker == self.malformed_once_at and marker not in self.malformed:
                 self.malformed.add(marker)
                 return "{malformed"
-            return json.dumps({"worker_id": f"pilot_review-{role}", "role": role, "verdict": "OK", "primary_finding": f"synthetic {role} finding", "primary_risk": f"synthetic {role} risk", "evidence_refs": ["pilot_evidence_packet.json"], "proposal": {"dimension_result": "PASS", "critical_finding": None}})
+            hold = role == self.hold_dimension
+            return json.dumps({"worker_id": f"pilot_review-{role}", "role": role, "verdict": "OK", "primary_finding": f"synthetic {role} finding", "primary_risk": f"synthetic {role} risk", "evidence_refs": ["pilot_evidence_packet.json"], "proposal": {"dimension_result": "HOLD" if hold else "PASS", "critical_finding": f"synthetic {role} hold" if hold else None}})
         if stage == "planning_merge":
             return json.dumps({"episode_id": episode_id, "immediate_objective": "synthetic objective", "obstacle": "synthetic obstacle", "protagonist_action": "synthetic action", "meaningful_change": "synthetic change", "episode_ending": "synthetic ending", "selected_worker_ids": ["planning-event"], "continuity_constraints": ["synthetic constraint"]})
         if stage == "writer":
@@ -494,29 +496,68 @@ def test_live_pilot_complete_rerun_is_noop(tmp_path):
     output = tmp_path / "pilot-live"
     client, _ = _pilot_client(output)
     PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
-    before = {path.relative_to(output).as_posix(): path.read_bytes() for path in output.rglob("*") if path.is_file()}
+    before = _file_bytes(output)
+    before_routing = (output / "routing_state.json").read_bytes()
+    before_telemetry = (output / "pilot_live_calls.json").read_bytes()
+    before_manifest = (output / "pilot_manifest.json").read_bytes()
 
     fresh_client, provider_root = _pilot_client(output)
     result = PilotPipeline(fresh_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
-    after = {path.relative_to(output).as_posix(): path.read_bytes() for path in output.rglob("*") if path.is_file()}
+    after = _file_bytes(output)
 
     assert result["no_op"] is True
     assert provider_root.provider_calls == []
+    assert (output / "routing_state.json").read_bytes() == before_routing
+    assert (output / "pilot_live_calls.json").read_bytes() == before_telemetry
+    assert (output / "pilot_manifest.json").read_bytes() == before_manifest
     assert after == before
+
+
+def test_live_episode_hold_rerun_is_noop(tmp_path):
+    output = tmp_path / "pilot-live"
+    client, _ = _pilot_client(output, _PilotProviderRoot(hold_episode="episode_003"))
+    PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    before = _file_bytes(output)
+    before_routing = (output / "routing_state.json").read_bytes()
+    before_telemetry = (output / "pilot_live_calls.json").read_bytes()
+    before_manifest = (output / "pilot_manifest.json").read_bytes()
+    before_calls = len(read_json(output / "pilot_live_calls.json")["calls"])
+
+    fresh_client, provider_root = _pilot_client(output)
+    result = PilotPipeline(fresh_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+
+    assert result["no_op"] is True
+    assert provider_root.provider_calls == []
+    assert len(read_json(output / "pilot_live_calls.json")["calls"]) == before_calls
+    assert (output / "routing_state.json").read_bytes() == before_routing
+    assert (output / "pilot_live_calls.json").read_bytes() == before_telemetry
+    assert (output / "pilot_manifest.json").read_bytes() == before_manifest
+    assert _file_bytes(output) == before
+    assert not (output / "episodes" / "episode_004").exists()
+    assert not (output / "pilot_review_workers.partial.json").exists()
 
 
 def test_live_pilot_hold_rerun_is_noop(tmp_path):
     output = tmp_path / "pilot-live"
-    client, _ = _pilot_client(output, _PilotProviderRoot(hold_episode="episode_003"))
+    client, _ = _pilot_client(output, _PilotProviderRoot(hold_dimension="continuity"))
     PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
-    before = len(read_json(output / "pilot_live_calls.json")["calls"])
+    before = _file_bytes(output)
+    before_routing = (output / "routing_state.json").read_bytes()
+    before_telemetry = (output / "pilot_live_calls.json").read_bytes()
+    before_manifest = (output / "pilot_manifest.json").read_bytes()
+    before_calls = len(read_json(output / "pilot_live_calls.json")["calls"])
 
     fresh_client, provider_root = _pilot_client(output)
     result = PilotPipeline(fresh_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
 
+    assert read_json(output / "pilot_manifest.json")["status"] == "HOLD"
     assert result["no_op"] is True
     assert provider_root.provider_calls == []
-    assert len(read_json(output / "pilot_live_calls.json")["calls"]) == before
+    assert len(read_json(output / "pilot_live_calls.json")["calls"]) == before_calls
+    assert (output / "routing_state.json").read_bytes() == before_routing
+    assert (output / "pilot_live_calls.json").read_bytes() == before_telemetry
+    assert (output / "pilot_manifest.json").read_bytes() == before_manifest
+    assert _file_bytes(output) == before
 
 
 def _acceptance_prompts(provider_root: _PilotProviderRoot) -> list[str]:
