@@ -1,33 +1,41 @@
 # ARC
 
-ARC는 AI가 연작 단편소설을 작성하는 취미 프로젝트다.
+ARC is an AI system for creating readable, long-running serialized novels.
 
-입력:
+ARC is a generator. It is not a work title, genre, world, or fixed narrative structure. Each novel created by ARC is an independent project with its own creative specification.
 
-- 최소 세계관
-- 에피소드 한 줄 아이디어
+## Canon
 
-과정:
+`ARC_CANON.md` is the sole canonical contract for:
 
-- 계획
-- 초안
-- 비판적 리뷰 1회
-- 수정 1회
-- 최종본
+- project identity
+- model capabilities
+- generation architecture
+- parallel execution policy
+- rolling planning
+- episode quality
+- long-term memory
+- context assembly
+- validation phases
+- implementation constraints
 
-출력:
+Before planning, implementing, reviewing, or modifying ARC:
 
-- 완성된 단편소설 final.md
+1. Read `ARC_CANON.md`.
+2. Determine the current phase from that document.
+3. Work only within the current phase.
+4. Do not infer requirements from previous ARC versions or repository history.
+5. Do not introduce architecture that is not required by the current phase.
 
-이번 초기 버전에서 하지 않는 것:
+## Current Phase
 
-- 복잡한 승인 게이트
-- 범용 플랫폼
-- 여러 모델 투표
-- 무한 수정
+`PHASE_0_CANON`
 
-첫 목표:
+Current deliverables:
 
-실제 단편소설 한 편을 ARC가 처음부터 끝까지 완성한다.
+- `README.md`
+- `ARC_CANON.md`
 
-이번에는 코드부터 만들지 않는다. 이 README를 정본으로 승인한 뒤, 필요한 최소 기능만 한 번에 설계한다.
+No generation engine is authorized in this phase.
+
+The next implementation phase begins only after the canon is reviewed and explicitly approved.
