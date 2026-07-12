@@ -242,6 +242,10 @@ class ScopedGemmaPoolClient:
     def generate(self, *, stage: str, role: str, prompt: str) -> str:
         return self.generate_for_desk(desk=logical_desk(stage, role), prompt=prompt)
 
+    @property
+    def sdk_version(self) -> str:
+        return self.base.sdk_version
+
     def telemetry(self) -> dict:
         return self.base.telemetry(scope_id=self.scope_id)
 

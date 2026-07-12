@@ -15,10 +15,14 @@ class PilotError(RuntimeError):
 
 
 class PilotPipeline:
-    def __init__(self, client, scenario: str):
-        if scenario not in {"pass", "episode_hold", "pilot_hold"}:
+    def __init__(self, client, scenario: str | None = "pass", mode: str = "mock"):
+        if mode not in {"mock", "live"}:
+            raise PilotError("unknown pilot mode")
+        if mode == "mock" and scenario not in {"pass", "episode_hold", "pilot_hold"}:
             raise PilotError("unknown pilot scenario")
-        self.client, self.scenario = client, scenario
+        if mode == "live" and scenario is not None:
+            raise PilotError("live pilot does not accept mock scenario")
+        self.client, self.scenario, self.mode = client, scenario, mode
 
     def run(self, fixture_path: Path, run_dir: Path) -> dict:
         raw = fixture_path.read_bytes()
@@ -27,15 +31,19 @@ class PilotPipeline:
         manifest_path = run_dir / "pilot_manifest.json"
         if manifest_path.exists():
             manifest = read_json(manifest_path)
-            if manifest["source_hash"] != source_hash or manifest["scenario"] != self.scenario or manifest["mode"] != "mock":
+            if manifest["source_hash"] != source_hash or manifest["scenario"] != self.scenario or manifest["mode"] != self.mode:
                 raise PilotError("pilot input changed; refusing reuse")
+            if self.mode == "live" and (run_dir / "pilot_live_calls.json").exists():
+                self.client.restore_telemetry(read_json(run_dir / "pilot_live_calls.json"))
             verify_pilot_artifacts(run_dir, manifest)
             if manifest["status"] in {"COMPLETE", "HOLD"}:
                 (run_dir / "pilot_review_workers.partial.json").unlink(missing_ok=True)
                 return {"no_op": True, "manifest": manifest}
         else:
             run_dir.mkdir(parents=True, exist_ok=True)
-            manifest = {"schema_version": 1, "mode": "mock", "pilot_id": fixture["pilot_id"], "fixture_id": fixture["initial_source"]["fixture_id"], "source_hash": source_hash, "scenario": self.scenario, "status": "RUNNING", "episode_ids": fixture["episode_ids"], "completed_episodes": [], "completed_transitions": [], "active_episode_id": fixture["episode_ids"][0], "episode_records": [], "artifact_hashes": {}, "acceptance_verdict": None, "last_error": None}
+            manifest = {"schema_version": 1, "mode": self.mode, "pilot_id": fixture["pilot_id"], "fixture_id": fixture["initial_source"]["fixture_id"], "source_hash": source_hash, "scenario": self.scenario, "status": "RUNNING", "episode_ids": fixture["episode_ids"], "completed_episodes": [], "completed_transitions": [], "active_episode_id": fixture["episode_ids"][0], "episode_records": [], "artifact_hashes": {}, "acceptance_verdict": None, "last_error": None}
+            if self.mode == "live":
+                manifest.update({"provider": "gemini_developer_api", "model": self.client.config.model, "key_pool_size": len(self.client.config.keys), "max_live": self.client.config.max_live, "routing_schema_version": 2, "routing_mode": "dynamic_key_pool", "pilot_live_call_count": 0})
             self._save_manifest(run_dir, manifest)
         try:
             self._advance(fixture, run_dir, manifest)
@@ -59,17 +67,22 @@ class PilotPipeline:
                 raise PilotError("episode source identity mismatch")
             episode_dir = run_dir / "episodes" / episode_id
             if episode_id not in manifest["completed_episodes"]:
-                original = getattr(self.client, "scenario", None)
-                if self.scenario == "episode_hold" and index == 2:
-                    self.client.scenario = "hold"
-                try:
-                    MockPipeline(self.client).run(source_path, episode_dir, getattr(self.client, "scenario", "pass"))
-                finally:
-                    if original is not None:
-                        self.client.scenario = original
+                if self.mode == "live":
+                    MockPipeline(self._episode_client(episode_id, index), mode="live").run(source_path, episode_dir, None)
+                    self._save_pilot_live_calls(run_dir, manifest)
+                else:
+                    original = getattr(self.client, "scenario", None)
+                    if self.scenario == "episode_hold" and index == 2:
+                        self.client.scenario = "hold"
+                    try:
+                        MockPipeline(self.client).run(source_path, episode_dir, getattr(self.client, "scenario", "pass"))
+                    finally:
+                        if original is not None:
+                            self.client.scenario = original
                 current = status(episode_dir)
                 if current["status"] == "HOLD":
                     manifest["status"], manifest["active_episode_id"] = "HOLD", episode_id
+                    self._save_pilot_live_calls(run_dir, manifest)
                     self._save_manifest(run_dir, manifest)
                     return
                 if current["status"] != "COMPLETE":
@@ -77,6 +90,7 @@ class PilotPipeline:
                 record = {"episode_id": episode_id, "status": current["status"], "writer_call_count": current["writer_call_count"], "revision_count": current["revision_count"], "final_sha256": sha256_file(episode_dir / "final.md"), "memory_after_sha256": sha256_file(episode_dir / "memory_after.json")}
                 manifest["completed_episodes"].append(episode_id)
                 manifest["episode_records"].append(record)
+                self._save_pilot_live_calls(run_dir, manifest)
                 self._save_manifest(run_dir, manifest)
             if index < len(ids) - 1:
                 transition_id = f"{episode_id}_to_{ids[index + 1]}"
@@ -86,6 +100,12 @@ class PilotPipeline:
                     self._save_manifest(run_dir, manifest)
                 else:
                     self._verify_completed_transition(run_dir, manifest, transition_id, episode_id, ids[index + 1], source, index)
+        if self.mode == "live":
+            manifest["active_episode_id"] = None
+            manifest["status"] = "COMPLETE"
+            self._save_pilot_live_calls(run_dir, manifest)
+            self._save_manifest(run_dir, manifest)
+            return
         if "pilot_acceptance.json" not in manifest["artifact_hashes"]:
             evidence = self._write_evidence_packet(run_dir, manifest)
             workers_path = run_dir / "pilot_review_workers.json"
@@ -242,6 +262,15 @@ class PilotPipeline:
     def _write_artifact(self, run_dir: Path, manifest: dict, name: str, value: dict | list) -> None:
         manifest["artifact_hashes"][name] = write_json(run_dir / name, value)
 
+    def _episode_client(self, episode_id: str, index: int):
+        return self.client.scope(scope_id=f"episode:{episode_id}", logical_order_base=index * 100)
+
+    def _save_pilot_live_calls(self, run_dir: Path, manifest: dict) -> None:
+        if self.mode == "live":
+            telemetry = self.client.telemetry()
+            manifest["pilot_live_call_count"] = len(telemetry["calls"])
+            manifest["artifact_hashes"]["pilot_live_calls.json"] = write_json(run_dir / "pilot_live_calls.json", telemetry)
+
     def _save_manifest(self, run_dir: Path, manifest: dict) -> None:
         write_json(run_dir / "pilot_manifest.json", manifest)
 
@@ -260,15 +289,30 @@ def verify_pilot_artifacts(run_dir: Path, manifest: dict) -> None:
         if not path.exists() or sha256_file(path) != digest:
             raise StorageError(f"pilot artifact hash mismatch: {name}")
     expected = {"pilot_manifest.json", *manifest["artifact_hashes"], "pilot_review_workers.partial.json"}
+    operational = {"routing_state.json"} if manifest.get("mode") == "live" else set()
     actual = {path.relative_to(run_dir).as_posix() for path in run_dir.rglob("*") if path.is_file()}
-    if actual - expected - {f"episodes/{episode_id}/{name}" for episode_id in manifest["episode_ids"] for name in _episode_files(run_dir / "episodes" / episode_id)}:
+    if actual - expected - operational - {f"episodes/{episode_id}/{name}" for episode_id in manifest["episode_ids"] for name in _episode_files(run_dir / "episodes" / episode_id)}:
         raise StorageError("unknown pilot artifact")
+    if manifest.get("mode") == "live" and (run_dir / "pilot_live_calls.json").exists():
+        _verify_live_telemetry_projections(run_dir, manifest)
     for episode_id in manifest["completed_episodes"]:
         status(run_dir / "episodes" / episode_id)
 
 
 def _episode_files(path: Path) -> list[str]:
     return [item.name for item in path.iterdir() if item.is_file()] if path.exists() else []
+
+
+def _verify_live_telemetry_projections(run_dir: Path, manifest: dict) -> None:
+    root = read_json(run_dir / "pilot_live_calls.json")
+    root_by_scope = {}
+    for call in root.get("calls", []):
+        root_by_scope.setdefault(call.get("scope_id"), []).append(call)
+    for episode_id in manifest["completed_episodes"]:
+        episode_calls = read_json(run_dir / "episodes" / episode_id / "live_calls.json").get("calls", [])
+        scope_id = f"episode:{episode_id}"
+        if episode_calls != root_by_scope.get(scope_id, []):
+            raise StorageError("episode live telemetry projection mismatch")
 
 
 def pilot_status(run_dir: Path) -> dict:
