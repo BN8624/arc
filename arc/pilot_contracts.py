@@ -27,8 +27,8 @@ def validate_pilot_fixture(value: dict) -> dict:
 
 
 def validate_transition(value: dict, source: dict, next_episode_id: str, root: str) -> dict:
-    required = {"completed_episode_id", "next_episode", "rolling_plan_after", "continuity_satisfied", "continuity_deferred", "adaptation_summary", "evidence_refs"}
-    if set(value) != required or value["completed_episode_id"] != source["current_episode"]["episode_id"] or value["next_episode"].get("episode_id") != next_episode_id:
+    required = {"schema_version", "completed_episode_id", "next_episode_id", "transition_input_hash", "next_source_hash", "next_episode", "rolling_plan_after", "continuity_satisfied", "continuity_deferred", "adaptation_summary", "evidence_refs"}
+    if set(value) != required or value["schema_version"] != 1 or not isinstance(value["transition_input_hash"], str) or not isinstance(value["next_source_hash"], str) or value["completed_episode_id"] != source["current_episode"]["episode_id"] or value["next_episode_id"] != next_episode_id or value["next_episode"].get("episode_id") != next_episode_id:
         raise ContractError("invalid pilot transition identity")
     if not isinstance(value["rolling_plan_after"], dict) or not value["rolling_plan_after"] or not isinstance(value["adaptation_summary"], str) or not value["adaptation_summary"]:
         raise ContractError("invalid pilot transition plan")

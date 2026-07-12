@@ -4,8 +4,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from .contracts import ContractError, validate_worker
-from .pipeline import MockPipeline, status
+from .contracts import ContractError, parse_object, validate_worker
+from .pipeline import MockPipeline, WaveCheckpoint, status
 from .pilot_contracts import PILOT_REVIEW_ROLES, STABLE_MEMORY_FIELDS, canonical_bytes, validate_pilot_acceptance, validate_pilot_fixture, validate_transition
 from .storage import StorageError, read_json, sha256_bytes, sha256_file, write_json
 
@@ -80,30 +80,78 @@ class PilotPipeline:
             if index < len(ids) - 1:
                 transition_id = f"{episode_id}_to_{ids[index + 1]}"
                 if transition_id not in manifest["completed_transitions"]:
-                    transition, next_source = self._transition(run_dir, episode_id, ids[index + 1], source)
-                    self._write_artifact(run_dir, manifest, f"transitions/{transition_id}.json", transition)
-                    self._write_artifact(run_dir, manifest, f"episode_sources/{ids[index + 1]}.json", next_source)
+                    self._reconcile_transition(run_dir, manifest, transition_id, episode_id, ids[index + 1], source, index)
                     manifest["completed_transitions"].append(transition_id)
                     self._save_manifest(run_dir, manifest)
         if "pilot_acceptance.json" not in manifest["artifact_hashes"]:
             evidence = self._write_evidence_packet(run_dir, manifest)
-            workers = [self._review_worker(role) for role in PILOT_REVIEW_ROLES]
+            workers_path = run_dir / "pilot_review_workers.json"
+            if workers_path.exists():
+                if manifest["artifact_hashes"].get("pilot_review_workers.json") != sha256_file(workers_path):
+                    raise PilotError("pilot review worker hash mismatch")
+                workers = read_json(workers_path)
+                if not isinstance(workers, list) or [worker.get("role") for worker in workers] != PILOT_REVIEW_ROLES:
+                    raise PilotError("invalid canonical pilot review workers")
+                for worker in workers:
+                    self._review_worker_contract(worker, worker["role"])
+            else:
+                workers = self._review_workers(run_dir, manifest, evidence)
+                self._write_artifact(run_dir, manifest, "pilot_review_workers.json", workers)
             acceptance = self._acceptance(evidence, workers)
-            self._write_artifact(run_dir, manifest, "pilot_review_workers.json", workers)
             self._write_artifact(run_dir, manifest, "pilot_acceptance.json", acceptance)
             manifest["acceptance_verdict"] = acceptance["verdict"]
         manifest["status"] = "COMPLETE" if manifest["acceptance_verdict"] == "PASS" else "HOLD"
         manifest["active_episode_id"] = None
         self._save_manifest(run_dir, manifest)
+        (run_dir / "pilot_review_workers.partial.json").unlink(missing_ok=True)
 
-    def _transition(self, run_dir: Path, episode_id: str, next_id: str, source: dict) -> tuple[dict, dict]:
+    def _transition_input_hash(self, run_dir: Path, manifest: dict, episode_id: str, next_id: str, source: dict, index: int) -> str:
+        root = run_dir / "episodes" / episode_id
+        value = {"pilot_id": manifest["pilot_id"], "completed_episode_id": episode_id, "next_episode_id": next_id, "source_hash": sha256_bytes(canonical_bytes(source)), "episode_plan_hash": sha256_file(root / "episode_plan.json"), "final_hash": sha256_file(root / "final.md"), "memory_update_hash": sha256_file(root / "memory_update.json"), "memory_after_hash": sha256_file(root / "memory_after.json"), "rolling_plan": source["rolling_plan"], "required_continuity": source["required_next_episode_continuity"], "remaining_episode_count": len(manifest["episode_ids"]) - index - 1}
+        return sha256_bytes(canonical_bytes(value))
+
+    def _reconcile_transition(self, run_dir: Path, manifest: dict, transition_id: str, episode_id: str, next_id: str, source: dict, index: int) -> None:
+        transition_path = run_dir / "transitions" / f"{transition_id}.json"
+        source_path = run_dir / "episode_sources" / f"{next_id}.json"
+        input_hash = self._transition_input_hash(run_dir, manifest, episode_id, next_id, source, index)
+        if transition_path.exists():
+            transition = read_json(transition_path)
+            validate_transition(transition, source, next_id, str(run_dir))
+            if transition["transition_input_hash"] != input_hash:
+                raise PilotError("transition input hash mismatch")
+            if source_path.exists():
+                if transition["next_source_hash"] != sha256_file(source_path):
+                    raise PilotError("transition next source hash mismatch")
+            else:
+                next_source = self._next_source_from_transition(run_dir, episode_id, transition)
+                if _json_file_hash(next_source) != transition["next_source_hash"]:
+                    raise PilotError("transition next source payload mismatch")
+                self._write_artifact(run_dir, manifest, f"episode_sources/{next_id}.json", next_source)
+            manifest["artifact_hashes"][f"transitions/{transition_id}.json"] = sha256_file(transition_path)
+            manifest["artifact_hashes"][f"episode_sources/{next_id}.json"] = sha256_file(source_path)
+        elif source_path.exists():
+            raise PilotError("next episode source exists without transition")
+        else:
+            transition, next_source = self._transition(run_dir, manifest, episode_id, next_id, source, input_hash)
+            self._write_artifact(run_dir, manifest, f"transitions/{transition_id}.json", transition)
+            self._write_artifact(run_dir, manifest, f"episode_sources/{next_id}.json", next_source)
+
+    def _transition(self, run_dir: Path, manifest: dict, episode_id: str, next_id: str, source: dict, input_hash: str) -> tuple[dict, dict]:
         episode_dir = run_dir / "episodes" / episode_id
         memory_after = read_json(episode_dir / "memory_after.json")
         update = read_json(episode_dir / "memory_update.json")
         rolling_plan = dict(memory_after["rolling_plan"])
         rolling_plan["near_horizon"] = list(rolling_plan.get("near_horizon", [])) + [f"synthetic transition toward {next_id}"]
-        transition = {"completed_episode_id": episode_id, "next_episode": {"episode_id": next_id, "importance": "ordinary", "required_role": f"synthetic pilot role for {next_id}"}, "rolling_plan_after": rolling_plan, "continuity_satisfied": [], "continuity_deferred": list(source["required_next_episode_continuity"]), "adaptation_summary": f"Synthetic plan adapts after {episode_id} toward {next_id}.", "evidence_refs": [f"episodes/{episode_id}/final.md", f"episodes/{episode_id}/memory_update.json", f"episodes/{episode_id}/memory_after.json", f"episodes/{episode_id}/episode_plan.json"]}
+        transition = {"schema_version": 1, "completed_episode_id": episode_id, "next_episode_id": next_id, "transition_input_hash": input_hash, "next_source_hash": "pending", "next_episode": {"episode_id": next_id, "importance": "ordinary", "required_role": f"synthetic pilot role for {next_id}"}, "rolling_plan_after": rolling_plan, "continuity_satisfied": [], "continuity_deferred": list(source["required_next_episode_continuity"]), "adaptation_summary": f"Synthetic plan adapts after {episode_id} toward {next_id}.", "evidence_refs": [f"episodes/{episode_id}/final.md", f"episodes/{episode_id}/memory_update.json", f"episodes/{episode_id}/memory_after.json", f"episodes/{episode_id}/episode_plan.json"]}
+        next_source = self._next_source_from_transition(run_dir, episode_id, transition)
+        transition["next_source_hash"] = _json_file_hash(next_source)
         validate_transition(transition, source, next_id, str(run_dir))
+        return transition, next_source
+
+    def _next_source_from_transition(self, run_dir: Path, episode_id: str, transition: dict) -> dict:
+        episode_dir = run_dir / "episodes" / episode_id
+        memory_after = read_json(episode_dir / "memory_after.json")
+        update = read_json(episode_dir / "memory_update.json")
         next_source = dict(memory_after)
         next_source["current_episode"] = transition["next_episode"]
         next_source["rolling_plan"] = transition["rolling_plan_after"]
@@ -111,7 +159,7 @@ class PilotPipeline:
         for field in STABLE_MEMORY_FIELDS:
             if canonical_bytes(next_source[field]) != canonical_bytes(memory_after[field]):
                 raise PilotError("transition mutated stable memory")
-        return transition, next_source
+        return next_source
 
     def _write_evidence_packet(self, run_dir: Path, manifest: dict) -> list[str]:
         evidence = {"pilot_id": manifest["pilot_id"], "episode_ids": manifest["episode_ids"], "episodes": [], "transitions": [], "rolling_plan_hashes": []}
@@ -129,15 +177,41 @@ class PilotPipeline:
         self._write_artifact(run_dir, manifest, "pilot_evidence_packet.json", evidence)
         return refs
 
-    def _review_worker(self, role: str) -> dict:
-        value = {"worker_id": f"pilot_review-{role}", "role": role, "verdict": "OK", "primary_finding": f"synthetic {role} finding", "primary_risk": f"synthetic {role} risk", "evidence_refs": ["pilot_evidence_packet.json"], "proposal": {"role": role}}
-        return validate_worker(value, f"pilot_review-{role}", role)
+    def _review_workers(self, run_dir: Path, manifest: dict, evidence_refs: list[str]) -> list[dict]:
+        evidence_hash = manifest["artifact_hashes"]["pilot_evidence_packet.json"]
+        checkpoint = WaveCheckpoint(run_dir / "pilot_review_workers.partial.json", "pilot_review", {"pilot_id": manifest["pilot_id"], "mode": manifest["mode"], "scenario": self.scenario, "episode_ids": manifest["episode_ids"], "evidence_packet_hash": evidence_hash}, PILOT_REVIEW_ROLES)
+        workers = [checkpoint.result(role) for role in PILOT_REVIEW_ROLES if checkpoint.result(role)]
+        first_error = None
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=len(PILOT_REVIEW_ROLES)) as executor:
+            futures = {executor.submit(self._review_worker, manifest, role, evidence_hash): role for role in PILOT_REVIEW_ROLES if not checkpoint.result(role)}
+            for future in as_completed(futures):
+                try:
+                    worker = future.result()
+                    workers.append(worker)
+                    checkpoint.save(worker["role"], worker)
+                except Exception as error:
+                    first_error = first_error or error
+        if first_error:
+            raise first_error
+        return sorted(workers, key=lambda worker: PILOT_REVIEW_ROLES.index(worker["role"]))
+
+    def _review_worker(self, manifest: dict, role: str, evidence_hash: str) -> dict:
+        prompt = json.dumps({"pilot_id": manifest["pilot_id"], "mode": manifest["mode"], "scenario": self.scenario, "episode_ids": manifest["episode_ids"], "evidence_packet_hash": evidence_hash, "dimension": role, "allowed_evidence_refs": ["pilot_evidence_packet.json"], "contract": "proposal.dimension_result is PASS or HOLD; HOLD requires proposal.critical_finding"}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        value = parse_object(self.client.generate(stage="pilot_review", role=role, prompt=prompt))
+        return self._review_worker_contract(value, role)
+
+    def _review_worker_contract(self, value: dict, role: str) -> dict:
+        worker = validate_worker(value, f"pilot_review-{role}", role)
+        proposal = worker["proposal"]
+        if set(proposal) != {"dimension_result", "critical_finding"} or proposal["dimension_result"] not in {"PASS", "HOLD"} or worker["evidence_refs"] != ["pilot_evidence_packet.json"] or (proposal["dimension_result"] == "PASS" and proposal["critical_finding"] is not None) or (proposal["dimension_result"] == "HOLD" and (not isinstance(proposal["critical_finding"], str) or not proposal["critical_finding"])):
+            raise PilotError("invalid pilot review worker")
+        return worker
 
     def _acceptance(self, evidence_refs: list[str], workers: list[dict]) -> dict:
-        dimensions = {worker["role"]: "PASS" for worker in workers}
-        if self.scenario == "pilot_hold":
-            dimensions["continuity"] = "HOLD"
-        value = {"verdict": "PASS" if all(item == "PASS" for item in dimensions.values()) else "HOLD", "dimension_results": dimensions, "critical_findings": [] if all(item == "PASS" for item in dimensions.values()) else ["synthetic cross-episode continuity hold"], "strengths_to_preserve": ["synthetic continuity evidence"], "evidence_refs": evidence_refs}
+        dimensions = {worker["role"]: worker["proposal"]["dimension_result"] for worker in workers}
+        findings = [worker["proposal"]["critical_finding"] for worker in workers if worker["proposal"]["critical_finding"]]
+        value = {"verdict": "PASS" if all(item == "PASS" for item in dimensions.values()) else "HOLD", "dimension_results": dimensions, "critical_findings": findings, "strengths_to_preserve": ["synthetic continuity evidence"], "evidence_refs": evidence_refs}
         return validate_pilot_acceptance(value, evidence_refs)
 
     def _write_artifact(self, run_dir: Path, manifest: dict, name: str, value: dict | list) -> None:
@@ -151,12 +225,16 @@ def _unique(values: list[str]) -> list[str]:
     return list(dict.fromkeys(values))
 
 
+def _json_file_hash(value: object) -> str:
+    return sha256_bytes((json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8"))
+
+
 def verify_pilot_artifacts(run_dir: Path, manifest: dict) -> None:
     for name, digest in manifest["artifact_hashes"].items():
         path = run_dir / name
         if not path.exists() or sha256_file(path) != digest:
             raise StorageError(f"pilot artifact hash mismatch: {name}")
-    expected = {"pilot_manifest.json", *manifest["artifact_hashes"]}
+    expected = {"pilot_manifest.json", *manifest["artifact_hashes"], "pilot_review_workers.partial.json"}
     actual = {path.relative_to(run_dir).as_posix() for path in run_dir.rglob("*") if path.is_file()}
     if actual - expected - {f"episodes/{episode_id}/{name}" for episode_id in manifest["episode_ids"] for name in _episode_files(run_dir / "episodes" / episode_id)}:
         raise StorageError("unknown pilot artifact")

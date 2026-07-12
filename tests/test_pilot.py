@@ -101,3 +101,49 @@ def test_pilot_fixture_rejects_duplicate_episode_ids() -> None:
     fixture["episode_ids"][4] = fixture["episode_ids"][3]
     with pytest.raises(Exception):
         validate_pilot_fixture(fixture)
+
+
+def test_pilot_review_uses_all_seven_client_desks(tmp_path: Path) -> None:
+    client, _ = run(tmp_path)
+    roles = [role for stage, role, _ in client.calls if stage == "pilot_review"]
+    assert len(roles) == 7
+    assert set(roles) == {"readability", "character_consistency", "continuity", "rolling_plan_adaptation", "memory_correctness", "narrative_weight", "episode_to_episode_interest"}
+
+
+def test_existing_transition_and_source_reconcile_without_rebuild(tmp_path: Path) -> None:
+    _, output = run(tmp_path)
+    manifest_path = output / "pilot_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    transition_id = "episode_002_to_episode_003"
+    manifest["status"] = "RUNNING"
+    manifest["completed_transitions"].remove(transition_id)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    class SpyPilot(PilotPipeline):
+        def _transition(self, *args, **kwargs):
+            raise AssertionError("transition rebuilt")
+
+    SpyPilot(MockModelClient("pass"), "pass").run(FIXTURE, output)
+    assert transition_id in json.loads(manifest_path.read_text(encoding="utf-8"))["completed_transitions"]
+
+
+def test_acceptance_partial_resumes_only_missing_dimension(tmp_path: Path) -> None:
+    _, output = run(tmp_path)
+    manifest_path = output / "pilot_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["status"] = "RUNNING"
+    manifest["acceptance_verdict"] = None
+    for name in ("pilot_review_workers.json", "pilot_acceptance.json"):
+        manifest["artifact_hashes"].pop(name)
+        (output / name).unlink()
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    partial_client = MockModelClient("pass", malformed_at="pilot_review:continuity")
+    with pytest.raises(Exception):
+        PilotPipeline(partial_client, "pass").run(FIXTURE, output)
+    completed = {role for stage, role, _ in partial_client.calls if stage == "pilot_review"} - {"continuity"}
+    resume_client = MockModelClient("pass")
+    PilotPipeline(resume_client, "pass").run(FIXTURE, output)
+    resumed = [role for stage, role, _ in resume_client.calls if stage == "pilot_review"]
+    assert completed.isdisjoint(resumed)
+    assert resumed == ["continuity"]

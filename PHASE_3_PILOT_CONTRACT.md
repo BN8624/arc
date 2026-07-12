@@ -14,9 +14,13 @@ Episode 1 uses the fixture initial source. Episode N+1 uses Episode N `memory_af
 
 Only `current_episode`, `rolling_plan`, and `required_next_episode_continuity` may change in a transition. A transition strictly partitions the previous required continuity into satisfied and deferred values. The next source carries deferred continuity followed by new memory-update continuity, with stable ordering and duplicate removal. Transition evidence references only canonical artifacts inside the pilot output.
 
+Each transition stores its canonical input hash and next-source hash. On restart, a valid transition-only state writes only the missing source, while a valid transition-and-source state records only the missing manifest completion. Existing valid transition or source artifacts are never rebuilt; mismatches fail closed.
+
 ## Resume, No-op, and HOLD
 
 Completed episodes and transitions are never rerun. A current episode delegates resume to the existing single-episode pipeline. COMPLETE and HOLD pilot reruns are no-ops. Episode HOLD prevents later source, transition, and acceptance creation. Pilot acceptance HOLD preserves all episodes and never automatically revises or advances to Phase 4.
+
+The seven acceptance dimensions execute through `client.generate(stage="pilot_review", role=dimension, prompt=canonical_prompt)`. Their validated successes are atomically stored in `pilot_review_workers.partial.json`. Restart reuses completed dimensions and calls only missing ones. Terminal desk errors preserve other successful partial results. Canonical review workers and acceptance artifacts are committed before the partial checkpoint is removed.
 
 ## Pilot Acceptance
 

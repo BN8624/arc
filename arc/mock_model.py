@@ -41,6 +41,9 @@ class MockModelClient:
         if stage in {"planning", "review", "memory"}:
             evidence = ["final.md"] if stage == "memory" else ["source:current_episode"]
             return {"worker_id": f"{stage}-{role}", "role": role, "verdict": "OK", "primary_finding": f"synthetic {role} finding", "primary_risk": f"synthetic {role} risk", "evidence_refs": evidence, "proposal": {"role": role}}
+        if stage == "pilot_review":
+            hold = payload.get("scenario") == "pilot_hold" and role == "continuity"
+            return {"worker_id": f"pilot_review-{role}", "role": role, "verdict": "OK", "primary_finding": f"synthetic {role} finding", "primary_risk": f"synthetic {role} risk", "evidence_refs": ["pilot_evidence_packet.json"], "proposal": {"dimension_result": "HOLD" if hold else "PASS", "critical_finding": "synthetic cross-episode continuity hold" if hold else None}}
         if stage == "planning_merge":
             return {"episode_id": episode_id, "immediate_objective": "synthetic objective", "obstacle": "synthetic obstacle", "protagonist_action": "synthetic action", "meaningful_change": "synthetic change", "episode_ending": "synthetic ending", "selected_worker_ids": ["planning-event"], "continuity_constraints": ["synthetic constraint"]}
         if stage == "writer":
