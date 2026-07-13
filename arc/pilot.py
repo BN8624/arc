@@ -36,8 +36,18 @@ class PilotPipeline:
             if self.mode == "live" and (run_dir / "pilot_live_calls.json").exists():
                 self.client.restore_telemetry(read_json(run_dir / "pilot_live_calls.json"))
             verify_pilot_artifacts(run_dir, manifest)
-            if self.mode == "live" and inspect_pilot_checkpoint(run_dir, manifest)["checkpoint_integrity"] == "RECONCILABLE":
-                raise PilotError("pilot checkpoint reconciliation required")
+            if self.mode == "live":
+                inspection = inspect_pilot_checkpoint(run_dir, manifest)
+                if _reconcile_legacy_revision_attempt(run_dir, manifest, inspection):
+                    return {"no_op": False, "manifest": manifest}
+                active_episode = manifest.get("active_episode_id")
+                active_manifest = run_dir / "episodes" / str(active_episode) / "manifest.json"
+                if active_episode in manifest["episode_ids"] and active_manifest.exists() and "revision_attempt_state" in read_json(active_manifest):
+                    index = manifest["episode_ids"].index(active_episode)
+                    MockPipeline(self._episode_client(active_episode, index), mode="live")._validate_revision_state(active_manifest.parent, read_json(active_manifest))
+                response_received = active_manifest.exists() and read_json(active_manifest).get("revision_attempt_state") == "RESPONSE_RECEIVED"
+                if inspection["checkpoint_integrity"] == "RECONCILABLE" and not response_received:
+                    raise PilotError("pilot checkpoint reconciliation required")
             if manifest["status"] in {"COMPLETE", "HOLD"}:
                 (run_dir / "pilot_review_workers.partial.json").unlink(missing_ok=True)
                 return {"no_op": True, "manifest": manifest}
@@ -365,6 +375,56 @@ def verify_pilot_artifacts(run_dir: Path, manifest: dict) -> None:
         _verify_live_telemetry_projections(run_dir, manifest)
     for episode_id in manifest["completed_episodes"]:
         status(run_dir / "episodes" / episode_id)
+
+
+def _reconcile_legacy_revision_attempt(run_dir: Path, manifest: dict, inspection: dict) -> bool:
+    episode_id = manifest.get("active_episode_id")
+    episode_dir = run_dir / "episodes" / str(episode_id)
+    episode_manifest_path = episode_dir / "manifest.json"
+    if not episode_manifest_path.exists():
+        return False
+    episode = read_json(episode_manifest_path)
+    if "revision_attempt_state" in episode:
+        return False
+    error = episode.get("last_error") if isinstance(episode.get("last_error"), dict) else {}
+    suspicious = episode.get("review_verdict") == "REVISE_ONCE" and error.get("stage") == "revision"
+    if not suspicious:
+        return False
+    telemetry = read_json(run_dir / "pilot_live_calls.json")
+    revision_calls = [call for call in telemetry.get("calls", []) if call.get("scope_id") == "episode:episode_004" and call.get("stage") == "revision" and call.get("role") == "canonical"]
+    responses = [call for call in revision_calls if call.get("status") == "PASS"]
+    failures = telemetry.get("contract_failures", [])
+    matched_failures = [item for item in failures if item.get("scope_id") == "episode:episode_004" and item.get("stage") == "revision" and item.get("role") == "canonical" and item.get("contract_code") == "PROSE_TOO_SHORT" and item.get("character_count") == 3949]
+    response = responses[0] if len(responses) == 1 else None
+    exact = all((
+        manifest.get("mode") == "live",
+        episode_id == "episode_004",
+        manifest.get("status") == "ERROR",
+        episode.get("status") == "ERROR",
+        episode.get("revision_count") == 0,
+        "REVISION_COMPLETED" not in episode.get("completed_stages", []),
+        "revised.md" not in episode.get("artifact_hashes", {}),
+        not (episode_dir / "revised.md").exists(),
+        error.get("contract_code") == "PROSE_TOO_SHORT",
+        error.get("character_count") == 3949,
+        inspection.get("checkpoint_integrity") == "VALID",
+        inspection.get("reconciliation_required") is False,
+        sum(call.get("key_slot") == "K10" and call.get("status") == "FAIL" and call.get("http_status") == 500 for call in revision_calls) == 1,
+        sum(call.get("key_slot") == "K11" and call.get("status") == "FAIL" and call.get("http_status") == 500 for call in revision_calls) == 1,
+        response is not None and response.get("key_slot") == "K01" and response.get("output_characters") == 3949,
+        len(matched_failures) == 1 and response is not None and matched_failures[0].get("call_id") == response.get("call_id"),
+        len({call.get("call_id") for call in telemetry.get("calls", [])}) == len(telemetry.get("calls", [])),
+        len({call.get("lease_sequence") for call in telemetry.get("calls", [])}) == len(telemetry.get("calls", [])),
+    ))
+    if not exact:
+        raise PilotError("REVISION_RECONCILIATION_BLOCKED")
+    episode.update({"revision_count": 1, "revision_attempt_state": "REJECTED", "revision_exhausted": True, "revision_response_sha256": response["response_sha256"], "revision_character_count": 3949, "revision_contract_code": "PROSE_TOO_SHORT", "revision_response_received_at": response["finished_at"], "revision_call_id": response["call_id"], "revision_lease_sequence": response["lease_sequence"], "status": "HOLD", "last_error": {"error_class": "CONTRACT_ERROR", "stage": "revision", "role": "canonical", "contract_code": "PROSE_TOO_SHORT", "call_id": response["call_id"], "character_count": 3949, "message": "revision exhausted after rejected response"}})
+    write_json(episode_manifest_path, episode)
+    manifest["status"] = "HOLD"
+    manifest["active_episode_id"] = "episode_004"
+    manifest["last_error"] = {"error_class": "CONTRACT_ERROR", "active_episode_id": "episode_004", "stage": "revision", "role": "canonical", "contract_code": "PROSE_TOO_SHORT", "message": "revision exhausted after rejected response"}
+    write_json(run_dir / "pilot_manifest.json", manifest)
+    return True
 
 
 def inspect_pilot_checkpoint(run_dir: Path, manifest: dict | None = None) -> dict:
