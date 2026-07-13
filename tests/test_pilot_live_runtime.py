@@ -752,6 +752,131 @@ def test_pilot_live_reconcile_does_not_load_provider_client(tmp_path, monkeypatc
     assert result["checkpoint_integrity"] == "VALID"
 
 
+def test_legacy_frozen_checkpoint_is_reconcilable(tmp_path):
+    output = _make_reconcilable_pilot_output(tmp_path)
+
+    inspection = inspect_pilot_checkpoint(output)
+
+    assert inspection["checkpoint_integrity"] == "RECONCILABLE"
+    assert "LEGACY_TELEMETRY_HASH_STALE" in inspection["reason_codes"]
+
+
+def test_legacy_frozen_status_is_read_only(tmp_path):
+    from arc.pilot import pilot_status
+
+    output = _make_reconcilable_pilot_output(tmp_path)
+    before = _file_bytes(output)
+
+    current = pilot_status(output)
+
+    assert current["checkpoint_integrity"] == "RECONCILABLE"
+    assert _file_bytes(output) == before
+
+
+def test_legacy_frozen_reconcile_changes_only_manifest(tmp_path):
+    output = _make_reconcilable_pilot_output(tmp_path)
+    before = _file_bytes(output)
+
+    reconcile_pilot_checkpoint(PILOT_FIXTURE, output)
+    after = _file_bytes(output)
+
+    assert {name for name in before if before[name] != after.get(name)} == {"pilot_manifest.json"}
+
+
+def test_legacy_frozen_reconcile_derives_episode_four(tmp_path):
+    output = _make_reconcilable_pilot_output(tmp_path)
+
+    reconcile_pilot_checkpoint(PILOT_FIXTURE, output)
+
+    assert read_json(output / "pilot_manifest.json")["active_episode_id"] == "episode_004"
+
+
+def test_legacy_frozen_reconcile_preserves_error_status(tmp_path):
+    output = _make_reconcilable_pilot_output(tmp_path)
+
+    reconcile_pilot_checkpoint(PILOT_FIXTURE, output)
+
+    assert read_json(output / "pilot_manifest.json")["status"] == "ERROR"
+
+
+def test_legacy_frozen_reconcile_migrates_telemetry_checkpoint(tmp_path):
+    output = _make_reconcilable_pilot_output(tmp_path)
+
+    reconcile_pilot_checkpoint(PILOT_FIXTURE, output)
+    manifest = read_json(output / "pilot_manifest.json")
+
+    assert "pilot_live_calls.json" not in manifest["artifact_hashes"]
+    assert manifest["live_telemetry_checkpoint"]["call_count"] == len(read_json(output / "pilot_live_calls.json")["calls"])
+
+
+def test_legacy_frozen_reconciled_output_resumes_from_planning_merge(tmp_path):
+    output = _make_reconcilable_pilot_output(tmp_path)
+    reconcile_pilot_checkpoint(PILOT_FIXTURE, output)
+    fresh_client, provider_root = _pilot_client(output)
+
+    result = PilotPipeline(fresh_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+
+    assert result["manifest"]["status"] == "COMPLETE"
+    resumed = {(_episode_from_prompt(prompt), marker) for _, marker, prompt in provider_root.provider_calls}
+    assert ("episode_004", "planning_merge:merge") in resumed
+    assert not any(episode in {"episode_001", "episode_002", "episode_003"} for episode, _ in resumed)
+    assert not any(episode == "episode_004" and marker.startswith("planning:") for episode, marker in resumed)
+
+
+def test_crash_after_telemetry_before_manifest_is_reconcilable(tmp_path):
+    output = _make_episode_four_plan_error_output(tmp_path)
+    manifest = read_json(output / "pilot_manifest.json")
+    telemetry = read_json(output / "pilot_live_calls.json")
+    extra = dict(telemetry["calls"][-1])
+    extra["call_id"] = "L999-A999"
+    extra["lease_sequence"] = max(call["lease_sequence"] for call in telemetry["calls"]) + 1
+    extra["scope_id"] = "pilot:acceptance"
+    extra["desk_id"] = "pilot:acceptance:pilot_review:readability"
+    telemetry["calls"].append(extra)
+    write_json(output / "pilot_live_calls.json", telemetry)
+    routing = read_json(output / "routing_state.json")
+    routing["next_lease_sequence"] = extra["lease_sequence"] + 1
+    write_json(output / "routing_state.json", routing)
+    write_json(output / "pilot_manifest.json", manifest)
+
+    inspection = inspect_pilot_checkpoint(output)
+
+    assert inspection["checkpoint_integrity"] == "RECONCILABLE"
+    assert "TELEMETRY_APPEND_AFTER_CHECKPOINT" in inspection["reason_codes"]
+
+
+def test_crash_after_child_complete_before_root_checkpoint_is_reconcilable(tmp_path):
+    output = _make_reconcilable_pilot_output(tmp_path)
+    manifest = read_json(output / "pilot_manifest.json")
+    manifest["completed_episodes"] = ["episode_001", "episode_002"]
+    manifest["episode_records"] = manifest["episode_records"][:2]
+    write_json(output / "pilot_manifest.json", manifest)
+
+    inspection = inspect_pilot_checkpoint(output)
+
+    assert inspection["checkpoint_integrity"] == "RECONCILABLE"
+    assert inspection["derived"]["completed_episodes"] == ["episode_001", "episode_002", "episode_003"]
+
+
+def test_crash_after_transition_before_root_checkpoint_is_reconcilable(tmp_path):
+    output = _make_reconcilable_pilot_output(tmp_path)
+    manifest = read_json(output / "pilot_manifest.json")
+    manifest["completed_transitions"] = ["episode_001_to_episode_002", "episode_002_to_episode_003"]
+    write_json(output / "pilot_manifest.json", manifest)
+
+    inspection = inspect_pilot_checkpoint(output)
+
+    assert inspection["checkpoint_integrity"] == "RECONCILABLE"
+    assert inspection["derived"]["completed_transitions"] == ["episode_001_to_episode_002", "episode_002_to_episode_003", "episode_003_to_episode_004"]
+
+
+def test_half_written_transition_checkpoint_is_corrupt(tmp_path):
+    output = _make_reconcilable_pilot_output(tmp_path)
+    (output / "episode_sources" / "episode_004.json").unlink()
+
+    assert inspect_pilot_checkpoint(output)["checkpoint_integrity"] == "CORRUPT"
+
+
 def test_live_pilot_uses_one_root_routing_state(tmp_path):
     output = tmp_path / "pilot-live"
     client, _ = _pilot_client(output)

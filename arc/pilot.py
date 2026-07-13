@@ -390,6 +390,11 @@ def inspect_pilot_checkpoint(run_dir: Path, manifest: dict | None = None) -> dic
         actual = sha256_file(run_dir / "pilot_live_calls.json")
         if manifest["artifact_hashes"]["pilot_live_calls.json"] != actual:
             reason_codes.append("LEGACY_TELEMETRY_HASH_STALE")
+    checkpoint = manifest.get("live_telemetry_checkpoint") or {}
+    if checkpoint:
+        telemetry = read_json(run_dir / "pilot_live_calls.json")
+        if len(telemetry.get("calls", [])) > checkpoint.get("call_count", 0) or len(telemetry.get("contract_failures", [])) > checkpoint.get("contract_failure_count", 0):
+            reason_codes.append("TELEMETRY_APPEND_AFTER_CHECKPOINT")
     if current["completed_episodes"] != derived["completed_episodes"]:
         if not _is_prefix(current["completed_episodes"], derived["completed_episodes"]):
             return {"checkpoint_integrity": "CORRUPT", "reconciliation_required": False, "reason_codes": ["COMPLETED_EPISODE_PREFIX_CONFLICT"], "current": current, "derived": derived}
