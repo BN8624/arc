@@ -131,6 +131,7 @@ def test_thoughts_zero_is_distinct_from_missing(tmp_path: Path) -> None:
         rows = conn.execute("SELECT event_id, reasoning_tokens, combined_output_tokens, status FROM usage_events ORDER BY event_id").fetchall()
     assert rows[0] == ("known-zero", 0, 2, "SUCCEEDED")
     assert rows[1] == ("missing", None, None, "SUCCEEDED")
+    assert ledger.status()["totals"]["usage_unknown_count"] == 1
 
 
 def test_count_token_failure_blocks_generation(tmp_path: Path) -> None:
@@ -213,6 +214,63 @@ def test_legacy_import_is_idempotent_and_derives_safe_reasoning(tmp_path: Path) 
     assert first["key_slot_unknown"] == 1
     assert second["skipped"] == 2
     assert telemetry.read_bytes() == before
+
+
+def test_legacy_import_preserves_provider_dispatch_pacific_date(tmp_path: Path) -> None:
+    output = tmp_path / "pilot"
+    output.mkdir()
+    (output / "pilot_live_calls.json").write_text(
+        json.dumps(
+            {
+                "model": "gemma-4-31b-it",
+                "calls": [
+                    {
+                        "call_id": "L001-A001",
+                        "lease_sequence": 1,
+                        "scope_id": "episode:episode_001",
+                        "stage": "writer",
+                        "role": "canonical",
+                        "attempt": 1,
+                        "key_slot": "K01",
+                        "status": "PASS",
+                        "provider_started_at": "2026-07-13T07:24:46.834740+00:00",
+                        "prompt_tokens": 10,
+                        "output_tokens": 20,
+                        "total_tokens": 35,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    ledger = UsageLedger(tmp_path / "usage.sqlite3", now=lambda: datetime(2026, 7, 14, 12, 0, tzinfo=timezone.utc))
+
+    assert ledger.import_pilot(output)["imported"] == 1
+
+    with sqlite3.connect(tmp_path / "usage.sqlite3") as conn:
+        row = conn.execute("SELECT utc_dispatch_ts, pacific_dispatch_ts, pacific_date FROM usage_events").fetchone()
+    assert row[0] == "2026-07-13T07:24:46.834740+00:00"
+    assert row[1] == "2026-07-13T00:24:46.834740-07:00"
+    assert row[2] == "2026-07-13"
+
+
+def test_legacy_reimport_refreshes_existing_dispatch_time(tmp_path: Path) -> None:
+    output = tmp_path / "pilot"
+    output.mkdir()
+    telemetry = {
+        "model": "gemma-4-31b-it",
+        "calls": [
+            {"call_id": "L001-A001", "lease_sequence": 1, "scope_id": "episode:episode_001", "stage": "writer", "role": "canonical", "attempt": 1, "key_slot": "K01", "status": "PASS", "provider_started_at": "2026-07-13T07:24:46.834740+00:00", "prompt_tokens": 10, "output_tokens": 20, "total_tokens": 35}
+        ],
+    }
+    (output / "pilot_live_calls.json").write_text(json.dumps(telemetry), encoding="utf-8")
+    ledger = UsageLedger(tmp_path / "usage.sqlite3", now=lambda: datetime(2026, 7, 14, 12, 0, tzinfo=timezone.utc))
+    ledger.insert_event(event_id="legacy:L001-A001:1", request_kind="generate_content", key_slot_id="K01", model="gemma-4-31b-it", call=telemetry["calls"][0], provider_dispatched=True, status="SUCCEEDED", usage_metadata_status="KNOWN", token_provenance="legacy", legacy_imported=True)
+
+    assert ledger.import_pilot(output)["skipped"] == 1
+
+    with sqlite3.connect(tmp_path / "usage.sqlite3") as conn:
+        assert conn.execute("SELECT pacific_dispatch_ts FROM usage_events").fetchone()[0] == "2026-07-13T00:24:46.834740-07:00"
 
 
 def test_usage_cli_db_check_and_json_status(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

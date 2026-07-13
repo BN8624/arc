@@ -208,8 +208,9 @@ class UsageLedger:
 
     def insert_event(self, **values: Any) -> None:
         self.ensure()
+        dispatch_utc = values.pop("dispatch_utc", None)
         now = self.now()
-        utc, pacific_ts, pacific_date = pacific_fields(now)
+        utc, pacific_ts, pacific_date = pacific_fields(dispatch_utc or now)
         call = values.pop("call", {}) or {}
         row = {
             "run_identity": call.get("scope_id"),
@@ -240,7 +241,7 @@ class UsageLedger:
             "legacy_imported": 0,
             "token_provenance": "provider",
             "created_at": utc,
-            "updated_at": utc,
+            "updated_at": now.isoformat(),
             **values,
         }
         row["provider_dispatched"] = int(bool(row["provider_dispatched"]))
@@ -270,7 +271,7 @@ class UsageLedger:
                        SUM(CASE WHEN request_kind='count_tokens' AND provider_dispatched=1 THEN 1 ELSE 0 END) AS count_token_requests,
                        SUM(CASE WHEN status='SUCCEEDED' THEN 1 ELSE 0 END) AS success_count,
                        SUM(CASE WHEN status='FAILED' THEN 1 ELSE 0 END) AS failed_count,
-                       SUM(CASE WHEN status='USAGE_UNKNOWN' THEN 1 ELSE 0 END) AS usage_unknown_count,
+                       SUM(CASE WHEN status='USAGE_UNKNOWN' OR usage_metadata_status='MISSING' OR combined_output_tokens IS NULL THEN 1 ELSE 0 END) AS usage_unknown_count,
                        SUM(CASE WHEN request_kind='generate_content' THEN actual_input_tokens ELSE NULL END) AS actual_input_tokens,
                        SUM(CASE WHEN request_kind='generate_content' THEN candidate_tokens ELSE NULL END) AS candidate_tokens,
                        SUM(CASE WHEN request_kind='generate_content' THEN reasoning_tokens ELSE NULL END) AS reasoning_tokens,
@@ -295,6 +296,7 @@ class UsageLedger:
         counts = {"imported": 0, "skipped": 0, "derived_reasoning": 0, "usage_unknown": 0, "key_slot_unknown": 0}
         for call in data.get("calls", []):
             event_id = f"legacy:{call.get('call_id') or call.get('desk_id')}:{call.get('lease_sequence')}"
+            dispatch_utc = _legacy_dispatch_time(call)
             key_slot = call.get("key_slot") or "UNKNOWN_SLOT"
             key_slot_unknown = key_slot == "UNKNOWN_SLOT"
             prompt_tokens = _clean_int(call.get("prompt_tokens"))
@@ -315,6 +317,7 @@ class UsageLedger:
             try:
                 self.insert_event(
                     event_id=event_id,
+                    dispatch_utc=dispatch_utc,
                     request_kind="generate_content",
                     key_slot_id=key_slot,
                     model=data.get("model"),
@@ -343,9 +346,18 @@ class UsageLedger:
                     counts["key_slot_unknown"] += 1
             except UsageLedgerError:
                 raise
+            except sqlite3.IntegrityError:
+                self._refresh_legacy_dispatch_time(event_id, dispatch_utc)
+                counts["skipped"] += 1
             except Exception:
                 counts["skipped"] += 1
         return counts
+
+    def _refresh_legacy_dispatch_time(self, event_id: str, dispatch_utc: datetime | None) -> None:
+        if dispatch_utc is None:
+            return
+        utc, pacific_ts, pacific_date = pacific_fields(dispatch_utc)
+        self.update_event(event_id, utc_dispatch_ts=utc, pacific_dispatch_ts=pacific_ts, pacific_date=pacific_date)
 
     def _warnings_for_date(self, date: str) -> list[dict]:
         with self._connect() as conn:
@@ -442,3 +454,18 @@ def _episode_from_scope(scope_id: str | None) -> str | None:
 
 def _clean_int(value: object) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _legacy_dispatch_time(call: dict) -> datetime | None:
+    for key in ("provider_started_at", "started_at"):
+        value = call.get(key)
+        if not isinstance(value, str):
+            continue
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    return None
