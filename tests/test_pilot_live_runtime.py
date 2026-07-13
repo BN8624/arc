@@ -921,6 +921,41 @@ def test_prose_target_band_uses_contract_minimum_and_hard_maximum():
     assert prose_target_band(4000, 6000) == (5200, 6000)
 
 
+def test_writer_prompt_requires_structured_plan_development_without_changing_target_band():
+    from arc.prompts import build_prompt
+
+    prompt = build_prompt("writer", "canonical", {"context": {}, "plan": {}})
+    for meaning in ("14 to 18", "plan.immediate_objective", "plan.obstacle", "plan.protagonist_action", "counteraction", "plan.meaningful_change", "consequence", "aftermath", "episode payoff", "plan.episode_ending", "plan.continuity_constraints", "5200 to 6400 characters"):
+        assert meaning in prompt
+    for forbidden in ("headings or paragraph numbers", "Do not compress multiple actions", "Do not invent a new central conflict"):
+        assert forbidden in prompt
+
+
+@pytest.mark.parametrize("character_count,expected", [(3000, (1000, 2000)), (3474, (526, 1526)), (3834, (166, 1200)), (3999, (1, 1200)), (4000, (0, 1200)), (4514, (0, 1200))])
+def test_revision_expansion_guidance_is_deterministic(character_count, expected):
+    from arc.prompts import revision_expansion_guidance
+
+    assert revision_expansion_guidance(character_count) == expected
+    assert revision_expansion_guidance(character_count) == expected
+
+
+def test_revision_prompt_uses_actual_length_and_full_replacement_expansion():
+    from arc.prompts import build_prompt
+
+    payload = {"context": {}, "plan": {}, "draft": "A" * 3474, "draft_contract": {"character_count": 3474, "verdict": "REVISE_REQUIRED"}, "decision": {"required_changes": ["preserve evidence"]}}
+    prompt = build_prompt("revision", "canonical", payload)
+    for meaning in ("3474 characters", "526 characters below", "roughly 1526 or more", "full replacement", "review required changes", "event order", "point of view", "ending", "consequences", "aftermath", "repetition, padding, fragments"):
+        assert meaning in prompt
+
+
+def test_non_prose_prompt_is_not_given_prose_structure_guidance():
+    from arc.prompts import build_prompt
+
+    prompt = build_prompt("planning", "event", {})
+    assert "14 to 18 natural prose paragraphs" not in prompt
+    assert "current draft is" not in prompt
+
+
 def test_underlength_revision_prompt_requires_full_replacement():
     from arc.prompts import build_prompt
 

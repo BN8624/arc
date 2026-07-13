@@ -8,6 +8,8 @@ from .contracts import ContractError, PROSE_MAX_CHARACTERS, PROSE_MIN_CHARACTERS
 
 
 JSON_STAGES = {"planning", "planning_merge", "review", "review_merge", "memory", "memory_merge", "preflight"}
+REVISION_SAFE_EXPANSION_FLOOR = 1200
+REVISION_EXPANSION_MARGIN = 1000
 
 
 def prose_target_band(hard_min: int = PROSE_MIN_CHARACTERS, hard_max: int | None = PROSE_MAX_CHARACTERS) -> tuple[int, int]:
@@ -23,6 +25,58 @@ def prose_target_band(hard_min: int = PROSE_MIN_CHARACTERS, hard_max: int | None
 def _prose_target_text() -> str:
     target_min, target_max = prose_target_band()
     return f"{target_min} to {target_max} characters"
+
+
+def revision_expansion_guidance(character_count: int) -> tuple[int, int]:
+    if not isinstance(character_count, int) or isinstance(character_count, bool) or character_count < 0:
+        raise ContractError("draft character count is invalid", "PROSE_DRAFT_CHARACTER_COUNT_INVALID")
+    hard_gap = max(0, PROSE_MIN_CHARACTERS - character_count)
+    safe_expansion = max(REVISION_SAFE_EXPANSION_FLOOR, hard_gap + REVISION_EXPANSION_MARGIN)
+    return hard_gap, safe_expansion
+
+
+def _prose_structural_guidance() -> str:
+    return (
+        "Silently plan roughly 14 to 18 natural prose paragraphs, usually with multiple sentences, without printing "
+        "headings or paragraph numbers. Develop, in scene order, the opening state and immediate objective; the obstacle "
+        "appearing as concrete interference; the protagonist's active choice and action; specific reactions from people, "
+        "the environment, or the conflict; the meaningful consequence and changed relationship or situation; the immediate "
+        "emotional and practical aftermath; the episode payoff; and an ending hook or pressure toward the next action. "
+        "Use action, dialogue, observation, sensory detail, reaction, counteraction, cost, consequence, and aftermath where "
+        "the plan supports them. Do not compress multiple actions into one or two summary sentences, replace important dialogue "
+        "with one sentence of indirect speech, reduce a conflict to 'they argued', skip movement, decisions, or results with a "
+        "single bridge sentence, narrate an event list, stretch setting exposition as padding, or jump from climax directly to "
+        "the ending. Do not end before action, consequence, real change, aftermath, payoff, and the hook are present."
+    )
+
+
+def _writer_plan_guidance() -> str:
+    return (
+        "Use the supplied context and plan only. Fully realize plan.immediate_objective in the opening, plan.obstacle as a "
+        "visible scene-level obstruction, plan.protagonist_action as an active choice followed by counteraction, "
+        "plan.meaningful_change as an experienced result, and plan.episode_ending only after consequence and aftermath. "
+        "Honor every plan.continuity_constraints item. Do not invent a new central conflict or unsupported setting."
+    )
+
+
+def _revision_guidance(payload: dict) -> str:
+    draft_contract = payload.get("draft_contract", {})
+    character_count = draft_contract.get("character_count")
+    if not isinstance(character_count, int):
+        draft = payload.get("draft")
+        if not isinstance(draft, str):
+            raise ContractError("revision draft character count is unavailable", "PROSE_DRAFT_CHARACTER_COUNT_INVALID")
+        character_count = len(draft)
+    hard_gap, safe_expansion = revision_expansion_guidance(character_count)
+    return (
+        f"The current draft is {character_count} characters and is {hard_gap} characters below the {PROSE_MIN_CHARACTERS}-character "
+        f"hard minimum. Produce a substantially expanded full replacement with roughly {safe_expansion} or more characters of "
+        "meaningful new prose development, while targeting the stated final band; this expansion amount is guidance, not a "
+        "validator. Preserve the existing facts, event order, point of view, ending, and strengths, and apply only the supplied "
+        "review required changes. Expand rushed action, compressed dialogue, missing counteraction, causes of emotional change, "
+        "costs of choices, consequences, aftermath, and abrupt compression before the ending through coherent scenes rather than "
+        "repetition, padding, fragments, or a new central conflict."
+    )
 
 
 def _planning_merge_rule(payload: dict) -> str:
@@ -56,7 +110,8 @@ def build_prompt(stage: str, role: str, payload: dict) -> str:
             "repeat sentences, pad with filler modifiers, summarize yourself, report a character count, or include headings, "
             "scene numbers, SCENE 1, Markdown fences, JSON, or process notes."
         )
-    else:
+        instruction += " " + _prose_structural_guidance() + " " + _writer_plan_guidance()
+    elif stage == "revision":
         instruction = (
             f"Write only the complete revised Korean novel prose. Target {target_band} while preserving the draft's facts, "
             "characters, order, point of view, and ending. Return one full replacement from beginning to end; do not append "
@@ -64,6 +119,9 @@ def build_prompt(stage: str, role: str, payload: dict) -> str:
             "change canon outside review requirements, repeat sentences, pad with filler, report a character count, or include "
             "headings, scene numbers, Markdown fences, JSON, or process notes."
         )
+        instruction += " " + _prose_structural_guidance() + " " + _revision_guidance(payload)
+    else:
+        instruction = "Perform only the assigned task."
     if stage == "writer":
         instruction += f" Before answering, silently verify the prose is safely within {target_band}; the validator checks the real length, so never mention the character count or this self-check."
     elif stage == "revision":
