@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
 import json
 import shutil
 from pathlib import Path
@@ -9,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from arc.contracts import ContractError, PROSE_FORBIDDEN_MARKERS, PROSE_MAX_CHARACTERS, PROSE_MIN_CHARACTERS, PROSE_REPAIRABLE_MIN_CHARACTERS, validate_draft_prose, validate_prose
-from arc.live_model import AtomicTelemetryStore, GemmaPoolClient, LiveConfig, MODEL_NAME, RoutingStateStore
+from arc.live_model import AtomicTelemetryStore, GemmaPoolClient, LiveCallError, LiveConfig, MODEL_NAME, RoutingStateStore
 from arc.pipeline import PLANNING_ROLES, MockPipeline, WaveCheckpoint, status
 from arc.pilot_contracts import PILOT_REVIEW_ROLES
 from arc.pilot import PilotPipeline, inspect_pilot_checkpoint, live_telemetry_checkpoint, reconcile_pilot_checkpoint
@@ -80,7 +81,7 @@ class _PilotProvider:
 
 
 class _PilotProviderRoot:
-    def __init__(self, fail_once_at: str | None = None, hold_episode: str | None = None, fail_status_code: int = 500, hold_dimension: str | None = None, wrong_plan_once: bool = False, wrong_plan_episode: str | None = None, short_writer_once_episode: str | None = None, repairable_writer_once_episode: str | None = None, review_pass_on_repairable: bool = False, short_revision_once_episode: str | None = None):
+    def __init__(self, fail_once_at: str | None = None, hold_episode: str | None = None, fail_status_code: int = 500, hold_dimension: str | None = None, wrong_plan_once: bool = False, wrong_plan_episode: str | None = None, short_writer_once_episode: str | None = None, repairable_writer_once_episode: str | None = None, review_pass_on_repairable: bool = False, short_revision_once_episode: str | None = None, revision_text: str | None = None):
         self.fail_once_at = fail_once_at
         self.hold_episode = hold_episode
         self.fail_status_code = fail_status_code
@@ -91,6 +92,7 @@ class _PilotProviderRoot:
         self.repairable_writer_once_episode = repairable_writer_once_episode
         self.review_pass_on_repairable = review_pass_on_repairable
         self.short_revision_once_episode = short_revision_once_episode
+        self.revision_text = revision_text
         self.malformed_once_at: str | None = None
         self.failed: set[str] = set()
         self.malformed: set[str] = set()
@@ -134,6 +136,8 @@ class _PilotProviderRoot:
             return json.dumps({"verdict": verdict, "strengths_to_preserve": ["synthetic agency"], "required_changes": [], "evidence_refs": ["draft.md"]})
         if stage == "revision":
             marker = f"revision:{episode_id}"
+            if self.revision_text is not None:
+                return self.revision_text
             if self.short_revision_once_episode == episode_id and marker not in self.malformed:
                 self.malformed.add(marker)
                 return "B" * 3500
@@ -228,6 +232,46 @@ def _make_interrupted_episode_output(tmp_path: Path) -> Path:
     manifest.update({"status": "RUNNING", "completed_episodes": ["episode_001"], "completed_transitions": ["episode_001_to_episode_002"], "active_episode_id": "episode_002", "episode_records": manifest["episode_records"][:1], "acceptance_verdict": None, "last_error": None, "pilot_live_call_count": len(kept_calls)})
     manifest["artifact_hashes"] = {key: value for key, value in manifest["artifact_hashes"].items() if key in {"episode_sources/episode_001.json", "episode_sources/episode_002.json", "transitions/episode_001_to_episode_002.json"}}
     manifest["live_telemetry_checkpoint"] = live_telemetry_checkpoint(root_telemetry)
+    write_json(output / "pilot_manifest.json", manifest)
+    return output
+
+
+def _make_legacy_revision_output(tmp_path: Path, *, ambiguous: bool = False) -> Path:
+    output = tmp_path / "pilot-live"
+    client, _ = _pilot_client(output, _PilotProviderRoot(repairable_writer_once_episode="episode_004", revision_text="B" * 3949))
+    PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    episode_dir = output / "episodes" / "episode_004"
+    episode = read_json(episode_dir / "manifest.json")
+    for key in ["revision_attempt_state", "revision_exhausted", "revision_response_sha256", "revision_character_count", "revision_contract_code", "revision_response_received_at", "revision_call_id", "revision_lease_sequence"]:
+        episode.pop(key)
+    episode.update({"status": "ERROR", "revision_count": 0, "last_error": {"error_class": "CONTRACT_ERROR", "stage": "revision", "role": "canonical", "contract_code": "PROSE_TOO_SHORT", "character_count": 3949, "call_id": "L317-A004", "message": "sanitized prose contract failure"}})
+    telemetry = read_json(output / "pilot_live_calls.json")
+    original = next(call for call in telemetry["calls"] if call["scope_id"] == "episode:episode_004" and call["stage"] == "revision")
+    telemetry["calls"] = [call for call in telemetry["calls"] if not (call["scope_id"] == "episode:episode_004" and call["stage"] == "revision")]
+    max_lease = max(call["lease_sequence"] for call in telemetry["calls"])
+    failures = []
+    for offset, slot in enumerate(("K10", "K11"), start=1):
+        failure = dict(original)
+        failure.update({"call_id": f"L317-A00{offset + 1}", "attempt": offset + 1, "lease_sequence": max_lease + offset, "key_slot": slot, "status": "FAIL", "output_characters": 0, "response_sha256": None, "error_class": "PROVIDER_5XX", "http_status": 500})
+        failures.append(failure)
+    response = dict(original)
+    response.update({"call_id": "L317-A004", "attempt": 4, "lease_sequence": max_lease + 3, "key_slot": "K01", "status": "PASS", "output_characters": 3949, "response_sha256": hashlib.sha256(("B" * 3949).encode()).hexdigest(), "error_class": None, "http_status": None})
+    telemetry["calls"].extend([*failures, response])
+    telemetry["contract_failures"] = [item for item in telemetry.get("contract_failures", []) if not (item.get("scope_id") == "episode:episode_004" and item.get("stage") == "revision")]
+    telemetry["contract_failures"].append({"event_id": "CF999", "scope_id": "episode:episode_004", "desk_id": "episode:episode_004:revision:canonical", "stage": "revision", "role": "canonical", "key_slot": "K01", "call_id": "L317-A004", "contract_code": "PROSE_TOO_SHORT", "error_class": "CONTRACT_ERROR", "created_at": response["finished_at"], "character_count": 3949, "message": "sanitized prose contract failure"})
+    if ambiguous:
+        extra = dict(response)
+        extra.update({"call_id": "L317-A005", "attempt": 5, "lease_sequence": max_lease + 4})
+        telemetry["calls"].append(extra)
+    write_json(output / "pilot_live_calls.json", telemetry)
+    projection = {**telemetry, "calls": [call for call in telemetry["calls"] if call["scope_id"] == "episode:episode_004"]}
+    episode["artifact_hashes"]["live_calls.json"] = write_json(episode_dir / "live_calls.json", projection)
+    write_json(episode_dir / "manifest.json", episode)
+    routing = read_json(output / "routing_state.json")
+    routing["next_lease_sequence"] = max(call["lease_sequence"] for call in telemetry["calls"]) + 1
+    write_json(output / "routing_state.json", routing)
+    manifest = read_json(output / "pilot_manifest.json")
+    manifest.update({"status": "ERROR", "active_episode_id": "episode_004", "last_error": {"error_class": "CONTRACT_ERROR", "active_episode_id": "episode_004", "stage": "revision", "role": "canonical", "contract_code": "PROSE_TOO_SHORT", "message": "sanitized child episode failure"}, "pilot_live_call_count": len(telemetry["calls"]), "live_telemetry_checkpoint": live_telemetry_checkpoint(telemetry)})
     write_json(output / "pilot_manifest.json", manifest)
     return output
 
@@ -766,11 +810,168 @@ def test_repairable_draft_revision_failure_is_terminal(tmp_path):
     output = tmp_path / "pilot-live"
     client, _ = _pilot_client(output, _PilotProviderRoot(repairable_writer_once_episode="episode_004", short_revision_once_episode="episode_004"))
 
-    with pytest.raises(Exception):
-        PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    result = PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
     ep4 = read_json(output / "episodes" / "episode_004" / "manifest.json")
+    assert result["manifest"]["status"] == "HOLD"
+    assert ep4["status"] == "HOLD"
+    assert ep4["revision_count"] == 1
+    assert ep4["revision_attempt_state"] == "REJECTED"
+    assert ep4["revision_exhausted"] is True
     assert ep4["last_error"]["stage"] == "revision"
     assert ep4["last_error"]["contract_code"] == "PROSE_TOO_SHORT"
+
+
+@pytest.mark.parametrize("revision_text", ["B" * 3999, "B" * 8001, "", "   ", '{"text":"bad"}', '["bad"]', "```\n" + "B" * 4100, "B" * 4100 + "SCENE 1"])
+def test_invalid_revision_response_is_consumed_and_holds(tmp_path, revision_text):
+    output = tmp_path / "pilot-live"
+    root = _PilotProviderRoot(repairable_writer_once_episode="episode_004", revision_text=revision_text)
+    client, root = _pilot_client(output, root)
+
+    result = PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    episode = read_json(output / "episodes" / "episode_004" / "manifest.json")
+    revision_calls = [call for call in read_json(output / "pilot_live_calls.json")["calls"] if call["scope_id"] == "episode:episode_004" and call["stage"] == "revision"]
+
+    assert result["manifest"]["status"] == "HOLD"
+    assert episode["revision_count"] == 1
+    assert episode["revision_attempt_state"] == "REJECTED"
+    assert episode["revision_character_count"] == len(revision_text)
+    assert len(revision_calls) == 1
+    assert not (output / "episodes" / "episode_004" / "revised.md").exists()
+
+
+def test_revision_response_receipt_is_persisted_before_validation(tmp_path, monkeypatch):
+    output = tmp_path / "pilot-live"
+    client, _ = _pilot_client(output, _PilotProviderRoot(repairable_writer_once_episode="episode_004"))
+
+    def inspect_receipt(value):
+        episode = read_json(output / "episodes" / "episode_004" / "manifest.json")
+        assert episode["revision_count"] == 1
+        assert episode["revision_attempt_state"] == "RESPONSE_RECEIVED"
+        assert episode["revision_response_sha256"]
+        assert episode["revision_character_count"] == len(value)
+        assert episode["revision_exhausted"] is True
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("arc.pipeline.validate_prose", inspect_receipt)
+    with pytest.raises(KeyboardInterrupt):
+        PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+
+
+def test_response_received_resume_holds_without_second_revision_call(tmp_path, monkeypatch):
+    output = tmp_path / "pilot-live"
+    client, _ = _pilot_client(output, _PilotProviderRoot(repairable_writer_once_episode="episode_004"))
+    monkeypatch.setattr("arc.pipeline.validate_prose", lambda value: (_ for _ in ()).throw(KeyboardInterrupt()))
+    with pytest.raises(KeyboardInterrupt):
+        PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    monkeypatch.undo()
+    resumed_client, resumed_root = _pilot_client(output)
+
+    result = PilotPipeline(resumed_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    episode = read_json(output / "episodes" / "episode_004" / "manifest.json")
+
+    assert result["manifest"]["status"] == "HOLD"
+    assert episode["revision_attempt_state"] == "REJECTED"
+    assert episode["revision_contract_code"] == "REVISION_RESPONSE_ALREADY_CONSUMED"
+    assert not any(marker == "revision:canonical" for _, marker, _ in resumed_root.provider_calls)
+
+
+def test_transport_failure_does_not_consume_revision_and_resume_can_retry(tmp_path, monkeypatch):
+    output = tmp_path / "pilot-live"
+    client, _ = _pilot_client(output, _PilotProviderRoot(repairable_writer_once_episode="episode_004"))
+    original = client.generate_for_desk
+
+    def fail_revision(*, desk, prompt):
+        if desk.stage == "revision":
+            raise LiveCallError("PROVIDER_5XX", "revision", "canonical", "K10", "injected", 500)
+        return original(desk=desk, prompt=prompt)
+
+    monkeypatch.setattr(client, "generate_for_desk", fail_revision)
+    with pytest.raises(LiveCallError):
+        PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    episode = read_json(output / "episodes" / "episode_004" / "manifest.json")
+    assert episode["status"] == "ERROR"
+    assert episode["revision_count"] == 0
+    assert episode["revision_attempt_state"] == "NOT_STARTED"
+    assert episode["revision_exhausted"] is False
+    monkeypatch.undo()
+    resumed_client, resumed_root = _pilot_client(output)
+
+    result = PilotPipeline(resumed_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+
+    assert result["manifest"]["status"] == "COMPLETE"
+    assert sum(marker == "revision:canonical" for _, marker, _ in resumed_root.provider_calls) == 1
+
+
+def test_transport_retry_attempts_count_as_one_logical_revision(tmp_path):
+    output = tmp_path / "pilot-live"
+    root = _PilotProviderRoot(fail_once_at="revision:canonical", repairable_writer_once_episode="episode_004")
+    client, _ = _pilot_client(output, root)
+
+    result = PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    episode = read_json(output / "episodes" / "episode_004" / "manifest.json")
+    calls = [call for call in read_json(output / "pilot_live_calls.json")["calls"] if call["scope_id"] == "episode:episode_004" and call["stage"] == "revision"]
+
+    assert result["manifest"]["status"] == "COMPLETE"
+    assert [call["status"] for call in calls] == ["FAIL", "PASS"]
+    assert episode["revision_count"] == 1
+    assert episode["revision_attempt_state"] == "COMPLETED"
+
+
+def test_rejected_revision_is_terminal_noop(tmp_path):
+    output = tmp_path / "pilot-live"
+    client, _ = _pilot_client(output, _PilotProviderRoot(repairable_writer_once_episode="episode_004", revision_text="B" * 3999))
+    PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    before = _file_bytes(output)
+    resumed_client, resumed_root = _pilot_client(output)
+
+    result = PilotPipeline(resumed_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+
+    assert result["no_op"] is True
+    assert resumed_root.provider_calls == []
+    assert _file_bytes(output) == before
+
+
+@pytest.mark.parametrize("field,value", [("revision_count", 2), ("revision_attempt_state", "NOT_STARTED"), ("revision_response_sha256", "bad")])
+def test_invalid_revision_state_fails_closed_before_provider_call(tmp_path, field, value):
+    output = tmp_path / "pilot-live"
+    client, _ = _pilot_client(output, _PilotProviderRoot(repairable_writer_once_episode="episode_004", revision_text="B" * 3999))
+    PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    episode_path = output / "episodes" / "episode_004" / "manifest.json"
+    episode = read_json(episode_path)
+    episode[field] = value
+    write_json(episode_path, episode)
+    resumed_client, resumed_root = _pilot_client(output)
+
+    with pytest.raises(Exception, match="invalid revision evidence"):
+        PilotPipeline(resumed_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    assert resumed_root.provider_calls == []
+
+
+def test_exact_legacy_revision_checkpoint_reconciles_to_hold_without_provider(tmp_path):
+    output = _make_legacy_revision_output(tmp_path)
+    client, root = _pilot_client(output)
+
+    result = PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    episode = read_json(output / "episodes" / "episode_004" / "manifest.json")
+
+    assert result["manifest"]["status"] == "HOLD"
+    assert episode["status"] == "HOLD"
+    assert episode["revision_count"] == 1
+    assert episode["revision_attempt_state"] == "REJECTED"
+    assert episode["revision_character_count"] == 3949
+    assert root.provider_calls == []
+    assert not (output / "episodes" / "episode_005").exists()
+    assert not (output / "pilot_acceptance.json").exists()
+
+
+def test_ambiguous_legacy_revision_checkpoint_is_blocked_without_provider(tmp_path):
+    output = _make_legacy_revision_output(tmp_path, ambiguous=True)
+    client, root = _pilot_client(output)
+
+    with pytest.raises(Exception, match="REVISION_RECONCILIATION_BLOCKED"):
+        PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    assert root.provider_calls == []
+    assert read_json(output / "pilot_manifest.json")["status"] == "ERROR"
 
 
 def test_normal_writer_path_does_not_force_revision(tmp_path):
