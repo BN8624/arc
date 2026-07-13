@@ -13,6 +13,7 @@ from .pipeline import MockPipeline, status
 from .pilot import PilotPipeline, pilot_status, reconcile_pilot_checkpoint
 from .storage import write_json
 from .usage import UsageLedger, backup_usage_db, repair_preflight_collision, usage_db_path
+from .prose_probe import PROBE_TELEMETRY, prose_live_probe_status, run_prose_live_probe
 
 
 def classify_preflight(results: list[dict]) -> dict:
@@ -113,6 +114,12 @@ def main() -> None:
     pilot_live_reconcile = commands.add_parser("pilot-live-reconcile")
     pilot_live_reconcile.add_argument("fixture", type=Path)
     pilot_live_reconcile.add_argument("--output", type=Path, required=True)
+    prose_probe = commands.add_parser("prose-live-probe")
+    prose_probe.add_argument("--source-episode", type=Path, required=True)
+    prose_probe.add_argument("--output", type=Path, required=True)
+    prose_probe.add_argument("--preflight", type=Path, required=True)
+    prose_probe_state = commands.add_parser("prose-live-probe-status")
+    prose_probe_state.add_argument("output", type=Path)
     usage = commands.add_parser("usage")
     usage_commands = usage.add_subparsers(dest="usage_command", required=True)
     usage_status = usage_commands.add_parser("status")
@@ -161,6 +168,14 @@ def main() -> None:
         print(json.dumps(pilot_status(args.output), ensure_ascii=False))
     elif args.command == "pilot-live-reconcile":
         print(json.dumps(reconcile_pilot_checkpoint(args.fixture, args.output), ensure_ascii=False))
+    elif args.command == "prose-live-probe":
+        client = _load_live_client(args.preflight, args.output, args.output / PROBE_TELEMETRY)
+        try:
+            print(json.dumps(run_prose_live_probe(args.source_episode, args.output, args.preflight, client), ensure_ascii=False))
+        finally:
+            client.close()
+    elif args.command == "prose-live-probe-status":
+        print(json.dumps(prose_live_probe_status(args.output), ensure_ascii=False))
     elif args.command == "usage":
         ledger = UsageLedger(usage_db_path())
         if args.usage_command == "status":
