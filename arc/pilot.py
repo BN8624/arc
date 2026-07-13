@@ -36,6 +36,8 @@ class PilotPipeline:
             if self.mode == "live" and (run_dir / "pilot_live_calls.json").exists():
                 self.client.restore_telemetry(read_json(run_dir / "pilot_live_calls.json"))
             verify_pilot_artifacts(run_dir, manifest)
+            if self.mode == "live" and inspect_pilot_checkpoint(run_dir, manifest)["checkpoint_integrity"] == "RECONCILABLE":
+                raise PilotError("pilot checkpoint reconciliation required")
             if manifest["status"] in {"COMPLETE", "HOLD"}:
                 (run_dir / "pilot_review_workers.partial.json").unlink(missing_ok=True)
                 return {"no_op": True, "manifest": manifest}
@@ -365,8 +367,157 @@ def verify_pilot_artifacts(run_dir: Path, manifest: dict) -> None:
         status(run_dir / "episodes" / episode_id)
 
 
+def inspect_pilot_checkpoint(run_dir: Path, manifest: dict | None = None) -> dict:
+    manifest = manifest or read_json(run_dir / "pilot_manifest.json")
+    current = _manifest_progress(manifest)
+    reason_codes: list[str] = []
+    if manifest.get("mode") != "live":
+        try:
+            verify_pilot_artifacts(run_dir, manifest)
+        except Exception as error:
+            return {"checkpoint_integrity": "CORRUPT", "reconciliation_required": False, "reason_codes": [str(error)], "current": current, "derived": {}}
+        return {"checkpoint_integrity": "VALID", "reconciliation_required": False, "reason_codes": [], "current": current, "derived": current}
+    try:
+        verify_pilot_artifacts(run_dir, manifest)
+    except Exception as error:
+        return {"checkpoint_integrity": "CORRUPT", "reconciliation_required": False, "reason_codes": [str(error)], "current": _manifest_progress(manifest), "derived": {}}
+    try:
+        derived = _derive_pilot_progress(run_dir, manifest)
+        _verify_live_telemetry_projection_for_episodes(run_dir, derived["completed_episodes"] + ([derived["active_episode_id"]] if derived["active_episode_id"] else []))
+    except Exception as error:
+        return {"checkpoint_integrity": "CORRUPT", "reconciliation_required": False, "reason_codes": [str(error)], "current": current, "derived": {}}
+    if manifest.get("mode") == "live" and "pilot_live_calls.json" in manifest.get("artifact_hashes", {}):
+        actual = sha256_file(run_dir / "pilot_live_calls.json")
+        if manifest["artifact_hashes"]["pilot_live_calls.json"] != actual:
+            reason_codes.append("LEGACY_TELEMETRY_HASH_STALE")
+    if current["completed_episodes"] != derived["completed_episodes"]:
+        if not _is_prefix(current["completed_episodes"], derived["completed_episodes"]):
+            return {"checkpoint_integrity": "CORRUPT", "reconciliation_required": False, "reason_codes": ["COMPLETED_EPISODE_PREFIX_CONFLICT"], "current": current, "derived": derived}
+        reason_codes.append("COMPLETED_EPISODE_PREFIX_STALE")
+    if current["completed_transitions"] != derived["completed_transitions"]:
+        if not _is_prefix(current["completed_transitions"], derived["completed_transitions"]):
+            return {"checkpoint_integrity": "CORRUPT", "reconciliation_required": False, "reason_codes": ["COMPLETED_TRANSITION_PREFIX_CONFLICT"], "current": current, "derived": derived}
+        reason_codes.append("COMPLETED_TRANSITION_PREFIX_STALE")
+    active = current["active_episode_id"]
+    derived_active = derived["active_episode_id"]
+    if active != derived_active:
+        ids = manifest["episode_ids"]
+        if active is not None and derived_active is not None and ids.index(active) > ids.index(derived_active):
+            return {"checkpoint_integrity": "CORRUPT", "reconciliation_required": False, "reason_codes": ["ACTIVE_EPISODE_AHEAD"], "current": current, "derived": derived}
+        reason_codes.append("ACTIVE_EPISODE_STALE")
+    records = manifest.get("episode_records", [])
+    derived_records = derived["episode_records"]
+    if records != derived_records:
+        if len(records) > len(derived_records) or records != derived_records[: len(records)]:
+            return {"checkpoint_integrity": "CORRUPT", "reconciliation_required": False, "reason_codes": ["EPISODE_RECORDS_CONFLICT"], "current": current, "derived": derived}
+        reason_codes.append("EPISODE_RECORDS_STALE")
+    if _root_artifact_index_stale(manifest, derived):
+        reason_codes.append("ROOT_ARTIFACT_INDEX_STALE")
+    integrity = "RECONCILABLE" if reason_codes else "VALID"
+    return {"checkpoint_integrity": integrity, "reconciliation_required": integrity == "RECONCILABLE", "reason_codes": reason_codes, "current": current, "derived": derived}
+
+
+def reconcile_pilot_checkpoint(fixture_path: Path, run_dir: Path) -> dict:
+    raw = fixture_path.read_bytes()
+    fixture = validate_pilot_fixture(json.loads(raw.decode("utf-8")))
+    manifest_path = run_dir / "pilot_manifest.json"
+    before = manifest_path.read_bytes()
+    manifest = json.loads(before.decode("utf-8"))
+    if manifest["source_hash"] != sha256_bytes(raw) or manifest["fixture_id"] != fixture["initial_source"]["fixture_id"]:
+        raise PilotError("pilot input changed; refusing reconciliation")
+    inspection = inspect_pilot_checkpoint(run_dir, manifest)
+    if inspection["checkpoint_integrity"] == "VALID":
+        return {"no_op": True, **inspection}
+    if inspection["checkpoint_integrity"] != "RECONCILABLE":
+        raise StorageError("pilot checkpoint corrupt")
+    derived = inspection["derived"]
+    telemetry = read_json(run_dir / "pilot_live_calls.json") if (run_dir / "pilot_live_calls.json").exists() else {"calls": [], "contract_failures": []}
+    manifest["completed_episodes"] = derived["completed_episodes"]
+    manifest["completed_transitions"] = derived["completed_transitions"]
+    manifest["active_episode_id"] = derived["active_episode_id"]
+    manifest["episode_records"] = derived["episode_records"]
+    manifest["pilot_live_call_count"] = len(telemetry.get("calls", []))
+    manifest["live_telemetry_checkpoint"] = live_telemetry_checkpoint(telemetry)
+    manifest["artifact_hashes"].pop("pilot_live_calls.json", None)
+    manifest["checkpoint_reconciliation"] = {
+        "schema_version": 1,
+        "reason_codes": inspection["reason_codes"],
+        "previous_manifest_sha256": sha256_bytes(before),
+        "telemetry_sha256": sha256_file(run_dir / "pilot_live_calls.json"),
+        "derived_completed_episode_count": len(derived["completed_episodes"]),
+        "derived_completed_transition_count": len(derived["completed_transitions"]),
+        "derived_active_episode_id": derived["active_episode_id"],
+    }
+    write_json(manifest_path, manifest)
+    after = inspect_pilot_checkpoint(run_dir, manifest)
+    return {"no_op": False, "changed_files": ["pilot_manifest.json"], **after}
+
+
 def _episode_files(path: Path) -> list[str]:
     return [item.name for item in path.iterdir() if item.is_file()] if path.exists() else []
+
+
+def _manifest_progress(manifest: dict) -> dict:
+    return {"status": manifest.get("status"), "active_episode_id": manifest.get("active_episode_id"), "completed_episodes": list(manifest.get("completed_episodes", [])), "completed_transitions": list(manifest.get("completed_transitions", [])), "episode_record_count": len(manifest.get("episode_records", []))}
+
+
+def _is_prefix(left: list, right: list) -> bool:
+    return right[: len(left)] == left
+
+
+def _derive_pilot_progress(run_dir: Path, manifest: dict) -> dict:
+    ids = manifest["episode_ids"]
+    completed: list[str] = []
+    records: list[dict] = []
+    found_incomplete = False
+    for episode_id in ids:
+        episode_dir = run_dir / "episodes" / episode_id
+        if not episode_dir.exists():
+            found_incomplete = True
+            break
+        current = status(episode_dir)
+        if current["status"] != "COMPLETE":
+            found_incomplete = True
+            break
+        completed.append(episode_id)
+        records.append({"episode_id": episode_id, "status": current["status"], "writer_call_count": current["writer_call_count"], "revision_count": current["revision_count"], "final_sha256": sha256_file(episode_dir / "final.md"), "memory_after_sha256": sha256_file(episode_dir / "memory_after.json")})
+    if found_incomplete:
+        for episode_id in ids[len(completed) + 1 :]:
+            episode_dir = run_dir / "episodes" / episode_id
+            if episode_dir.exists() and status(episode_dir)["status"] == "COMPLETE":
+                raise StorageError("non-contiguous completed episode prefix")
+    transitions: list[str] = []
+    for index, episode_id in enumerate(ids[:-1]):
+        if episode_id not in completed:
+            break
+        next_id = ids[index + 1]
+        transition_id = f"{episode_id}_to_{next_id}"
+        transition_path = run_dir / "transitions" / f"{transition_id}.json"
+        source_path = run_dir / "episode_sources" / f"{next_id}.json"
+        if not transition_path.exists() and not source_path.exists():
+            break
+        if not transition_path.exists() or not source_path.exists():
+            raise StorageError("non-contiguous transition prefix")
+        source = read_json(run_dir / "episode_sources" / f"{episode_id}.json")
+        transition = read_json(transition_path)
+        validate_transition(transition, source, next_id, str(run_dir))
+        value = {"pilot_id": manifest["pilot_id"], "completed_episode_id": episode_id, "next_episode_id": next_id, "source_hash": sha256_bytes(canonical_bytes(source)), "episode_plan_hash": sha256_file(run_dir / "episodes" / episode_id / "episode_plan.json"), "final_hash": sha256_file(run_dir / "episodes" / episode_id / "final.md"), "memory_update_hash": sha256_file(run_dir / "episodes" / episode_id / "memory_update.json"), "memory_after_hash": sha256_file(run_dir / "episodes" / episode_id / "memory_after.json"), "rolling_plan": source["rolling_plan"], "required_continuity": source["required_next_episode_continuity"], "remaining_episode_count": len(ids) - index - 1}
+        if transition["transition_input_hash"] != sha256_bytes(canonical_bytes(value)) or transition["next_source_hash"] != sha256_file(source_path):
+            raise StorageError("transition semantic contract failure")
+        transitions.append(transition_id)
+    active = None
+    if len(completed) < len(ids):
+        for episode_id in ids[len(completed) :]:
+            if (run_dir / "episode_sources" / f"{episode_id}.json").exists() or (run_dir / "episodes" / episode_id).exists():
+                active = episode_id
+                break
+    return {"completed_episodes": completed, "completed_transitions": transitions, "active_episode_id": active, "episode_records": records}
+
+
+def _root_artifact_index_stale(manifest: dict, derived: dict) -> bool:
+    expected = {f"episode_sources/{episode_id}.json" for episode_id in derived["completed_episodes"]}
+    expected.update(f"transitions/{transition_id}.json" for transition_id in derived["completed_transitions"])
+    return bool(expected - set(manifest.get("artifact_hashes", {})))
 
 
 def _verify_live_telemetry_projections(run_dir: Path, manifest: dict) -> None:
@@ -390,7 +541,19 @@ def _verify_live_telemetry_projections(run_dir: Path, manifest: dict) -> None:
     if active_episode_id and (run_dir / "episodes" / active_episode_id / "live_calls.json").exists():
         checked.append(active_episode_id)
     for episode_id in checked:
-        episode_calls = read_json(run_dir / "episodes" / episode_id / "live_calls.json").get("calls", [])
+        _verify_live_telemetry_projection_for_episodes(run_dir, [episode_id], root_by_scope)
+
+
+def _verify_live_telemetry_projection_for_episodes(run_dir: Path, episode_ids: list[str], root_by_scope: dict | None = None) -> None:
+    if root_by_scope is None:
+        root_by_scope = {}
+        for call in read_json(run_dir / "pilot_live_calls.json").get("calls", []):
+            root_by_scope.setdefault(call.get("scope_id"), []).append(call)
+    for episode_id in episode_ids:
+        live_path = run_dir / "episodes" / episode_id / "live_calls.json"
+        if not live_path.exists():
+            raise StorageError("episode live telemetry projection mismatch")
+        episode_calls = read_json(live_path).get("calls", [])
         scope_id = f"episode:{episode_id}"
         if episode_calls != root_by_scope.get(scope_id, []):
             raise StorageError("episode live telemetry projection mismatch")
@@ -398,11 +561,13 @@ def _verify_live_telemetry_projections(run_dir: Path, manifest: dict) -> None:
 
 def pilot_status(run_dir: Path) -> dict:
     manifest = read_json(run_dir / "pilot_manifest.json")
-    verify_pilot_artifacts(run_dir, manifest)
+    inspection = inspect_pilot_checkpoint(run_dir, manifest)
+    if inspection["checkpoint_integrity"] == "CORRUPT":
+        raise StorageError("; ".join(inspection["reason_codes"]))
     episodes = {episode_id: status(run_dir / "episodes" / episode_id)["status"] for episode_id in manifest["completed_episodes"]}
     finals = all((run_dir / "episodes" / episode_id / "final.md").exists() for episode_id in manifest["completed_episodes"])
     sources = [episode_id for episode_id in manifest["episode_ids"] if (run_dir / "episode_sources" / f"{episode_id}.json").exists()]
-    result = {"mode": manifest.get("mode", "mock"), "pilot_id": manifest["pilot_id"], "status": manifest["status"], "episode_count": len(manifest["episode_ids"]), "completed_episode_count": len(manifest["completed_episodes"]), "completed_transition_count": len(manifest["completed_transitions"]), "active_episode_id": manifest["active_episode_id"], "episode_statuses": episodes, "writer_call_count": sum(item["writer_call_count"] for item in manifest["episode_records"]), "revision_count": sum(item["revision_count"] for item in manifest["episode_records"]), "acceptance_verdict": manifest["acceptance_verdict"], "finals_exist": finals, "memory_chain_valid": _memory_chain_valid(run_dir, manifest), "rolling_plan_adapted": len({sha256_bytes(canonical_bytes(read_json(run_dir / "episode_sources" / f"{episode_id}.json")["rolling_plan"])) for episode_id in sources}) > 1}
+    result = {"mode": manifest.get("mode", "mock"), "pilot_id": manifest["pilot_id"], "status": manifest["status"], "episode_count": len(manifest["episode_ids"]), "completed_episode_count": len(manifest["completed_episodes"]), "completed_transition_count": len(manifest["completed_transitions"]), "active_episode_id": manifest["active_episode_id"], "episode_statuses": episodes, "writer_call_count": sum(item["writer_call_count"] for item in manifest["episode_records"]), "revision_count": sum(item["revision_count"] for item in manifest["episode_records"]), "acceptance_verdict": manifest["acceptance_verdict"], "finals_exist": finals, "memory_chain_valid": _memory_chain_valid(run_dir, manifest), "rolling_plan_adapted": len({sha256_bytes(canonical_bytes(read_json(run_dir / "episode_sources" / f"{episode_id}.json")["rolling_plan"])) for episode_id in sources}) > 1, "checkpoint_integrity": inspection["checkpoint_integrity"], "reconciliation_required": inspection["reconciliation_required"], "reason_codes": inspection["reason_codes"], "current": inspection["current"], "derived": inspection["derived"]}
     if result["mode"] == "live":
         telemetry = read_json(run_dir / "pilot_live_calls.json")
         checkpoint = manifest.get("live_telemetry_checkpoint")

@@ -11,7 +11,7 @@ import pytest
 from arc.live_model import AtomicTelemetryStore, GemmaPoolClient, LiveConfig, MODEL_NAME, RoutingStateStore
 from arc.pipeline import PLANNING_ROLES, MockPipeline, WaveCheckpoint, status
 from arc.pilot_contracts import PILOT_REVIEW_ROLES
-from arc.pilot import PilotPipeline, live_telemetry_checkpoint
+from arc.pilot import PilotPipeline, inspect_pilot_checkpoint, live_telemetry_checkpoint, reconcile_pilot_checkpoint
 from arc.storage import StorageError, read_json, write_json
 
 
@@ -271,6 +271,22 @@ def _make_episode_four_plan_error_output(tmp_path: Path) -> Path:
     return output
 
 
+def _make_reconcilable_pilot_output(tmp_path: Path) -> Path:
+    output = _make_episode_four_plan_error_output(tmp_path)
+    manifest = read_json(output / "pilot_manifest.json")
+    telemetry = read_json(output / "pilot_live_calls.json")
+    stale_hash = write_json(output / "pilot_live_calls.json", telemetry)
+    manifest["active_episode_id"] = "episode_001"
+    manifest["completed_episodes"] = ["episode_001"]
+    manifest["completed_transitions"] = ["episode_001_to_episode_002"]
+    manifest["episode_records"] = manifest["episode_records"][:1]
+    manifest["artifact_hashes"]["pilot_live_calls.json"] = "0" * 64
+    manifest.pop("live_telemetry_checkpoint", None)
+    write_json(output / "pilot_manifest.json", manifest)
+    assert stale_hash != manifest["artifact_hashes"]["pilot_live_calls.json"]
+    return output
+
+
 def _resume_episode_four_output(output: Path, root: _PilotProviderRoot | None = None):
     fresh_client, provider_root = _pilot_client(output, root)
     result = PilotPipeline(fresh_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
@@ -521,6 +537,219 @@ def test_live_terminal_checkpoint_covers_complete_telemetry(tmp_path):
 
 def test_phase2_live_telemetry_contract_remains_compatible(tmp_path):
     test_phase2_unscoped_telemetry_remains_compatible(tmp_path)
+
+
+def test_pilot_live_status_reports_valid_checkpoint_without_writes(tmp_path):
+    from arc.pilot import pilot_status
+
+    output = tmp_path / "pilot-live"
+    client, _ = _pilot_client(output)
+    PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    before = _file_bytes(output)
+
+    current = pilot_status(output)
+
+    assert current["checkpoint_integrity"] == "VALID"
+    assert current["reconciliation_required"] is False
+    assert _file_bytes(output) == before
+
+
+def test_pilot_live_status_reports_reconcilable_checkpoint_without_writes(tmp_path):
+    from arc.pilot import pilot_status
+
+    output = _make_reconcilable_pilot_output(tmp_path)
+    before = _file_bytes(output)
+
+    current = pilot_status(output)
+
+    assert current["checkpoint_integrity"] == "RECONCILABLE"
+    assert current["reconciliation_required"] is True
+    assert current["derived"]["active_episode_id"] == "episode_004"
+    assert current["derived"]["completed_episodes"] == ["episode_001", "episode_002", "episode_003"]
+    assert current["derived"]["completed_transitions"] == ["episode_001_to_episode_002", "episode_002_to_episode_003", "episode_003_to_episode_004"]
+    assert _file_bytes(output) == before
+
+
+def test_pilot_live_status_rejects_corrupt_checkpoint_without_writes(tmp_path):
+    from arc.pilot import pilot_status
+
+    output = tmp_path / "pilot-live"
+    client, _ = _pilot_client(output)
+    PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    before = _file_bytes(output)
+    (output / "transitions" / "episode_001_to_episode_002.json").write_text("{}", encoding="utf-8")
+
+    with pytest.raises(StorageError):
+        pilot_status(output)
+    assert (output / "pilot_live_calls.json").read_bytes() == before["pilot_live_calls.json"]
+
+
+def test_reconcile_repairs_stale_active_episode_forward_only(tmp_path):
+    output = _make_reconcilable_pilot_output(tmp_path)
+
+    result = reconcile_pilot_checkpoint(PILOT_FIXTURE, output)
+    manifest = read_json(output / "pilot_manifest.json")
+
+    assert result["checkpoint_integrity"] == "VALID"
+    assert manifest["active_episode_id"] == "episode_004"
+    assert "ACTIVE_EPISODE_STALE" in manifest["checkpoint_reconciliation"]["reason_codes"]
+
+
+def test_reconcile_repairs_completed_episode_prefix_forward_only(tmp_path):
+    output = _make_reconcilable_pilot_output(tmp_path)
+
+    reconcile_pilot_checkpoint(PILOT_FIXTURE, output)
+    manifest = read_json(output / "pilot_manifest.json")
+
+    assert manifest["completed_episodes"] == ["episode_001", "episode_002", "episode_003"]
+
+
+def test_reconcile_repairs_completed_transition_prefix_forward_only(tmp_path):
+    output = _make_reconcilable_pilot_output(tmp_path)
+
+    reconcile_pilot_checkpoint(PILOT_FIXTURE, output)
+    manifest = read_json(output / "pilot_manifest.json")
+
+    assert manifest["completed_transitions"] == ["episode_001_to_episode_002", "episode_002_to_episode_003", "episode_003_to_episode_004"]
+
+
+def test_reconcile_rebuilds_missing_episode_records(tmp_path):
+    output = _make_reconcilable_pilot_output(tmp_path)
+    manifest = read_json(output / "pilot_manifest.json")
+    manifest["episode_records"] = []
+    write_json(output / "pilot_manifest.json", manifest)
+
+    reconcile_pilot_checkpoint(PILOT_FIXTURE, output)
+
+    assert len(read_json(output / "pilot_manifest.json")["episode_records"]) == 3
+
+
+def test_reconcile_migrates_legacy_telemetry_hash(tmp_path):
+    output = _make_reconcilable_pilot_output(tmp_path)
+
+    reconcile_pilot_checkpoint(PILOT_FIXTURE, output)
+    manifest = read_json(output / "pilot_manifest.json")
+
+    assert "pilot_live_calls.json" not in manifest["artifact_hashes"]
+    assert manifest["live_telemetry_checkpoint"] == live_telemetry_checkpoint(read_json(output / "pilot_live_calls.json"))
+
+
+def test_reconcile_writes_only_pilot_manifest(tmp_path):
+    output = _make_reconcilable_pilot_output(tmp_path)
+    before = _file_bytes(output)
+
+    reconcile_pilot_checkpoint(PILOT_FIXTURE, output)
+    after = _file_bytes(output)
+    changed = {name for name in before if before[name] != after.get(name)}
+
+    assert changed == {"pilot_manifest.json"}
+
+
+def test_reconcile_is_noop_after_success(tmp_path):
+    output = _make_reconcilable_pilot_output(tmp_path)
+    reconcile_pilot_checkpoint(PILOT_FIXTURE, output)
+    before = _file_bytes(output)
+
+    result = reconcile_pilot_checkpoint(PILOT_FIXTURE, output)
+
+    assert result["no_op"] is True
+    assert _file_bytes(output) == before
+
+
+def test_reconcile_rejects_manifest_ahead_of_child_evidence(tmp_path):
+    output = _make_reconcilable_pilot_output(tmp_path)
+    manifest = read_json(output / "pilot_manifest.json")
+    manifest["completed_episodes"] = manifest["episode_ids"]
+    write_json(output / "pilot_manifest.json", manifest)
+
+    assert inspect_pilot_checkpoint(output)["checkpoint_integrity"] == "CORRUPT"
+    with pytest.raises(StorageError):
+        reconcile_pilot_checkpoint(PILOT_FIXTURE, output)
+
+
+def test_reconcile_rejects_non_contiguous_episode_prefix(tmp_path):
+    output = _make_reconcilable_pilot_output(tmp_path)
+    shutil.copytree(output / "episodes" / "episode_003", output / "episodes" / "episode_005")
+    manifest = read_json(output / "episodes" / "episode_005" / "manifest.json")
+    manifest["episode_id"] = "episode_005"
+    write_json(output / "episodes" / "episode_005" / "manifest.json", manifest)
+
+    assert inspect_pilot_checkpoint(output)["checkpoint_integrity"] == "CORRUPT"
+
+
+def test_reconcile_rejects_non_contiguous_transition_prefix(tmp_path):
+    output = _make_reconcilable_pilot_output(tmp_path)
+    (output / "transitions" / "episode_002_to_episode_003.json").unlink()
+
+    assert inspect_pilot_checkpoint(output)["checkpoint_integrity"] == "CORRUPT"
+
+
+def test_reconcile_rejects_immutable_artifact_mismatch(tmp_path):
+    output = _make_reconcilable_pilot_output(tmp_path)
+    (output / "episode_sources" / "episode_001.json").write_text("{}", encoding="utf-8")
+
+    assert inspect_pilot_checkpoint(output)["checkpoint_integrity"] == "CORRUPT"
+
+
+def test_reconcile_rejects_telemetry_prefix_tamper(tmp_path):
+    output = tmp_path / "pilot-live"
+    client, _ = _pilot_client(output)
+    PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    telemetry = read_json(output / "pilot_live_calls.json")
+    telemetry["calls"][0]["call_id"] = "tampered"
+    write_json(output / "pilot_live_calls.json", telemetry)
+
+    assert inspect_pilot_checkpoint(output)["checkpoint_integrity"] == "CORRUPT"
+
+
+def test_reconcile_rejects_projection_mismatch(tmp_path):
+    output = _make_reconcilable_pilot_output(tmp_path)
+    episode_live = output / "episodes" / "episode_003" / "live_calls.json"
+    value = read_json(episode_live)
+    value["calls"] = []
+    digest = write_json(episode_live, value)
+    manifest = read_json(output / "episodes" / "episode_003" / "manifest.json")
+    manifest["artifact_hashes"]["live_calls.json"] = digest
+    write_json(output / "episodes" / "episode_003" / "manifest.json", manifest)
+
+    assert inspect_pilot_checkpoint(output)["checkpoint_integrity"] == "CORRUPT"
+
+
+def test_reconcile_rejects_routing_state_behind_telemetry(tmp_path):
+    output = _make_reconcilable_pilot_output(tmp_path)
+    routing = read_json(output / "routing_state.json")
+    routing["next_lease_sequence"] = 1
+    write_json(output / "routing_state.json", routing)
+
+    assert inspect_pilot_checkpoint(output)["checkpoint_integrity"] == "CORRUPT"
+
+
+def test_pilot_live_run_refuses_reconcilable_output_before_provider_call(tmp_path):
+    output = _make_reconcilable_pilot_output(tmp_path)
+    fresh_client, provider_root = _pilot_client(output)
+
+    with pytest.raises(Exception, match="pilot checkpoint reconciliation required"):
+        PilotPipeline(fresh_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    assert provider_root.provider_calls == []
+
+
+def test_pilot_live_run_refuses_corrupt_output_before_provider_call(tmp_path):
+    output = _make_reconcilable_pilot_output(tmp_path)
+    (output / "episode_sources" / "episode_001.json").write_text("{}", encoding="utf-8")
+    fresh_client, provider_root = _pilot_client(output)
+
+    with pytest.raises(StorageError):
+        PilotPipeline(fresh_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    assert provider_root.provider_calls == []
+
+
+def test_pilot_live_reconcile_does_not_load_provider_client(tmp_path, monkeypatch):
+    output = _make_reconcilable_pilot_output(tmp_path)
+    monkeypatch.setenv("GOOGLE_API_KEY_1", "")
+
+    result = reconcile_pilot_checkpoint(PILOT_FIXTURE, output)
+
+    assert result["checkpoint_integrity"] == "VALID"
 
 
 def test_live_pilot_uses_one_root_routing_state(tmp_path):

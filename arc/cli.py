@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 
 from .mock_model import MockModelClient
 from .pipeline import MockPipeline, status
-from .pilot import PilotPipeline, pilot_status
+from .pilot import PilotPipeline, pilot_status, reconcile_pilot_checkpoint
 from .storage import write_json
 
 
@@ -109,6 +109,9 @@ def main() -> None:
     pilot_live.add_argument("--preflight", type=Path, required=True)
     pilot_live_state = commands.add_parser("pilot-live-status")
     pilot_live_state.add_argument("output", type=Path)
+    pilot_live_reconcile = commands.add_parser("pilot-live-reconcile")
+    pilot_live_reconcile.add_argument("fixture", type=Path)
+    pilot_live_reconcile.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.command == "mock-run":
         result = MockPipeline(MockModelClient(args.scenario)).run(args.fixture, args.output, args.scenario)
@@ -131,6 +134,9 @@ def main() -> None:
     elif args.command == "pilot-status":
         print(json.dumps(pilot_status(args.output), ensure_ascii=False))
     elif args.command == "pilot-live-run":
+        current = pilot_status(args.output) if (args.output / "pilot_manifest.json").exists() else None
+        if current and current.get("checkpoint_integrity") == "RECONCILABLE":
+            raise RuntimeError("pilot checkpoint reconciliation required")
         client = _load_live_client(args.preflight, args.output, args.output / "pilot_live_calls.json")
         try:
             result = PilotPipeline(client, scenario=None, mode="live").run(args.fixture, args.output)
@@ -139,5 +145,7 @@ def main() -> None:
             client.close()
     elif args.command == "pilot-live-status":
         print(json.dumps(pilot_status(args.output), ensure_ascii=False))
+    elif args.command == "pilot-live-reconcile":
+        print(json.dumps(reconcile_pilot_checkpoint(args.fixture, args.output), ensure_ascii=False))
     else:
         print(json.dumps(status(args.output), ensure_ascii=False))
