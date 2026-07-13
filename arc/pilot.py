@@ -44,7 +44,7 @@ class PilotPipeline:
             manifest = {"schema_version": 1, "mode": self.mode, "pilot_id": fixture["pilot_id"], "fixture_id": fixture["initial_source"]["fixture_id"], "source_hash": source_hash, "scenario": self.scenario, "status": "RUNNING", "episode_ids": fixture["episode_ids"], "completed_episodes": [], "completed_transitions": [], "active_episode_id": fixture["episode_ids"][0], "episode_records": [], "artifact_hashes": {}, "acceptance_verdict": None, "last_error": None}
             if self.mode == "live":
                 manifest.update({"provider": "gemini_developer_api", "model": self.client.config.model, "key_pool_size": len(self.client.config.keys), "max_live": self.client.config.max_live, "routing_schema_version": 2, "routing_mode": "dynamic_key_pool", "pilot_live_call_count": 0})
-            self._save_manifest(run_dir, manifest)
+            self._save_checkpoint(run_dir, manifest)
         try:
             self._advance(fixture, run_dir, manifest)
         except Exception as error:
@@ -54,10 +54,10 @@ class PilotPipeline:
                 child = read_json(run_dir / "episodes" / active / "manifest.json") if active and (run_dir / "episodes" / active / "manifest.json").exists() else {}
                 child_error = child.get("last_error") if isinstance(child.get("last_error"), dict) else None
                 manifest["last_error"] = {"error_class": (child_error or {}).get("error_class", "CONTRACT_ERROR" if isinstance(error, ContractError) else "PIPELINE_ERROR"), "active_episode_id": active, "stage": (child_error or {}).get("stage"), "role": (child_error or {}).get("role"), "contract_code": (child_error or {}).get("contract_code"), "message": "sanitized child episode failure"}
-                self._save_pilot_live_calls(run_dir, manifest)
+                self._save_checkpoint(run_dir, manifest)
             else:
                 manifest["last_error"] = str(error)
-            self._save_manifest(run_dir, manifest)
+                self._save_manifest(run_dir, manifest)
             raise
         return {"no_op": False, "manifest": manifest}
 
@@ -76,9 +76,9 @@ class PilotPipeline:
             if episode_id not in manifest["completed_episodes"]:
                 if self.mode == "live":
                     manifest["active_episode_id"] = episode_id
-                    self._save_manifest(run_dir, manifest)
+                    self._save_checkpoint(run_dir, manifest)
                     MockPipeline(self._episode_client(episode_id, index), mode="live").run(source_path, episode_dir, None)
-                    self._save_pilot_live_calls(run_dir, manifest)
+                    self._save_checkpoint(run_dir, manifest)
                 else:
                     original = getattr(self.client, "scenario", None)
                     if self.scenario == "episode_hold" and index == 2:
@@ -91,22 +91,20 @@ class PilotPipeline:
                 current = status(episode_dir)
                 if current["status"] == "HOLD":
                     manifest["status"], manifest["active_episode_id"] = "HOLD", episode_id
-                    self._save_pilot_live_calls(run_dir, manifest)
-                    self._save_manifest(run_dir, manifest)
+                    self._save_checkpoint(run_dir, manifest)
                     return
                 if current["status"] != "COMPLETE":
                     raise PilotError("episode did not complete")
                 record = {"episode_id": episode_id, "status": current["status"], "writer_call_count": current["writer_call_count"], "revision_count": current["revision_count"], "final_sha256": sha256_file(episode_dir / "final.md"), "memory_after_sha256": sha256_file(episode_dir / "memory_after.json")}
                 manifest["completed_episodes"].append(episode_id)
                 manifest["episode_records"].append(record)
-                self._save_pilot_live_calls(run_dir, manifest)
-                self._save_manifest(run_dir, manifest)
+                self._save_checkpoint(run_dir, manifest)
             if index < len(ids) - 1:
                 transition_id = f"{episode_id}_to_{ids[index + 1]}"
                 if transition_id not in manifest["completed_transitions"]:
                     self._reconcile_transition(run_dir, manifest, transition_id, episode_id, ids[index + 1], source, index)
                     manifest["completed_transitions"].append(transition_id)
-                    self._save_manifest(run_dir, manifest)
+                    self._save_checkpoint(run_dir, manifest)
                 else:
                     self._verify_completed_transition(run_dir, manifest, transition_id, episode_id, ids[index + 1], source, index)
         if "pilot_acceptance.json" not in manifest["artifact_hashes"]:
@@ -122,7 +120,7 @@ class PilotPipeline:
                     self._review_worker_contract(worker, worker["role"])
             else:
                 workers = self._review_workers(run_dir, manifest, evidence)
-                self._save_pilot_live_calls(run_dir, manifest)
+                self._save_checkpoint(run_dir, manifest)
                 self._write_artifact(run_dir, manifest, "pilot_review_workers.json", workers)
             acceptance = self._acceptance(evidence, workers)
             self._write_artifact(run_dir, manifest, "pilot_acceptance.json", acceptance)
@@ -133,7 +131,7 @@ class PilotPipeline:
             manifest["acceptance_verdict"] = acceptance["verdict"]
         manifest["status"] = "COMPLETE" if manifest["acceptance_verdict"] == "PASS" else "HOLD"
         manifest["active_episode_id"] = None
-        self._save_manifest(run_dir, manifest)
+        self._save_checkpoint(run_dir, manifest)
         (run_dir / "pilot_review_workers.partial.json").unlink(missing_ok=True)
 
     def _transition_input_hash(self, run_dir: Path, manifest: dict, episode_id: str, next_id: str, source: dict, index: int) -> str:
@@ -285,7 +283,14 @@ class PilotPipeline:
         if self.mode == "live":
             telemetry = self.client.telemetry()
             manifest["pilot_live_call_count"] = len(telemetry["calls"])
-            manifest["artifact_hashes"]["pilot_live_calls.json"] = write_json(run_dir / "pilot_live_calls.json", telemetry)
+            write_json(run_dir / "pilot_live_calls.json", telemetry)
+            manifest["live_telemetry_checkpoint"] = live_telemetry_checkpoint(telemetry)
+            manifest["artifact_hashes"].pop("pilot_live_calls.json", None)
+
+    def _save_checkpoint(self, run_dir: Path, manifest: dict) -> None:
+        if self.mode == "live":
+            self._save_pilot_live_calls(run_dir, manifest)
+        self._save_manifest(run_dir, manifest)
 
     def _save_manifest(self, run_dir: Path, manifest: dict) -> None:
         write_json(run_dir / "pilot_manifest.json", manifest)
@@ -299,13 +304,58 @@ def _json_file_hash(value: object) -> str:
     return sha256_bytes((json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8"))
 
 
+def _prefix_hash(items: list[dict]) -> str:
+    return sha256_bytes(canonical_bytes(items))
+
+
+def live_telemetry_checkpoint(telemetry: dict) -> dict:
+    calls = list(telemetry.get("calls", []))
+    failures = list(telemetry.get("contract_failures", []))
+    lease_sequences = [call.get("lease_sequence") for call in calls if call.get("lease_sequence") is not None]
+    return {
+        "schema_version": 1,
+        "call_count": len(calls),
+        "contract_failure_count": len(failures),
+        "calls_prefix_sha256": _prefix_hash(calls),
+        "contract_failures_prefix_sha256": _prefix_hash(failures),
+        "max_lease_sequence": max(lease_sequences) if lease_sequences else None,
+        "last_call_id": calls[-1].get("call_id") if calls else None,
+    }
+
+
+def verify_live_telemetry_checkpoint(telemetry: dict, checkpoint: dict | None) -> None:
+    if not checkpoint:
+        return
+    calls = list(telemetry.get("calls", []))
+    failures = list(telemetry.get("contract_failures", []))
+    call_count = checkpoint.get("call_count")
+    failure_count = checkpoint.get("contract_failure_count")
+    if not isinstance(call_count, int) or not isinstance(failure_count, int):
+        raise StorageError("invalid pilot live telemetry checkpoint")
+    if len(calls) < call_count or len(failures) < failure_count:
+        raise StorageError("pilot live telemetry shorter than checkpoint")
+    if checkpoint.get("calls_prefix_sha256") != _prefix_hash(calls[:call_count]):
+        raise StorageError("pilot live telemetry checkpoint call prefix mismatch")
+    if checkpoint.get("contract_failures_prefix_sha256") != _prefix_hash(failures[:failure_count]):
+        raise StorageError("pilot live telemetry checkpoint contract failure prefix mismatch")
+    if call_count:
+        if checkpoint.get("last_call_id") != calls[call_count - 1].get("call_id"):
+            raise StorageError("pilot live telemetry checkpoint last call mismatch")
+        leases = [call.get("lease_sequence") for call in calls[:call_count] if call.get("lease_sequence") is not None]
+        if checkpoint.get("max_lease_sequence") != (max(leases) if leases else None):
+            raise StorageError("pilot live telemetry checkpoint lease mismatch")
+
+
 def verify_pilot_artifacts(run_dir: Path, manifest: dict) -> None:
     for name, digest in manifest["artifact_hashes"].items():
+        if manifest.get("mode") == "live" and name == "pilot_live_calls.json":
+            continue
         path = run_dir / name
         if not path.exists() or sha256_file(path) != digest:
             raise StorageError(f"pilot artifact hash mismatch: {name}")
-    expected = {"pilot_manifest.json", *manifest["artifact_hashes"], "pilot_review_workers.partial.json"}
-    operational = {"routing_state.json"} if manifest.get("mode") == "live" else set()
+    immutable = set(manifest["artifact_hashes"]) - ({"pilot_live_calls.json"} if manifest.get("mode") == "live" else set())
+    expected = {"pilot_manifest.json", *immutable, "pilot_review_workers.partial.json"}
+    operational = {"routing_state.json", "pilot_live_calls.json"} if manifest.get("mode") == "live" else set()
     actual = {path.relative_to(run_dir).as_posix() for path in run_dir.rglob("*") if path.is_file()}
     if actual - expected - operational - {f"episodes/{episode_id}/{name}" for episode_id in manifest["episode_ids"] for name in _episode_files(run_dir / "episodes" / episode_id)}:
         raise StorageError("unknown pilot artifact")
@@ -331,6 +381,7 @@ def _verify_live_telemetry_projections(run_dir: Path, manifest: dict) -> None:
         routing = read_json(run_dir / "routing_state.json")
         if routing.get("next_lease_sequence", 0) <= max(lease_sequences):
             raise StorageError("routing lease sequence behind telemetry")
+    verify_live_telemetry_checkpoint(root, manifest.get("live_telemetry_checkpoint"))
     root_by_scope = {}
     for call in root.get("calls", []):
         root_by_scope.setdefault(call.get("scope_id"), []).append(call)
@@ -354,11 +405,12 @@ def pilot_status(run_dir: Path) -> dict:
     result = {"mode": manifest.get("mode", "mock"), "pilot_id": manifest["pilot_id"], "status": manifest["status"], "episode_count": len(manifest["episode_ids"]), "completed_episode_count": len(manifest["completed_episodes"]), "completed_transition_count": len(manifest["completed_transitions"]), "active_episode_id": manifest["active_episode_id"], "episode_statuses": episodes, "writer_call_count": sum(item["writer_call_count"] for item in manifest["episode_records"]), "revision_count": sum(item["revision_count"] for item in manifest["episode_records"]), "acceptance_verdict": manifest["acceptance_verdict"], "finals_exist": finals, "memory_chain_valid": _memory_chain_valid(run_dir, manifest), "rolling_plan_adapted": len({sha256_bytes(canonical_bytes(read_json(run_dir / "episode_sources" / f"{episode_id}.json")["rolling_plan"])) for episode_id in sources}) > 1}
     if result["mode"] == "live":
         telemetry = read_json(run_dir / "pilot_live_calls.json")
+        checkpoint = manifest.get("live_telemetry_checkpoint")
         calls = telemetry.get("calls", [])
         call_ids = [call.get("call_id") for call in calls]
         lease_sequences = [call.get("lease_sequence") for call in calls]
         acceptance_calls = [call for call in calls if call.get("scope_id") == "pilot:acceptance"]
-        result.update({"model": manifest["model"], "key_pool_size": manifest["key_pool_size"], "configured_max_live": manifest["max_live"], "telemetry_schema_version": telemetry["schema_version"], "pilot_live_call_count": len(calls), "successful_live_calls": sum(call["status"] == "PASS" for call in calls), "failed_live_calls": sum(call["status"] == "FAIL" for call in calls), "transient_failure_count": sum(call["status"] == "FAIL" and call.get("error_class") in {"RATE_LIMITED", "PROVIDER_5XX", "TIMEOUT", "NETWORK_ERROR"} for call in calls), "contract_failure_count": len(telemetry.get("contract_failures", [])), "used_key_slots": sorted({call["key_slot"] for call in calls}), "rotation_count": sum(1 for call in calls if call["status"] == "FAIL" and call.get("error_class")), "episode_call_counts": {episode_id: len(read_json(run_dir / "episodes" / episode_id / "live_calls.json")["calls"]) for episode_id in manifest["completed_episodes"]}, "acceptance_call_count": len(acceptance_calls), "acceptance_pass_calls": sum(call["status"] == "PASS" for call in acceptance_calls), "call_ids_unique": len(call_ids) == len(set(call_ids)), "lease_sequences_unique": len(lease_sequences) == len(set(lease_sequences))})
+        result.update({"model": manifest["model"], "key_pool_size": manifest["key_pool_size"], "configured_max_live": manifest["max_live"], "telemetry_schema_version": telemetry["schema_version"], "pilot_live_call_count": len(calls), "live_telemetry_checkpoint": checkpoint, "successful_live_calls": sum(call["status"] == "PASS" for call in calls), "failed_live_calls": sum(call["status"] == "FAIL" for call in calls), "transient_failure_count": sum(call["status"] == "FAIL" and call.get("error_class") in {"RATE_LIMITED", "PROVIDER_5XX", "TIMEOUT", "NETWORK_ERROR"} for call in calls), "contract_failure_count": len(telemetry.get("contract_failures", [])), "used_key_slots": sorted({call["key_slot"] for call in calls}), "rotation_count": sum(1 for call in calls if call["status"] == "FAIL" and call.get("error_class")), "episode_call_counts": {episode_id: len(read_json(run_dir / "episodes" / episode_id / "live_calls.json")["calls"]) for episode_id in manifest["completed_episodes"]}, "acceptance_call_count": len(acceptance_calls), "acceptance_pass_calls": sum(call["status"] == "PASS" for call in acceptance_calls), "call_ids_unique": len(call_ids) == len(set(call_ids)), "lease_sequences_unique": len(lease_sequences) == len(set(lease_sequences))})
     return result
 
 

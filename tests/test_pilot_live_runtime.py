@@ -11,7 +11,7 @@ import pytest
 from arc.live_model import AtomicTelemetryStore, GemmaPoolClient, LiveConfig, MODEL_NAME, RoutingStateStore
 from arc.pipeline import PLANNING_ROLES, MockPipeline, WaveCheckpoint, status
 from arc.pilot_contracts import PILOT_REVIEW_ROLES
-from arc.pilot import PilotPipeline
+from arc.pilot import PilotPipeline, live_telemetry_checkpoint
 from arc.storage import StorageError, read_json, write_json
 
 
@@ -207,7 +207,7 @@ def _make_interrupted_episode_output(tmp_path: Path) -> Path:
 
     manifest.update({"status": "RUNNING", "completed_episodes": ["episode_001"], "completed_transitions": ["episode_001_to_episode_002"], "active_episode_id": "episode_002", "episode_records": manifest["episode_records"][:1], "acceptance_verdict": None, "last_error": None, "pilot_live_call_count": len(kept_calls)})
     manifest["artifact_hashes"] = {key: value for key, value in manifest["artifact_hashes"].items() if key in {"episode_sources/episode_001.json", "episode_sources/episode_002.json", "transitions/episode_001_to_episode_002.json"}}
-    manifest["artifact_hashes"]["pilot_live_calls.json"] = root_hash
+    manifest["live_telemetry_checkpoint"] = live_telemetry_checkpoint(root_telemetry)
     write_json(output / "pilot_manifest.json", manifest)
     return output
 
@@ -246,7 +246,7 @@ def _make_acceptance_partial_output(tmp_path: Path) -> Path:
     manifest.update({"status": "RUNNING", "active_episode_id": None, "acceptance_verdict": None, "last_error": None, "pilot_live_call_count": len(kept_calls)})
     manifest["artifact_hashes"].pop("pilot_review_workers.json", None)
     manifest["artifact_hashes"].pop("pilot_acceptance.json", None)
-    manifest["artifact_hashes"]["pilot_live_calls.json"] = root_hash
+    manifest["live_telemetry_checkpoint"] = live_telemetry_checkpoint(telemetry)
     write_json(output / "pilot_manifest.json", manifest)
     return output
 
@@ -410,6 +410,117 @@ def test_live_pilot_runs_five_episodes_with_one_base_client(tmp_path):
     episode_scopes = {call["scope_id"] for call in read_json(output / "pilot_live_calls.json")["calls"] if call["scope_id"].startswith("episode:")}
     assert len(episode_scopes) == 5
     assert provider_root.provider_calls
+
+
+def test_pilot_live_telemetry_is_operational_not_immutable_artifact(tmp_path):
+    output = tmp_path / "pilot-live"
+    client, _ = _pilot_client(output)
+
+    PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+
+    manifest = read_json(output / "pilot_manifest.json")
+    assert "pilot_live_calls.json" not in manifest["artifact_hashes"]
+    assert (output / "pilot_live_calls.json").exists()
+
+
+def test_live_checkpoint_writes_telemetry_before_manifest(tmp_path):
+    output = tmp_path / "pilot-live"
+    client, _ = _pilot_client(output)
+
+    PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+
+    manifest = read_json(output / "pilot_manifest.json")
+    telemetry = read_json(output / "pilot_live_calls.json")
+    assert manifest["live_telemetry_checkpoint"] == live_telemetry_checkpoint(telemetry)
+
+
+def test_live_checkpoint_records_telemetry_prefix(tmp_path):
+    output = tmp_path / "pilot-live"
+    client, _ = _pilot_client(output)
+
+    PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+
+    checkpoint = read_json(output / "pilot_manifest.json")["live_telemetry_checkpoint"]
+    telemetry = read_json(output / "pilot_live_calls.json")
+    assert checkpoint["call_count"] == len(telemetry["calls"])
+    assert checkpoint["contract_failure_count"] == len(telemetry["contract_failures"])
+    assert checkpoint["last_call_id"] == telemetry["calls"][-1]["call_id"]
+
+
+def test_live_checkpoint_accepts_append_only_telemetry(tmp_path):
+    from arc.pilot import pilot_status
+
+    output = _make_episode_four_plan_error_output(tmp_path)
+    manifest = read_json(output / "pilot_manifest.json")
+    telemetry = read_json(output / "pilot_live_calls.json")
+    checkpoint = manifest["live_telemetry_checkpoint"]
+    assert len(telemetry["calls"]) == checkpoint["call_count"]
+    extra = dict(telemetry["calls"][-1])
+    extra["call_id"] = "L999-A999"
+    extra["lease_sequence"] = max(call["lease_sequence"] for call in telemetry["calls"]) + 1
+    extra["scope_id"] = "pilot:acceptance"
+    extra["desk_id"] = "pilot:acceptance:pilot_review:readability"
+    telemetry["calls"].append(extra)
+    write_json(output / "pilot_live_calls.json", telemetry)
+    routing = read_json(output / "routing_state.json")
+    routing["next_lease_sequence"] = extra["lease_sequence"] + 1
+    write_json(output / "routing_state.json", routing)
+
+    current = pilot_status(output)
+
+    assert current["pilot_live_call_count"] == checkpoint["call_count"] + 1
+
+
+def test_live_checkpoint_rejects_changed_call_prefix(tmp_path):
+    from arc.pilot import pilot_status
+
+    output = tmp_path / "pilot-live"
+    client, _ = _pilot_client(output)
+    PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    telemetry = read_json(output / "pilot_live_calls.json")
+    telemetry["calls"][0]["stage"] = "tampered"
+    write_json(output / "pilot_live_calls.json", telemetry)
+
+    with pytest.raises(StorageError, match="checkpoint call prefix mismatch"):
+        pilot_status(output)
+
+
+def test_live_checkpoint_rejects_shortened_telemetry(tmp_path):
+    from arc.pilot import pilot_status
+
+    output = tmp_path / "pilot-live"
+    client, _ = _pilot_client(output)
+    PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    telemetry = read_json(output / "pilot_live_calls.json")
+    telemetry["calls"].pop()
+    write_json(output / "pilot_live_calls.json", telemetry)
+
+    with pytest.raises(StorageError, match="shorter than checkpoint"):
+        pilot_status(output)
+
+
+def test_live_exception_saves_error_manifest_after_telemetry(tmp_path):
+    output = _make_episode_four_plan_error_output(tmp_path)
+    manifest = read_json(output / "pilot_manifest.json")
+    telemetry = read_json(output / "pilot_live_calls.json")
+    assert manifest["status"] == "ERROR"
+    assert manifest["live_telemetry_checkpoint"] == live_telemetry_checkpoint(telemetry)
+
+
+def test_live_terminal_checkpoint_covers_complete_telemetry(tmp_path):
+    output = tmp_path / "pilot-live"
+    client, _ = _pilot_client(output)
+
+    PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+
+    manifest = read_json(output / "pilot_manifest.json")
+    telemetry = read_json(output / "pilot_live_calls.json")
+    assert manifest["status"] == "COMPLETE"
+    assert manifest["live_telemetry_checkpoint"] == live_telemetry_checkpoint(telemetry)
+
+
+def test_phase2_live_telemetry_contract_remains_compatible(tmp_path):
+    test_phase2_unscoped_telemetry_remains_compatible(tmp_path)
 
 
 def test_live_pilot_uses_one_root_routing_state(tmp_path):
