@@ -388,8 +388,9 @@ class TokenGate:
         self.counter = counter
 
     def admit(self, *, client: object, model: str, prompt: str, config: object, key_slot_id: str, call: dict, max_output_tokens: int, output_identity: str | None = None) -> tuple[str, int]:
-        count_event_id = f"{call['call_id']}:count_tokens:{call.get('lease_sequence')}"
-        generation_event_id = f"{call['call_id']}:generate_content:{call.get('lease_sequence')}"
+        event_scope = call.get("desk_id") or call["call_id"]
+        count_event_id = f"{event_scope}:{call['call_id']}:count_tokens:{call.get('lease_sequence')}"
+        generation_event_id = f"{event_scope}:{call['call_id']}:generate_content:{call.get('lease_sequence')}"
         try:
             self.ledger.prepare_count_tokens(event_id=count_event_id, key_slot_id=key_slot_id, model=model, call=call, output_identity=output_identity)
             input_tokens = self._count_tokens(client, model, prompt, config)

@@ -68,6 +68,10 @@ def _call() -> dict:
     return {"scope_id": "episode:episode_004", "call_id": "L317-A001", "lease_sequence": 179, "stage": "revision", "role": "canonical", "attempt": 1}
 
 
+def _preflight_call(slot: str) -> dict:
+    return {"scope_id": None, "desk_id": f"preflight:{slot}", "call_id": "L000-A001", "lease_sequence": None, "stage": "preflight", "role": slot, "attempt": 1}
+
+
 def test_pacific_fields_use_los_angeles_date_across_utc_midnight() -> None:
     _, _, date = pacific_fields(datetime(2026, 7, 13, 1, 30, tzinfo=timezone.utc))
     assert date == "2026-07-12"
@@ -115,6 +119,23 @@ def test_token_gate_records_count_and_generation_usage_with_reasoning(tmp_path: 
     assert status["totals"]["candidate_tokens"] == 20
     assert status["totals"]["reasoning_tokens"] == 7
     assert status["totals"]["combined_output_tokens"] == 27
+
+
+def test_preflight_slots_with_same_call_id_get_distinct_usage_events(tmp_path: Path) -> None:
+    ledger = UsageLedger(tmp_path / "usage.sqlite3")
+    gate = TokenGate(ledger)
+
+    first_event, _ = gate.admit(client=_Client(15), model="gemma-4-31b-it", prompt="safe prompt", config={}, key_slot_id="K01", call=_preflight_call("K01"), max_output_tokens=JSON_OUTPUT_LIMIT)
+    second_event, _ = gate.admit(client=_Client(15), model="gemma-4-31b-it", prompt="safe prompt", config={}, key_slot_id="K02", call=_preflight_call("K02"), max_output_tokens=JSON_OUTPUT_LIMIT)
+
+    assert first_event != second_event
+    status = ledger.status()
+    assert status["totals"]["count_token_requests"] == 2
+    assert status["totals"]["generation_requests"] == 0
+    with sqlite3.connect(tmp_path / "usage.sqlite3") as conn:
+        event_ids = [row[0] for row in conn.execute("SELECT event_id FROM usage_events ORDER BY event_id")]
+    assert len(event_ids) == 4
+    assert len(event_ids) == len(set(event_ids))
 
 
 def test_thoughts_zero_is_distinct_from_missing(tmp_path: Path) -> None:
