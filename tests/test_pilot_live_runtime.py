@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from arc.contracts import ContractError, validate_prose
+from arc.contracts import ContractError, PROSE_FORBIDDEN_MARKERS, validate_prose
 from arc.live_model import AtomicTelemetryStore, GemmaPoolClient, LiveConfig, MODEL_NAME, RoutingStateStore
 from arc.pipeline import PLANNING_ROLES, MockPipeline, WaveCheckpoint, status
 from arc.pilot_contracts import PILOT_REVIEW_ROLES
@@ -575,6 +575,28 @@ def test_validate_prose_rejects_forbidden_marker_with_code():
     with pytest.raises(ContractError) as error:
         validate_prose(("A" * 4100) + "SCENE 1")
     assert error.value.contract_code == "PROSE_FORBIDDEN_MARKER"
+
+
+def test_prose_forbidden_markers_are_utf8_canonical():
+    assert PROSE_FORBIDDEN_MARKERS == ("[화면]", "[음향]", "[카메라]", "장면 1", "장면 2", "SCENE 1", "CUT TO:", "```")
+
+
+@pytest.mark.parametrize("marker", ["[화면]", "[음향]", "[카메라]", "장면 1", "장면 2"])
+def test_validate_prose_rejects_korean_forbidden_markers(marker):
+    with pytest.raises(ContractError) as error:
+        validate_prose(("A" * 4100) + marker)
+    assert error.value.contract_code == "PROSE_FORBIDDEN_MARKER"
+
+
+@pytest.mark.parametrize("marker", ["SCENE 1", "CUT TO:", "```"])
+def test_validate_prose_rejects_english_forbidden_markers(marker):
+    with pytest.raises(ContractError) as error:
+        validate_prose(("A" * 4100) + marker)
+    assert error.value.contract_code == "PROSE_FORBIDDEN_MARKER"
+
+
+def test_prose_contract_sources_do_not_contain_mojibake_markers():
+    assert "?붾㈃" not in Path("arc/contracts.py").read_text(encoding="utf-8")
 
 
 def test_validate_prose_rejects_json_shape_with_code():

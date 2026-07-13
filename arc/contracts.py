@@ -18,7 +18,7 @@ class ModelClient(Protocol):
     def generate(self, *, stage: str, role: str, prompt: str) -> str: ...
 
 
-PROSE_FORBIDDEN_MARKERS = ("[?붾㈃]", "[?뚰뼢]", "[移대찓??", "?λ㈃ 1", "?λ㈃ 2", "SCENE 1", "CUT TO:", "```")
+PROSE_FORBIDDEN_MARKERS = ("[화면]", "[음향]", "[카메라]", "장면 1", "장면 2", "SCENE 1", "CUT TO:", "```")
 
 
 REQUIRED_FIXTURE_KEYS = {
