@@ -209,22 +209,75 @@ class UsageLedger:
     def prepare_count_tokens(self, *, event_id: str, key_slot_id: str, model: str, call: dict, output_identity: str | None = None, usage_run_id: str | None = None, usage_attempt_id: str | None = None, request_group_id: str | None = None) -> None:
         self.insert_event(event_id=event_id, request_kind="count_tokens", key_slot_id=key_slot_id, model=model, call=call, output_identity=output_identity, usage_run_id=usage_run_id, usage_attempt_id=usage_attempt_id, request_group_id=request_group_id, gate_decision="ALLOW", provider_dispatched=False, status="PREPARED", usage_metadata_status="NOT_APPLICABLE", token_provenance="measured")
 
-    def finish_count_tokens(self, *, event_id: str, input_tokens: int | None, dispatched: bool, error_code: str | None = None) -> None:
+    def finish_count_tokens(
+        self,
+        *,
+        event_id: str,
+        input_tokens: int | None,
+        dispatched: bool,
+        error_code: str | None = None,
+        usage_run_id: str | None = None,
+        usage_attempt_id: str | None = None,
+        request_group_id: str | None = None,
+    ) -> None:
         status = "SUCCEEDED" if error_code is None else "FAILED"
-        self.update_event(event_id, expected_statuses={"PREPARED", "DISPATCHED"}, status=status, provider_dispatched=dispatched, actual_input_tokens=input_tokens, usage_metadata_status="KNOWN" if input_tokens is not None else "MISSING", error_code=error_code)
+        self.update_event(
+            event_id,
+            expected_statuses={"PREPARED", "DISPATCHED"},
+            usage_run_id=usage_run_id,
+            usage_attempt_id=usage_attempt_id,
+            request_group_id=request_group_id,
+            request_kind="count_tokens",
+            status=status,
+            provider_dispatched=dispatched,
+            actual_input_tokens=input_tokens,
+            usage_metadata_status="KNOWN" if input_tokens is not None else "MISSING",
+            error_code=error_code,
+        )
 
     def insert_generation(self, *, event_id: str, key_slot_id: str, model: str, call: dict, input_tokens: int | None, max_output_tokens: int, admission: Admission, output_identity: str | None = None, usage_run_id: str | None = None, usage_attempt_id: str | None = None, request_group_id: str | None = None) -> None:
         status = "PREPARED" if admission.allowed else "BLOCKED"
         self.insert_event(event_id=event_id, request_kind="generate_content", key_slot_id=key_slot_id, model=model, call=call, output_identity=output_identity, usage_run_id=usage_run_id, usage_attempt_id=usage_attempt_id, request_group_id=request_group_id, gate_input_tokens=input_tokens, configured_max_output_tokens=max_output_tokens, gate_decision=admission.gate_decision, gate_reason_code=admission.reason_code or admission.warning_code, provider_dispatched=False, status=status, usage_metadata_status="PENDING" if admission.allowed else "NOT_APPLICABLE", token_provenance="provider")
 
-    def mark_dispatched(self, event_id: str) -> None:
-        self.update_event(event_id, expected_statuses={"PREPARED"}, status="DISPATCHED", provider_dispatched=True)
+    def mark_dispatched(
+        self,
+        event_id: str,
+        *,
+        usage_run_id: str | None = None,
+        usage_attempt_id: str | None = None,
+        request_group_id: str | None = None,
+        request_kind: str | None = None,
+    ) -> None:
+        self.update_event(
+            event_id,
+            expected_statuses={"PREPARED"},
+            usage_run_id=usage_run_id,
+            usage_attempt_id=usage_attempt_id,
+            request_group_id=request_group_id,
+            request_kind=request_kind,
+            status="DISPATCHED",
+            provider_dispatched=True,
+        )
 
-    def finish_generation(self, *, event_id: str, usage: UsageNumbers, status: str, error_code: str | None = None) -> None:
+    def finish_generation(
+        self,
+        *,
+        event_id: str,
+        usage: UsageNumbers,
+        status: str,
+        error_code: str | None = None,
+        usage_run_id: str | None = None,
+        usage_attempt_id: str | None = None,
+        request_group_id: str | None = None,
+    ) -> None:
         final_status = "USAGE_UNKNOWN" if status == "SUCCEEDED" and usage.metadata_status == "MISSING" else status
         self.update_event(
             event_id,
             expected_statuses={"DISPATCHED"},
+            usage_run_id=usage_run_id,
+            usage_attempt_id=usage_attempt_id,
+            request_group_id=request_group_id,
+            request_kind="generate_content",
             status=final_status,
             actual_input_tokens=usage.prompt_tokens,
             candidate_tokens=usage.candidate_tokens,
@@ -281,26 +334,81 @@ class UsageLedger:
         row["provider_dispatched"] = int(bool(row["provider_dispatched"]))
         self._write_row(row)
 
-    def update_event(self, event_id: str, *, expected_statuses: set[str] | None = None, allow_terminal: bool = False, **values: Any) -> None:
+    def update_event(
+        self,
+        event_id: str,
+        *,
+        expected_statuses: set[str] | None = None,
+        usage_run_id: str | None = None,
+        usage_attempt_id: str | None = None,
+        request_group_id: str | None = None,
+        request_kind: str | None = None,
+        **values: Any,
+    ) -> None:
         self.ensure()
         values["updated_at"] = datetime.now(timezone.utc).isoformat()
         if "provider_dispatched" in values:
             values["provider_dispatched"] = int(bool(values["provider_dispatched"]))
         columns = ", ".join(f"{key}=?" for key in values)
+        terminal = {"SUCCEEDED", "FAILED", "USAGE_UNKNOWN", "BLOCKED"}
+        expected = set(expected_statuses or {"PREPARED", "DISPATCHED"})
+        target_status = values.get("status")
+        transition_sql = "1=1"
+        transition_params: list[object] = []
+        if target_status == "DISPATCHED":
+            transition_sql = "status='PREPARED'"
+        elif target_status == "SUCCEEDED":
+            transition_sql = "(status='DISPATCHED' OR (status='PREPARED' AND request_kind='count_tokens' AND ?=0))"
+            transition_params.append(values.get("provider_dispatched", 0))
+        elif target_status == "FAILED":
+            transition_sql = "(status='DISPATCHED' OR (status='PREPARED' AND request_kind='count_tokens'))"
+        elif target_status == "USAGE_UNKNOWN":
+            transition_sql = "status='DISPATCHED' AND request_kind='generate_content'"
+        elif target_status is not None:
+            raise UsageLedgerError("USAGE_EVENT_STATE_CONFLICT")
+
+        ownership_values = (usage_run_id, usage_attempt_id, request_group_id)
+        ownership_supplied = any(value is not None for value in ownership_values)
+        if ownership_supplied and not all(isinstance(value, str) and value for value in ownership_values):
+            raise UsageLedgerError("USAGE_EVENT_ID_COLLISION")
+        ownership_sql = (
+            "usage_run_id=? AND usage_attempt_id=? AND request_group_id=?"
+            if ownership_supplied
+            else "usage_run_id IS NULL AND usage_attempt_id IS NULL AND request_group_id IS NULL"
+        )
+        ownership_params: list[object] = list(ownership_values) if ownership_supplied else []
+        if request_kind is not None:
+            ownership_sql += " AND request_kind=?"
+            ownership_params.append(request_kind)
+        expected_placeholders = ",".join("?" for _ in expected)
         try:
             with self._connect() as conn:
-                row = conn.execute("SELECT status FROM usage_events WHERE event_id=?", (event_id,)).fetchone()
+                cursor = conn.execute(
+                    f"""
+                    UPDATE usage_events
+                    SET {columns}
+                    WHERE event_id=?
+                      AND status IN ({expected_placeholders})
+                      AND status NOT IN ('SUCCEEDED','FAILED','USAGE_UNKNOWN','BLOCKED')
+                      AND {transition_sql}
+                      AND {ownership_sql}
+                    """,
+                    (*values.values(), event_id, *sorted(expected), *transition_params, *ownership_params),
+                )
+                if cursor.rowcount == 1:
+                    return
+                row = conn.execute(
+                    "SELECT status, usage_run_id, usage_attempt_id, request_group_id, request_kind FROM usage_events WHERE event_id=?",
+                    (event_id,),
+                ).fetchone()
                 if row is None:
                     raise UsageLedgerError("USAGE_EVENT_NOT_FOUND")
-                current = row["status"]
-                terminal = {"SUCCEEDED", "FAILED", "USAGE_UNKNOWN", "BLOCKED"}
-                if expected_statuses is not None and current not in expected_statuses:
-                    raise UsageLedgerError("USAGE_EVENT_STATE_CONFLICT")
-                if expected_statuses is None and not allow_terminal and current in terminal:
+                if row["status"] in terminal:
                     raise UsageLedgerError("USAGE_EVENT_TERMINAL")
-                cursor = conn.execute(f"UPDATE usage_events SET {columns} WHERE event_id=?", (*values.values(), event_id))
-                if cursor.rowcount != 1:
-                    raise UsageLedgerError("USAGE_EVENT_UPDATE_FAILED")
+                row_ownership = (row["usage_run_id"], row["usage_attempt_id"], row["request_group_id"])
+                if row_ownership != ownership_values or (request_kind is not None and row["request_kind"] != request_kind):
+                    raise UsageLedgerError("USAGE_EVENT_ID_COLLISION")
+                raise UsageLedgerError("USAGE_EVENT_STATE_CONFLICT")
         except Exception as error:
             if isinstance(error, UsageLedgerError):
                 raise
@@ -392,7 +500,7 @@ class UsageLedger:
                 if key_slot_unknown:
                     counts["key_slot_unknown"] += 1
             except UsageEventCollision:
-                self._refresh_legacy_dispatch_time(event_id, dispatch_utc)
+                self._refresh_legacy_dispatch_time(event_id, dispatch_utc, call)
                 counts["skipped"] += 1
             except UsageLedgerError:
                 raise
@@ -400,11 +508,36 @@ class UsageLedger:
                 counts["skipped"] += 1
         return counts
 
-    def _refresh_legacy_dispatch_time(self, event_id: str, dispatch_utc: datetime | None) -> None:
+    def _refresh_legacy_dispatch_time(self, event_id: str, dispatch_utc: datetime | None, call: dict) -> None:
         if dispatch_utc is None:
             return
+        expected_event_id = f"legacy:{call.get('call_id') or call.get('desk_id')}:{call.get('lease_sequence')}"
+        if event_id != expected_event_id:
+            raise UsageEventCollision("USAGE_EVENT_ID_COLLISION")
         utc, pacific_ts, pacific_date = pacific_fields(dispatch_utc)
-        self.update_event(event_id, allow_terminal=True, utc_dispatch_ts=utc, pacific_dispatch_ts=pacific_ts, pacific_date=pacific_date)
+        try:
+            with self._connect() as conn:
+                cursor = conn.execute(
+                    """
+                    UPDATE usage_events
+                    SET utc_dispatch_ts=?, pacific_dispatch_ts=?, pacific_date=?, updated_at=?
+                    WHERE event_id=?
+                      AND legacy_imported=1
+                      AND usage_run_id IS NULL
+                      AND usage_attempt_id IS NULL
+                      AND request_group_id IS NULL
+                      AND request_kind='generate_content'
+                      AND call_id IS ?
+                      AND lease_sequence IS ?
+                    """,
+                    (utc, pacific_ts, pacific_date, datetime.now(timezone.utc).isoformat(), event_id, call.get("call_id"), call.get("lease_sequence")),
+                )
+                if cursor.rowcount != 1:
+                    raise UsageEventCollision("USAGE_EVENT_ID_COLLISION")
+        except Exception as error:
+            if isinstance(error, UsageLedgerError):
+                raise
+            raise UsageLedgerError("USAGE_DB_UNAVAILABLE") from error
 
     def _warnings_for_date(self, date: str) -> list[dict]:
         with self._connect() as conn:
@@ -529,18 +662,21 @@ class TokenGate:
         self.counter = counter
         self.usage_run_id = usage_run_id or uuid.uuid4().hex
         self.id_factory = id_factory or (lambda: uuid.uuid4().hex)
+        self._generation_ownership: dict[str, dict[str, str]] = {}
 
     def admit(self, *, client: object, model: str, prompt: str, config: object, key_slot_id: str, call: dict, max_output_tokens: int, output_identity: str | None = None) -> tuple[str, int]:
         usage_attempt_id = self.id_factory()
         request_group_id = f"{self.usage_run_id}:{usage_attempt_id}"
         count_event_id = f"{request_group_id}:count_tokens"
         generation_event_id = f"{request_group_id}:generate_content"
+        count_ownership = {"usage_run_id": self.usage_run_id, "usage_attempt_id": usage_attempt_id, "request_group_id": request_group_id}
+        generation_ownership = dict(count_ownership)
         count_prepared = False
         try:
             self.ledger.prepare_count_tokens(event_id=count_event_id, key_slot_id=key_slot_id, model=model, call=call, output_identity=output_identity, usage_run_id=self.usage_run_id, usage_attempt_id=usage_attempt_id, request_group_id=request_group_id)
             count_prepared = True
-            input_tokens, dispatched = self._count_tokens(count_event_id, client, model, prompt, config)
-            self.ledger.finish_count_tokens(event_id=count_event_id, input_tokens=input_tokens, dispatched=dispatched)
+            input_tokens, dispatched = self._count_tokens(count_event_id, count_ownership, client, model, prompt, config)
+            self.ledger.finish_count_tokens(event_id=count_event_id, input_tokens=input_tokens, dispatched=dispatched, **count_ownership)
             admission = decide_admission(input_tokens, max_output_tokens)
             self.ledger.insert_generation(event_id=generation_event_id, key_slot_id=key_slot_id, model=model, call=call, input_tokens=input_tokens, max_output_tokens=max_output_tokens, admission=admission, output_identity=output_identity, usage_run_id=self.usage_run_id, usage_attempt_id=usage_attempt_id, request_group_id=request_group_id)
         except UsageEventCollision as error:
@@ -550,35 +686,44 @@ class TokenGate:
         except Exception as error:
             if count_prepared:
                 try:
-                    self.ledger.finish_count_tokens(event_id=count_event_id, input_tokens=None, dispatched=bool(getattr(error, "_arc_count_dispatched", False)), error_code="TOKEN_COUNT_UNAVAILABLE")
+                    self.ledger.finish_count_tokens(event_id=count_event_id, input_tokens=None, dispatched=bool(getattr(error, "_arc_count_dispatched", False)), error_code="TOKEN_COUNT_UNAVAILABLE", **count_ownership)
                 except Exception:
                     pass
             raise TokenAdmissionError("TOKEN_COUNT_UNAVAILABLE") from error
         if not admission.allowed:
             raise TokenAdmissionError(admission.reason_code or "TOKEN_ADMISSION_BLOCKED")
+        self._generation_ownership[generation_event_id] = generation_ownership
         return generation_event_id, input_tokens
 
     def mark_dispatched(self, event_id: str) -> None:
-        self.ledger.mark_dispatched(event_id)
+        self.ledger.mark_dispatched(event_id, request_kind="generate_content", **self._generation_ownership.get(event_id, {}))
 
     def finish(self, *, event_id: str, response: object | None, succeeded: bool, error_code: str | None = None) -> None:
         usage = parse_usage_metadata(getattr(response, "usage_metadata", None) if response else None)
-        self.ledger.finish_generation(event_id=event_id, usage=usage, status="SUCCEEDED" if succeeded else "FAILED", error_code=error_code)
+        self.ledger.finish_generation(event_id=event_id, usage=usage, status="SUCCEEDED" if succeeded else "FAILED", error_code=error_code, **self._generation_ownership.get(event_id, {}))
 
-    def _count_tokens(self, event_id: str, client: object, model: str, prompt: str, config: object) -> tuple[int | None, bool]:
+    def _count_tokens(self, event_id: str, ownership: dict[str, str], client: object, model: str, prompt: str, config: object) -> tuple[int, bool]:
         if self.counter:
-            return self.counter(model, prompt, config), False
+            return _require_token_count(self.counter(model, prompt, config), dispatched=False), False
         models = getattr(client, "models", None)
         count_tokens = getattr(models, "count_tokens", None)
         if count_tokens:
-            self.ledger.mark_dispatched(event_id)
+            self.ledger.mark_dispatched(event_id, request_kind="count_tokens", **ownership)
             try:
                 response = count_tokens(model=model, contents=prompt)
             except Exception as error:
                 setattr(error, "_arc_count_dispatched", True)
                 raise
-            return _get_int(response, "total_tokens", "totalTokens"), True
+            return _require_token_count(_get_int(response, "total_tokens", "totalTokens"), dispatched=True), True
         raise TokenAdmissionError("TOKEN_COUNT_UNAVAILABLE")
+
+
+def _require_token_count(value: object, *, dispatched: bool) -> int:
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    error = TokenAdmissionError("TOKEN_COUNT_UNAVAILABLE")
+    setattr(error, "_arc_count_dispatched", dispatched)
+    raise error
 
 
 def _row_dict(row: sqlite3.Row) -> dict:
