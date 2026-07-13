@@ -35,6 +35,10 @@ def build_prompt(stage: str, role: str, payload: dict) -> str:
         instruction = "한국어 산문 한 회차 본문만 작성하세요. 공백 포함 5000~7000자로 작성해 4000~8000자 검증 범위를 안전하게 만족하세요. 설명, 표식, JSON, Markdown, 생성 과정 언급을 포함하지 마세요."
     else:
         instruction = "한국어 수정본 본문만 작성하세요. 공백 포함 5000~7000자로 작성해 4000~8000자 검증 범위를 안전하게 만족하세요. 설명, 표식, JSON, Markdown을 포함하지 마세요."
+    if stage == "writer":
+        instruction += " Write only novel prose. Before answering, silently verify the prose is safely between 5000 and 7000 characters, and never mention the character count or this self-check."
+    elif stage == "revision":
+        instruction += " Write only revised novel prose. Before answering, silently verify the prose is safely between 5000 and 7000 characters, and never mention the character count or this self-check."
     worker_id = f"{stage}-{role}"
     worker_rule = f'Use exactly these keys and no others: {{"worker_id":"{worker_id}","role":"{role}","verdict":"OK","primary_finding":"one concise finding","primary_risk":"one concise risk","evidence_refs":["source:current_episode"],"proposal":{{"role":"{role}"}}}}.'
     conflicts = payload.get("open_conflicts", [])

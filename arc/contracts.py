@@ -18,6 +18,9 @@ class ModelClient(Protocol):
     def generate(self, *, stage: str, role: str, prompt: str) -> str: ...
 
 
+PROSE_FORBIDDEN_MARKERS = ("[?붾㈃]", "[?뚰뼢]", "[移대찓??", "?λ㈃ 1", "?λ㈃ 2", "SCENE 1", "CUT TO:", "```")
+
+
 REQUIRED_FIXTURE_KEYS = {
     "fixture_id", "series_compass", "world_rules", "characters", "confirmed_facts",
     "relationship_state", "open_conflicts", "episode_summaries", "important_excerpts",
@@ -32,6 +35,28 @@ def parse_object(raw: str) -> dict:
         raise ContractError("malformed JSON response") from error
     if not isinstance(value, dict):
         raise ContractError("response must be a JSON object")
+    return value
+
+
+def validate_prose(value: object) -> str:
+    if not isinstance(value, str) or not value.strip() or value.lstrip().startswith(("{", "[")):
+        count = len(value) if isinstance(value, str) else 0
+        error = ContractError("invalid canonical prose", "PROSE_INVALID_SHAPE")
+        error.character_count = count
+        raise error
+    count = len(value)
+    if count < 4000:
+        error = ContractError("canonical prose is too short", "PROSE_TOO_SHORT")
+        error.character_count = count
+        raise error
+    if count > 8000:
+        error = ContractError("canonical prose is too long", "PROSE_TOO_LONG")
+        error.character_count = count
+        raise error
+    if any(marker in value for marker in PROSE_FORBIDDEN_MARKERS):
+        error = ContractError("canonical prose contains forbidden marker", "PROSE_FORBIDDEN_MARKER")
+        error.character_count = count
+        raise error
     return value
 
 

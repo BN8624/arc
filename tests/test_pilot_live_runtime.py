@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from arc.contracts import ContractError, validate_prose
 from arc.live_model import AtomicTelemetryStore, GemmaPoolClient, LiveConfig, MODEL_NAME, RoutingStateStore
 from arc.pipeline import PLANNING_ROLES, MockPipeline, WaveCheckpoint, status
 from arc.pilot_contracts import PILOT_REVIEW_ROLES
@@ -79,13 +80,14 @@ class _PilotProvider:
 
 
 class _PilotProviderRoot:
-    def __init__(self, fail_once_at: str | None = None, hold_episode: str | None = None, fail_status_code: int = 500, hold_dimension: str | None = None, wrong_plan_once: bool = False, wrong_plan_episode: str | None = None):
+    def __init__(self, fail_once_at: str | None = None, hold_episode: str | None = None, fail_status_code: int = 500, hold_dimension: str | None = None, wrong_plan_once: bool = False, wrong_plan_episode: str | None = None, short_writer_once_episode: str | None = None):
         self.fail_once_at = fail_once_at
         self.hold_episode = hold_episode
         self.fail_status_code = fail_status_code
         self.hold_dimension = hold_dimension
         self.wrong_plan_once = wrong_plan_once
         self.wrong_plan_episode = wrong_plan_episode
+        self.short_writer_once_episode = short_writer_once_episode
         self.malformed_once_at: str | None = None
         self.failed: set[str] = set()
         self.malformed: set[str] = set()
@@ -112,6 +114,10 @@ class _PilotProviderRoot:
                 return json.dumps({"episode_id": "wrong_episode", "immediate_objective": "synthetic objective", "obstacle": "synthetic obstacle", "protagonist_action": "synthetic action", "meaningful_change": "synthetic change", "episode_ending": "synthetic ending", "selected_worker_ids": ["planning-event"], "continuity_constraints": ["synthetic constraint"]})
             return json.dumps({"episode_id": episode_id, "immediate_objective": "synthetic objective", "obstacle": "synthetic obstacle", "protagonist_action": "synthetic action", "meaningful_change": "synthetic change", "episode_ending": "synthetic ending", "selected_worker_ids": ["planning-event"], "continuity_constraints": ["synthetic constraint"]})
         if stage == "writer":
+            marker = f"writer:{episode_id}"
+            if self.short_writer_once_episode == episode_id and marker not in self.malformed:
+                self.malformed.add(marker)
+                return "short prose"
             return ("A synthetic live episode sentence. " * 160)[:4800]
         if stage == "review_merge":
             verdict = "HOLD" if episode_id == self.hold_episode else "PASS"
@@ -284,6 +290,14 @@ def _make_reconcilable_pilot_output(tmp_path: Path) -> Path:
     manifest.pop("live_telemetry_checkpoint", None)
     write_json(output / "pilot_manifest.json", manifest)
     assert stale_hash != manifest["artifact_hashes"]["pilot_live_calls.json"]
+    return output
+
+
+def _make_episode_four_writer_error_output(tmp_path: Path) -> Path:
+    output = tmp_path / "pilot-live"
+    client, _ = _pilot_client(output, _PilotProviderRoot(short_writer_once_episode="episode_004"))
+    with pytest.raises(Exception):
+        PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
     return output
 
 
@@ -537,6 +551,83 @@ def test_live_terminal_checkpoint_covers_complete_telemetry(tmp_path):
 
 def test_phase2_live_telemetry_contract_remains_compatible(tmp_path):
     test_phase2_unscoped_telemetry_remains_compatible(tmp_path)
+
+
+def test_validate_prose_accepts_normal_range():
+    assert validate_prose("A" * 4000) == "A" * 4000
+
+
+def test_validate_prose_rejects_short_with_code():
+    with pytest.raises(ContractError) as error:
+        validate_prose("A" * 3999)
+    assert error.value.contract_code == "PROSE_TOO_SHORT"
+    assert error.value.character_count == 3999
+
+
+def test_validate_prose_rejects_long_with_code():
+    with pytest.raises(ContractError) as error:
+        validate_prose("A" * 8001)
+    assert error.value.contract_code == "PROSE_TOO_LONG"
+    assert error.value.character_count == 8001
+
+
+def test_validate_prose_rejects_forbidden_marker_with_code():
+    with pytest.raises(ContractError) as error:
+        validate_prose(("A" * 4100) + "SCENE 1")
+    assert error.value.contract_code == "PROSE_FORBIDDEN_MARKER"
+
+
+def test_validate_prose_rejects_json_shape_with_code():
+    with pytest.raises(ContractError) as error:
+        validate_prose('{"text":"bad"}')
+    assert error.value.contract_code == "PROSE_INVALID_SHAPE"
+
+
+def test_writer_contract_failure_keeps_provider_pass_and_records_code(tmp_path):
+    output = _make_episode_four_writer_error_output(tmp_path)
+    telemetry = read_json(output / "pilot_live_calls.json")
+    event = next(item for item in telemetry["contract_failures"] if item["stage"] == "writer")
+    writer_call = next(call for call in telemetry["calls"] if call["desk_id"] == "episode:episode_004:writer:canonical")
+    manifest = read_json(output / "episodes" / "episode_004" / "manifest.json")
+
+    assert writer_call["status"] == "PASS"
+    assert event["contract_code"] == "PROSE_TOO_SHORT"
+    assert event["character_count"] == len("short prose")
+    assert event["call_id"] == writer_call["call_id"]
+    assert manifest["last_error"]["contract_code"] == "PROSE_TOO_SHORT"
+    assert manifest["last_error"]["character_count"] == len("short prose")
+    assert "short prose" not in json.dumps(telemetry, ensure_ascii=False)
+    assert "short prose" not in json.dumps(manifest, ensure_ascii=False)
+
+
+def test_writer_failure_checkpoint_resumes_from_writer_without_recalling_prefix(tmp_path):
+    output = _make_episode_four_writer_error_output(tmp_path)
+    before = read_json(output / "pilot_live_calls.json")
+    before_episode_counts = {scope: sum(call["scope_id"] == scope for call in before["calls"]) for scope in ["episode:episode_001", "episode:episode_002", "episode:episode_003"]}
+    before_planning = sum(call["desk_id"].startswith("episode:episode_004:planning:") for call in before["calls"])
+    before_merge = [call["attempt"] for call in before["calls"] if call["desk_id"] == "episode:episode_004:planning_merge:merge"]
+
+    result, provider_root = _resume_episode_four_output(output)
+    after = read_json(output / "pilot_live_calls.json")
+    resumed = [(_episode_from_prompt(prompt), marker) for _, marker, prompt in provider_root.provider_calls]
+    writer_attempts = [call["attempt"] for call in after["calls"] if call["desk_id"] == "episode:episode_004:writer:canonical"]
+
+    assert result["manifest"]["status"] == "COMPLETE"
+    assert resumed[0] == ("episode_004", "writer:canonical")
+    assert {scope: sum(call["scope_id"] == scope for call in after["calls"]) for scope in before_episode_counts} == before_episode_counts
+    assert sum(call["desk_id"].startswith("episode:episode_004:planning:") for call in after["calls"]) == before_planning
+    assert [call["attempt"] for call in after["calls"] if call["desk_id"] == "episode:episode_004:planning_merge:merge"] == before_merge
+    assert writer_attempts == [1, 2]
+    assert read_json(output / "episodes" / "episode_004" / "manifest.json")["writer_call_count"] == 1
+
+
+def test_writer_prompt_reinforces_safe_character_band():
+    from arc.prompts import build_prompt
+
+    prompt = build_prompt("writer", "canonical", {"context": {}, "plan": {}})
+
+    assert "5000 and 7000 characters" in prompt
+    assert "never mention the character count" in prompt
 
 
 def test_pilot_live_status_reports_valid_checkpoint_without_writes(tmp_path):

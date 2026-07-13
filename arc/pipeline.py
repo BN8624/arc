@@ -7,7 +7,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from .contracts import ContractError, ModelClient, apply_conflict_selectors, apply_memory_update, parse_object, validate_fixture, validate_memory, validate_plan, validate_review, validate_worker
+from .contracts import ContractError, ModelClient, apply_conflict_selectors, apply_memory_update, parse_object, validate_fixture, validate_memory, validate_plan, validate_prose, validate_review, validate_worker
 from .storage import StorageError, read_json, sha256_bytes, sha256_file, verify_artifacts, write_json, write_text
 
 PLANNING_ROLES = ["event", "protagonist_action", "relationship", "continuity", "readability_weight", "reader_payoff"]
@@ -128,8 +128,6 @@ class MockPipeline:
         plan = read_json(run_dir / "episode_plan.json")
         if "DRAFT_COMPLETED" not in manifest["completed_stages"]:
             text = self._prose("writer", {"context": context, "plan": plan})
-            if not isinstance(text, str) or not text.strip() or text.lstrip().startswith(("{", "[")):
-                raise ContractError("invalid canonical draft")
             manifest["writer_call_count"] += 1
             self._commit(run_dir, manifest, "draft.md", text, "DRAFT_COMPLETED", text=True)
         draft = (run_dir / "draft.md").read_text(encoding="utf-8")
@@ -153,8 +151,6 @@ class MockPipeline:
             return
         if decision["verdict"] == "REVISE_ONCE" and "REVISION_COMPLETED" not in manifest["completed_stages"]:
             text = self._prose("revision", {"context": context, "plan": plan, "draft": draft, "decision": decision})
-            if not isinstance(text, str) or not text.strip():
-                raise ContractError("invalid revision")
             manifest["revision_count"] = 1
             self._commit(run_dir, manifest, "revised.md", text, "REVISION_COMPLETED", text=True)
         if "FINALIZED" not in manifest["completed_stages"]:
@@ -228,6 +224,12 @@ class MockPipeline:
     def _prose(self, stage: str, payload: dict) -> str:
         raw = self._request(stage, "canonical", payload)
         text = raw if self.mode == "live" else parse_object(raw).get("text")
+        if self.mode == "live":
+            try:
+                return validate_prose(text)
+            except ContractError as error:
+                self.client.record_contract_failure(stage, "canonical", contract_code=error.contract_code, character_count=getattr(error, "character_count", None))
+                raise
         if not isinstance(text, str) or not text.strip() or text.lstrip().startswith(("{", "[")):
             raise ContractError("invalid canonical prose")
         if self.mode == "live" and (not 4000 <= len(text) <= 8000 or any(marker in text for marker in ("[화면]", "[음향]", "[카메라]", "장면 1", "장면 2", "SCENE 1", "CUT TO:", "```"))):
@@ -266,8 +268,16 @@ class MockPipeline:
             return {"error_class": error.error_class, "stage": error.stage, "role": error.role, "key_slot": error.slot, "http_status": error.http_status, "provider_code": error.provider_code, "message": "sanitized provider failure"}
         if isinstance(error, ContractError) and error.contract_code:
             telemetry = self.client.telemetry() if hasattr(self.client, "telemetry") else {"contract_failures": []}
-            event = next((item for item in reversed(telemetry.get("contract_failures", [])) if item.get("stage") == "planning_merge" and item.get("role") == "merge" and item.get("contract_code") == error.contract_code), {})
-            return {"error_class": "CONTRACT_ERROR", "stage": "planning_merge", "role": "merge", "contract_code": error.contract_code, "key_slot": event.get("key_slot", "UNKNOWN"), "http_status": None, "provider_code": None, "message": "sanitized planning merge contract failure"}
+            event = next((item for item in reversed(telemetry.get("contract_failures", [])) if item.get("contract_code") == error.contract_code), {})
+            stage = event.get("stage") or ("planning_merge" if str(error.contract_code).startswith("PLAN_") else None)
+            role = event.get("role") or ("merge" if stage == "planning_merge" else None)
+            message = "sanitized planning merge contract failure" if stage == "planning_merge" else "sanitized prose contract failure" if stage in {"writer", "revision"} else "sanitized contract failure"
+            record = {"error_class": "CONTRACT_ERROR", "stage": stage, "role": role, "contract_code": error.contract_code, "key_slot": event.get("key_slot", "UNKNOWN"), "http_status": None, "provider_code": None, "message": message}
+            if "character_count" in event:
+                record["character_count"] = event["character_count"]
+            if stage in {"writer", "revision"} and event.get("call_id"):
+                record["call_id"] = event["call_id"]
+            return record
         return str(error)
 
     def _commit(self, run_dir: Path, manifest: dict, filename: str, value: dict | list | str, stage: str, text: bool = False) -> None:

@@ -256,8 +256,8 @@ class ScopedGemmaPoolClient:
         if invalid:
             raise ValueError(f"telemetry projection contains calls outside {self.scope_id}: {invalid[:3]}")
 
-    def record_contract_failure(self, stage: str, role: str, slot: str | None = None, contract_code: str | None = None) -> None:
-        self.base.record_contract_failure(stage, role, slot, contract_code=contract_code, scope_id=self.scope_id)
+    def record_contract_failure(self, stage: str, role: str, slot: str | None = None, contract_code: str | None = None, character_count: int | None = None) -> None:
+        self.base.record_contract_failure(stage, role, slot, contract_code=contract_code, scope_id=self.scope_id, character_count=character_count)
 
     def close(self) -> None:
         return None
@@ -365,12 +365,15 @@ class GemmaPoolClient:
             self.contract_failures = list(telemetry.get("contract_failures", []))
             self.max_active_by_stage = dict(telemetry.get("max_active_by_stage", {}))
 
-    def record_contract_failure(self, stage: str, role: str, slot: str | None = None, contract_code: str | None = None, scope_id: str | None = None) -> None:
+    def record_contract_failure(self, stage: str, role: str, slot: str | None = None, contract_code: str | None = None, scope_id: str | None = None, character_count: int | None = None) -> None:
         now = datetime.now(timezone.utc).isoformat()
         with self._lock:
             recent = next((call for call in reversed(self.calls) if call.get("scope_id") == scope_id and call["stage"] == stage and call["role"] == role), None)
             key_slot = slot or (recent or {}).get("key_slot") or "UNKNOWN"
-            event = {"event_id": f"CF{len(self.contract_failures)+1:03d}", "scope_id": scope_id, "desk_id": (recent or {}).get("desk_id", f"{stage}:{role}"), "stage": stage, "role": role, "key_slot": key_slot, "call_id": (recent or {}).get("call_id"), "contract_code": contract_code, "error_class": "CONTRACT_ERROR", "created_at": now, "message": "sanitized planning merge contract failure" if stage == "planning_merge" else "sanitized contract failure"}
+            message = "sanitized planning merge contract failure" if stage == "planning_merge" else "sanitized prose contract failure" if stage in {"writer", "revision"} else "sanitized contract failure"
+            event = {"event_id": f"CF{len(self.contract_failures)+1:03d}", "scope_id": scope_id, "desk_id": (recent or {}).get("desk_id", f"{stage}:{role}"), "stage": stage, "role": role, "key_slot": key_slot, "call_id": (recent or {}).get("call_id"), "contract_code": contract_code, "error_class": "CONTRACT_ERROR", "created_at": now, "message": message}
+            if character_count is not None:
+                event["character_count"] = character_count
             duplicate = any(item.get("call_id") == event["call_id"] and item.get("contract_code") == contract_code and item.get("stage") == stage and item.get("role") == role and item.get("scope_id") == scope_id for item in self.contract_failures)
             if duplicate:
                 return
