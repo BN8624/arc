@@ -114,7 +114,12 @@ class MockPipeline:
             (run_dir / "planning_workers.partial.json").unlink(missing_ok=True)
         planning = read_json(run_dir / "planning_workers.json")
         if "PLAN_MERGED" not in manifest["completed_stages"]:
-            value = validate_plan(parse_object(self._request("planning_merge", "merge", {"episode_id": manifest["episode_id"], "context": context, "workers": planning})), manifest["episode_id"], {worker["worker_id"] for worker in planning})
+            try:
+                value = validate_plan(parse_object(self._request("planning_merge", "merge", {"episode_id": manifest["episode_id"], "context": context, "workers": planning})), manifest["episode_id"], {worker["worker_id"] for worker in planning})
+            except ContractError as error:
+                if self.mode == "live":
+                    self.client.record_contract_failure("planning_merge", "merge", contract_code=error.contract_code)
+                raise
             self._commit(run_dir, manifest, "episode_plan.json", value, "PLAN_MERGED")
         plan = read_json(run_dir / "episode_plan.json")
         if "DRAFT_COMPLETED" not in manifest["completed_stages"]:
@@ -255,6 +260,10 @@ class MockPipeline:
     def _error_record(self, error: Exception) -> dict | str:
         if hasattr(error, "error_class"):
             return {"error_class": error.error_class, "stage": error.stage, "role": error.role, "key_slot": error.slot, "http_status": error.http_status, "provider_code": error.provider_code, "message": "sanitized provider failure"}
+        if isinstance(error, ContractError) and error.contract_code:
+            telemetry = self.client.telemetry() if hasattr(self.client, "telemetry") else {"contract_failures": []}
+            event = next((item for item in reversed(telemetry.get("contract_failures", [])) if item.get("stage") == "planning_merge" and item.get("role") == "merge" and item.get("contract_code") == error.contract_code), {})
+            return {"error_class": "CONTRACT_ERROR", "stage": "planning_merge", "role": "merge", "contract_code": error.contract_code, "key_slot": event.get("key_slot", "UNKNOWN"), "http_status": None, "provider_code": None, "message": "sanitized planning merge contract failure"}
         return str(error)
 
     def _commit(self, run_dir: Path, manifest: dict, filename: str, value: dict | list | str, stage: str, text: bool = False) -> None:

@@ -49,7 +49,13 @@ class PilotPipeline:
             self._advance(fixture, run_dir, manifest)
         except Exception as error:
             manifest["status"] = "ERROR"
-            manifest["last_error"] = str(error)
+            if self.mode == "live":
+                active = manifest.get("active_episode_id")
+                child = read_json(run_dir / "episodes" / active / "manifest.json") if active and (run_dir / "episodes" / active / "manifest.json").exists() else {}
+                child_error = child.get("last_error") if isinstance(child.get("last_error"), dict) else None
+                manifest["last_error"] = {"error_class": (child_error or {}).get("error_class", "CONTRACT_ERROR" if isinstance(error, ContractError) else "PIPELINE_ERROR"), "active_episode_id": active, "stage": (child_error or {}).get("stage"), "role": (child_error or {}).get("role"), "contract_code": (child_error or {}).get("contract_code"), "message": "sanitized child episode failure"}
+            else:
+                manifest["last_error"] = str(error)
             self._save_manifest(run_dir, manifest)
             raise
         return {"no_op": False, "manifest": manifest}
@@ -68,6 +74,8 @@ class PilotPipeline:
             episode_dir = run_dir / "episodes" / episode_id
             if episode_id not in manifest["completed_episodes"]:
                 if self.mode == "live":
+                    manifest["active_episode_id"] = episode_id
+                    self._save_manifest(run_dir, manifest)
                     MockPipeline(self._episode_client(episode_id, index), mode="live").run(source_path, episode_dir, None)
                     self._save_pilot_live_calls(run_dir, manifest)
                 else:

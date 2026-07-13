@@ -256,8 +256,8 @@ class ScopedGemmaPoolClient:
         if invalid:
             raise ValueError(f"telemetry projection contains calls outside {self.scope_id}: {invalid[:3]}")
 
-    def record_contract_failure(self, stage: str, role: str, slot: str) -> None:
-        self.base.record_contract_failure(stage, role, slot, scope_id=self.scope_id)
+    def record_contract_failure(self, stage: str, role: str, slot: str | None = None, contract_code: str | None = None) -> None:
+        self.base.record_contract_failure(stage, role, slot, contract_code=contract_code, scope_id=self.scope_id)
 
     def close(self) -> None:
         return None
@@ -365,10 +365,16 @@ class GemmaPoolClient:
             self.contract_failures = list(telemetry.get("contract_failures", []))
             self.max_active_by_stage = dict(telemetry.get("max_active_by_stage", {}))
 
-    def record_contract_failure(self, stage: str, role: str, slot: str, scope_id: str | None = None) -> None:
+    def record_contract_failure(self, stage: str, role: str, slot: str | None = None, contract_code: str | None = None, scope_id: str | None = None) -> None:
         now = datetime.now(timezone.utc).isoformat()
         with self._lock:
-            self.contract_failures.append({"event_id": f"CF{len(self.contract_failures)+1:03d}", "scope_id": scope_id, "stage": stage, "role": role, "key_slot": slot, "error_class": "CONTRACT_ERROR", "created_at": now, "message": "sanitized contract failure"})
+            recent = next((call for call in reversed(self.calls) if call.get("scope_id") == scope_id and call["stage"] == stage and call["role"] == role), None)
+            key_slot = slot or (recent or {}).get("key_slot") or "UNKNOWN"
+            event = {"event_id": f"CF{len(self.contract_failures)+1:03d}", "scope_id": scope_id, "desk_id": (recent or {}).get("desk_id", f"{stage}:{role}"), "stage": stage, "role": role, "key_slot": key_slot, "call_id": (recent or {}).get("call_id"), "contract_code": contract_code, "error_class": "CONTRACT_ERROR", "created_at": now, "message": "sanitized planning merge contract failure" if stage == "planning_merge" else "sanitized contract failure"}
+            duplicate = any(item.get("call_id") == event["call_id"] and item.get("contract_code") == contract_code and item.get("stage") == stage and item.get("role") == role and item.get("scope_id") == scope_id for item in self.contract_failures)
+            if duplicate:
+                return
+            self.contract_failures.append(event)
             if self._telemetry_sink:
                 self._telemetry_sink(self._telemetry_snapshot())
 

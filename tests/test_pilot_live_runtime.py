@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from arc.live_model import AtomicTelemetryStore, GemmaPoolClient, LiveConfig, MODEL_NAME, RoutingStateStore
-from arc.pipeline import PLANNING_ROLES, WaveCheckpoint
+from arc.pipeline import PLANNING_ROLES, MockPipeline, WaveCheckpoint, status
 from arc.pilot_contracts import PILOT_REVIEW_ROLES
 from arc.pilot import PilotPipeline
 from arc.storage import StorageError, read_json, write_json
@@ -79,11 +79,12 @@ class _PilotProvider:
 
 
 class _PilotProviderRoot:
-    def __init__(self, fail_once_at: str | None = None, hold_episode: str | None = None, fail_status_code: int = 500, hold_dimension: str | None = None):
+    def __init__(self, fail_once_at: str | None = None, hold_episode: str | None = None, fail_status_code: int = 500, hold_dimension: str | None = None, wrong_plan_once: bool = False):
         self.fail_once_at = fail_once_at
         self.hold_episode = hold_episode
         self.fail_status_code = fail_status_code
         self.hold_dimension = hold_dimension
+        self.wrong_plan_once = wrong_plan_once
         self.malformed_once_at: str | None = None
         self.failed: set[str] = set()
         self.malformed: set[str] = set()
@@ -105,6 +106,9 @@ class _PilotProviderRoot:
             hold = role == self.hold_dimension
             return json.dumps({"worker_id": f"pilot_review-{role}", "role": role, "verdict": "OK", "primary_finding": f"synthetic {role} finding", "primary_risk": f"synthetic {role} risk", "evidence_refs": ["pilot_evidence_packet.json"], "proposal": {"dimension_result": "HOLD" if hold else "PASS", "critical_finding": f"synthetic {role} hold" if hold else None}})
         if stage == "planning_merge":
+            if self.wrong_plan_once and "planning_merge:merge" not in self.malformed:
+                self.malformed.add("planning_merge:merge")
+                return json.dumps({"episode_id": "wrong_episode", "immediate_objective": "synthetic objective", "obstacle": "synthetic obstacle", "protagonist_action": "synthetic action", "meaningful_change": "synthetic change", "episode_ending": "synthetic ending", "selected_worker_ids": ["planning-event"], "continuity_constraints": ["synthetic constraint"]})
             return json.dumps({"episode_id": episode_id, "immediate_objective": "synthetic objective", "obstacle": "synthetic obstacle", "protagonist_action": "synthetic action", "meaningful_change": "synthetic change", "episode_ending": "synthetic ending", "selected_worker_ids": ["planning-event"], "continuity_constraints": ["synthetic constraint"]})
         if stage == "writer":
             return ("A synthetic live episode sentence. " * 160)[:4800]
@@ -244,6 +248,22 @@ def _make_acceptance_partial_output(tmp_path: Path) -> Path:
     manifest["artifact_hashes"]["pilot_live_calls.json"] = root_hash
     write_json(output / "pilot_manifest.json", manifest)
     return output
+
+
+def _run_planning_merge_contract_failure(tmp_path: Path):
+    output = tmp_path / "episode"
+    root = _PilotProviderRoot(wrong_plan_once=True)
+    client, _ = _pilot_client(tmp_path / "runtime", root)
+    scoped = client.scope(scope_id="episode:episode_004", logical_order_base=300)
+    with pytest.raises(Exception):
+        MockPipeline(scoped, mode="live").run(Path("tests/fixtures/synthetic_work.json"), output, None)
+    telemetry = read_json(output / "live_calls.json")
+    manifest = read_json(output / "manifest.json")
+    return output, root, telemetry, manifest
+
+
+def _planning_merge_contract_event(telemetry: dict) -> dict:
+    return next(item for item in telemetry["contract_failures"] if item["stage"] == "planning_merge")
 
 
 def test_scoped_clients_share_one_dynamic_key_pool(tmp_path):
@@ -462,6 +482,79 @@ def test_live_pilot_interrupted_episode_rejects_root_projection_mismatch(tmp_pat
     fresh_client, _ = _pilot_client(output)
     with pytest.raises(StorageError, match="telemetry projection mismatch"):
         PilotPipeline(fresh_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+
+
+def test_planning_merge_contract_failure_keeps_provider_call_pass(tmp_path):
+    _, _, telemetry, _ = _run_planning_merge_contract_failure(tmp_path)
+    call = next(call for call in telemetry["calls"] if call["stage"] == "planning_merge")
+    assert call["status"] == "PASS"
+    assert call["error_class"] is None
+
+
+def test_planning_merge_contract_failure_records_contract_event(tmp_path):
+    _, _, telemetry, _ = _run_planning_merge_contract_failure(tmp_path)
+    event = _planning_merge_contract_event(telemetry)
+    assert event["error_class"] == "CONTRACT_ERROR"
+    assert event["stage"] == "planning_merge"
+    assert event["role"] == "merge"
+
+
+def test_planning_merge_contract_failure_uses_actual_key_slot(tmp_path):
+    _, _, telemetry, _ = _run_planning_merge_contract_failure(tmp_path)
+    call = next(call for call in telemetry["calls"] if call["stage"] == "planning_merge")
+    event = _planning_merge_contract_event(telemetry)
+    assert event["key_slot"] == call["key_slot"]
+    assert event["key_slot"] != "UNKNOWN"
+
+
+def test_planning_merge_contract_failure_records_contract_code(tmp_path):
+    _, _, telemetry, manifest = _run_planning_merge_contract_failure(tmp_path)
+    event = _planning_merge_contract_event(telemetry)
+    assert event["contract_code"] == "PLAN_EPISODE_ID_MISMATCH"
+    assert manifest["last_error"]["contract_code"] == "PLAN_EPISODE_ID_MISMATCH"
+
+
+def test_planning_merge_contract_failure_has_no_raw_response(tmp_path):
+    output, _, telemetry, _ = _run_planning_merge_contract_failure(tmp_path)
+    serialized = json.dumps(telemetry, ensure_ascii=False)
+    assert "wrong_episode" not in serialized
+    assert "raw_response" not in serialized
+    assert not (output / "episode_plan.json").exists()
+
+
+def test_planning_merge_contract_failure_writes_structured_episode_error(tmp_path):
+    _, _, _, manifest = _run_planning_merge_contract_failure(tmp_path)
+    assert manifest["status"] == "ERROR"
+    assert manifest["last_error"] == {"error_class": "CONTRACT_ERROR", "stage": "planning_merge", "role": "merge", "contract_code": "PLAN_EPISODE_ID_MISMATCH", "key_slot": manifest["last_error"]["key_slot"], "http_status": None, "provider_code": None, "message": "sanitized planning merge contract failure"}
+
+
+def test_planning_merge_contract_failure_writes_structured_pilot_error(tmp_path):
+    output = tmp_path / "pilot-live"
+    client, _ = _pilot_client(output, _PilotProviderRoot(wrong_plan_once=True))
+    with pytest.raises(Exception):
+        PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    manifest = read_json(output / "pilot_manifest.json")
+    assert manifest["status"] == "ERROR"
+    assert manifest["last_error"]["error_class"] == "CONTRACT_ERROR"
+    assert manifest["last_error"]["stage"] == "planning_merge"
+    assert manifest["last_error"]["contract_code"] == "PLAN_EPISODE_ID_MISMATCH"
+
+
+def test_status_does_not_duplicate_contract_failure(tmp_path):
+    output, _, telemetry, _ = _run_planning_merge_contract_failure(tmp_path)
+    before = len(telemetry["contract_failures"])
+    status(output)
+    after = len(read_json(output / "live_calls.json")["contract_failures"])
+    assert after == before
+
+
+def test_restored_telemetry_keeps_contract_failure_event_ids_unique(tmp_path):
+    _, _, telemetry, _ = _run_planning_merge_contract_failure(tmp_path)
+    client, _ = _client(tmp_path / "restore")
+    client.restore_telemetry(telemetry)
+    client.record_contract_failure("planning_merge", "merge", contract_code="PLAN_FIELDS_MISMATCH")
+    event_ids = [event["event_id"] for event in client.telemetry()["contract_failures"]]
+    assert len(event_ids) == len(set(event_ids))
 
 
 def test_live_pilot_rejects_root_and_episode_telemetry_mismatch(tmp_path):
