@@ -12,6 +12,7 @@ from .mock_model import MockModelClient
 from .pipeline import MockPipeline, status
 from .pilot import PilotPipeline, pilot_status, reconcile_pilot_checkpoint
 from .storage import write_json
+from .usage import UsageLedger, usage_db_path
 
 
 def classify_preflight(results: list[dict]) -> dict:
@@ -112,6 +113,14 @@ def main() -> None:
     pilot_live_reconcile = commands.add_parser("pilot-live-reconcile")
     pilot_live_reconcile.add_argument("fixture", type=Path)
     pilot_live_reconcile.add_argument("--output", type=Path, required=True)
+    usage = commands.add_parser("usage")
+    usage_commands = usage.add_subparsers(dest="usage_command", required=True)
+    usage_status = usage_commands.add_parser("status")
+    usage_status.add_argument("--date")
+    usage_status.add_argument("--json", action="store_true")
+    usage_import = usage_commands.add_parser("import-pilot")
+    usage_import.add_argument("--output", type=Path, required=True)
+    usage_check = usage_commands.add_parser("db-check")
     args = parser.parse_args()
     if args.command == "mock-run":
         result = MockPipeline(MockModelClient(args.scenario)).run(args.fixture, args.output, args.scenario)
@@ -147,5 +156,23 @@ def main() -> None:
         print(json.dumps(pilot_status(args.output), ensure_ascii=False))
     elif args.command == "pilot-live-reconcile":
         print(json.dumps(reconcile_pilot_checkpoint(args.fixture, args.output), ensure_ascii=False))
+    elif args.command == "usage":
+        ledger = UsageLedger(usage_db_path())
+        if args.usage_command == "status":
+            document = ledger.status(args.date)
+            if args.json:
+                print(json.dumps(document, ensure_ascii=False))
+            else:
+                totals = document["totals"]
+                print(f"Pacific date: {document['pacific_date']}")
+                print(f"DB: {ledger.path}")
+                print(f"provider_requests={totals['provider_requests']} generation_requests={totals['generation_requests']} count_token_requests={totals['count_token_requests']} blocked={totals['blocked_count']}")
+                print(f"input_tokens={totals['actual_input_tokens']} candidate_tokens={totals['candidate_tokens']} reasoning_tokens={totals['reasoning_tokens']} output_tokens={totals['combined_output_tokens']} provider_total_tokens={totals['provider_total_tokens']}")
+                for row in document["keys"]:
+                    print(f"{row['key_slot_id']} provider_requests={row['provider_requests']} generation_requests={row['generation_requests']} count_token_requests={row['count_token_requests']} blocked={row['blocked_count']} output_tokens={row['combined_output_tokens']}")
+        elif args.usage_command == "import-pilot":
+            print(json.dumps(ledger.import_pilot(args.output), ensure_ascii=False))
+        elif args.usage_command == "db-check":
+            print(json.dumps({"path": str(ledger.path), "schema_version": ledger.schema_version(), "status": "OK"}, ensure_ascii=False))
     else:
         print(json.dumps(status(args.output), ensure_ascii=False))

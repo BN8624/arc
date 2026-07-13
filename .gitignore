@@ -3,3 +3,7 @@ __pycache__/
 *.egg-info/
 .env
 .tmp/
+.arc/
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal

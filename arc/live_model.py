@@ -264,9 +264,14 @@ class ScopedGemmaPoolClient:
 
 
 class GemmaPoolClient:
-    def __init__(self, config: LiveConfig, client_factory: Callable[[str], object] | None = None, state_store: RoutingStateStore | None = None, telemetry_sink: Callable[[dict], None] | None = None):
+    def __init__(self, config: LiveConfig, client_factory: Callable[[str], object] | None = None, state_store: RoutingStateStore | None = None, telemetry_sink: Callable[[dict], None] | None = None, usage_gate: object | None = None):
         self.config, self._lock, self.calls = config, threading.Lock(), []
         self._telemetry_sink = telemetry_sink
+        uses_real_provider = client_factory is None
+        if usage_gate is None and uses_real_provider:
+            from .usage import TokenGate, UsageLedger
+            usage_gate = TokenGate(UsageLedger())
+        self.usage_gate = usage_gate
         self.pacer = LaunchPacer(config.launch_interval)
         self.pool = DynamicKeyPool(list(config.keys), state_store=state_store)
         self.contract_failures: list[dict] = []
@@ -310,18 +315,30 @@ class GemmaPoolClient:
     def _invoke(self, slot: str, desk: LogicalDesk, prompt: str, lease_sequence: int | None = None) -> str:
         started, tick = datetime.now(timezone.utc), time.perf_counter()
         stage, role, logical_order = desk.stage, desk.role, desk.logical_order
+        generation_event_id = None
+        response = None
         with self._lock:
             attempt = 1 + sum(call.get("desk_id", f"{call['stage']}:{call['role']}") == desk.desk_id for call in self.calls)
             reservation = {"call_id": f"L{logical_order:03d}-A{attempt:03d}", "scope_id": desk.scope_id, "desk_id": desk.desk_id, "logical_order": logical_order, "attempt": attempt, "lease_sequence": lease_sequence}
             self.active_by_stage[stage] = self.active_by_stage.get(stage, 0) + 1
             self.max_active_by_stage[stage] = max(self.max_active_by_stage.get(stage, 0), self.active_by_stage[stage])
         try:
+            config = self._generation_config(stage)
+            call = {**reservation, "stage": stage, "role": role}
+            if self.usage_gate:
+                generation_event_id, _ = self.usage_gate.admit(client=self._clients[slot], model=self.config.model, prompt=prompt, config=config, key_slot_id=slot, call=call, max_output_tokens=self._max_output_tokens(stage))
             launch_sequence, scheduled, provider_start = self.pacer.wait()
-            response = self._clients[slot].models.generate_content(model=self.config.model, contents=prompt, config=self._generation_config(stage))
+            if self.usage_gate and generation_event_id:
+                self.usage_gate.mark_dispatched(generation_event_id)
+            response = self._clients[slot].models.generate_content(model=self.config.model, contents=prompt, config=config)
             text = getattr(response, "text", None)
             if not isinstance(text, str) or not text.strip():
+                if self.usage_gate and generation_event_id:
+                    self.usage_gate.finish(event_id=generation_event_id, response=response, succeeded=False, error_code="EMPTY_RESPONSE")
                 self._append(stage, role, slot, "FAIL", started, tick, prompt, "", response, "EMPTY_RESPONSE", None, reservation, launch_sequence, scheduled, provider_start)
                 raise LiveCallError("EMPTY_RESPONSE", stage, role, slot, "provider returned no usable text")
+            if self.usage_gate and generation_event_id:
+                self.usage_gate.finish(event_id=generation_event_id, response=response, succeeded=True)
             self._append(stage, role, slot, "PASS", started, tick, prompt, text, response, reservation=reservation, launch_sequence=launch_sequence, scheduled=scheduled, provider_start=provider_start)
             return text
         except LiveCallError:
@@ -329,7 +346,12 @@ class GemmaPoolClient:
         except Exception as error:
             status = getattr(error, "status_code", None) or getattr(error, "code", None)
             mapping = {400: "INVALID_REQUEST", 401: "AUTH_ERROR", 403: "PERMISSION_ERROR", 404: "MODEL_NOT_FOUND", 408: "TIMEOUT", 429: "RATE_LIMITED"}
-            error_class = mapping.get(status, "PROVIDER_5XX" if isinstance(status, int) and status >= 500 else "TIMEOUT" if isinstance(error, (TimeoutError, socket.timeout)) else "NETWORK_ERROR" if isinstance(error, ConnectionError) else "UNKNOWN_PROVIDER_ERROR")
+            if error.__class__.__name__ in {"TokenAdmissionError", "UsageLedgerError"} and getattr(error, "args", None):
+                error_class = str(error.args[0])
+            else:
+                error_class = mapping.get(status, "PROVIDER_5XX" if isinstance(status, int) and status >= 500 else "TIMEOUT" if isinstance(error, (TimeoutError, socket.timeout)) else "NETWORK_ERROR" if isinstance(error, ConnectionError) else "UNKNOWN_PROVIDER_ERROR")
+            if self.usage_gate and generation_event_id:
+                self.usage_gate.finish(event_id=generation_event_id, response=response, succeeded=False, error_code=error_class)
             self._append(stage, role, slot, "FAIL", started, tick, prompt, "", None, error_class, status if isinstance(status, int) else None, reservation, locals().get("launch_sequence"), locals().get("scheduled"), locals().get("provider_start"))
             raise LiveCallError(error_class, stage, role, slot, "provider request failed", status if isinstance(status, int) else None) from None
         finally:
@@ -341,6 +363,9 @@ class GemmaPoolClient:
         if stage not in {"writer", "revision"}:
             values["responseMimeType"] = "application/json"
         return self._types.GenerateContentConfig(**values) if self._types else values
+
+    def _max_output_tokens(self, stage: str) -> int:
+        return self.config.prose_limit if stage in {"writer", "revision"} else self.config.json_limit
 
     def _append(self, stage: str, role: str, slot: str, status: str, started: datetime, tick: float, prompt: str, text: str, response: object | None, error_class: str | None = None, http_status: int | None = None, reservation: dict | None = None, launch_sequence: int | None = None, scheduled: float | None = None, provider_start: float | None = None) -> None:
         usage = getattr(response, "usage_metadata", None) if response else None
