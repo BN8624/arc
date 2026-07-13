@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import sqlite3
 import threading
@@ -562,73 +563,310 @@ class UsageLedger:
         return conn
 
 
+def _database_fingerprint(conn: sqlite3.Connection, path: Path) -> dict:
+    conn.row_factory = sqlite3.Row
+    integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+    if integrity != "ok":
+        raise UsageLedgerError("USAGE_DB_INTEGRITY_FAILED")
+    tables = []
+    for table in ("schema_version", "usage_events"):
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone() is None:
+            raise UsageLedgerError("USAGE_DB_SCHEMA_INVALID")
+        columns = [
+            {"name": row["name"], "type": row["type"], "notnull": row["notnull"], "default": row["dflt_value"], "pk": row["pk"]}
+            for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        ]
+        tables.append({"name": table, "columns": columns})
+    version_rows = [row[0] for row in conn.execute("SELECT version FROM schema_version ORDER BY rowid").fetchall()]
+    if len(version_rows) != 1 or not isinstance(version_rows[0], int):
+        raise UsageLedgerError("USAGE_DB_SCHEMA_INVALID")
+    usage_columns = [item["name"] for item in tables[1]["columns"]]
+    rows = [list(row) for row in conn.execute(f"SELECT {','.join(usage_columns)} FROM usage_events ORDER BY event_id").fetchall()]
+    payload = json.dumps({"schema_version_rows": version_rows, "core_schema": tables, "usage_rows": rows}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return {
+        "path": str(path.resolve()),
+        "schema_version": version_rows[0],
+        "row_count": len(rows),
+        "core_schema": tables,
+        "content_sha256": hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+        "integrity_check": integrity,
+    }
+
+
+def _fingerprints_match(left: dict, right: dict) -> bool:
+    keys = ("schema_version", "row_count", "core_schema", "content_sha256")
+    return all(left[key] == right[key] for key in keys)
+
+
+def _read_only_connection(path: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=5000")
+    return conn
+
+
 def backup_usage_db(source: Path | None = None, destination: Path | None = None) -> dict:
-    source = source or usage_db_path()
+    source = Path(source or usage_db_path())
+    if not source.exists():
+        raise UsageLedgerError("USAGE_DB_NOT_FOUND")
+    if not source.is_file():
+        raise UsageLedgerError("USAGE_DB_NOT_FILE")
     if destination is None:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         destination = source.with_name(f"{source.stem}.backup-{stamp}{source.suffix}")
+    destination = Path(destination)
+    source_resolved = source.resolve()
+    destination_resolved = destination.resolve()
+    if source_resolved == destination_resolved or (destination.exists() and os.path.samefile(source, destination)):
+        raise UsageLedgerError("USAGE_BACKUP_SOURCE_DESTINATION_SAME")
     if destination.exists():
         raise UsageLedgerError("USAGE_BACKUP_EXISTS")
     destination.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(source) as src, sqlite3.connect(destination) as dst:
-        src.backup(dst)
-    with sqlite3.connect(destination) as conn:
-        integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
-    if integrity != "ok":
-        raise UsageLedgerError("USAGE_BACKUP_INTEGRITY_FAILED")
-    return {"source": str(source), "backup": str(destination), "integrity_check": integrity}
+    try:
+        with _read_only_connection(source_resolved) as src, sqlite3.connect(destination) as dst:
+            dst.row_factory = sqlite3.Row
+            src.backup(dst)
+            source_fingerprint = _database_fingerprint(src, source_resolved)
+            backup_fingerprint = _database_fingerprint(dst, destination_resolved)
+        if not _fingerprints_match(source_fingerprint, backup_fingerprint):
+            raise UsageLedgerError("USAGE_BACKUP_FINGERPRINT_MISMATCH")
+    except Exception as error:
+        if isinstance(error, UsageLedgerError):
+            raise
+        raise UsageLedgerError("USAGE_BACKUP_FAILED") from error
+    created_at = datetime.now(timezone.utc).isoformat()
+    return {
+        "source": str(source),
+        "backup": str(destination),
+        "backup_created_at": created_at,
+        "integrity_check": backup_fingerprint["integrity_check"],
+        "source_fingerprint": source_fingerprint,
+        "backup_fingerprint": backup_fingerprint,
+    }
+
+
+def _known_collision_repair(provenance: object) -> bool:
+    if not isinstance(provenance, str):
+        return False
+    try:
+        value = json.loads(provenance)
+    except (TypeError, ValueError):
+        return False
+    return value.get("repair_type") == "issue40_preflight_collision" or value.get("repair") == "issue40_preflight_collision"
+
+
+def _count_candidate_issue(row: sqlite3.Row) -> str | None:
+    slot = row["key_slot_id"]
+    if row["repair_provenance"] is not None:
+        return "REPAIR_PROVENANCE_CONFLICT"
+    if row["stage"] != "preflight":
+        return "COUNT_STAGE_MISMATCH"
+    if slot not in {f"K{index:02d}" for index in range(1, 12)}:
+        return "COUNT_KEY_SLOT_INVALID"
+    if row["call_id"] != "L000-A001" or row["lease_sequence"] is not None or row["role"] != slot or row["attempt"] != 1:
+        return "COUNT_CALL_IDENTITY_MISMATCH"
+    if row["event_id"] != f"preflight:{slot}:L000-A001:count_tokens:None":
+        return "COUNT_EVENT_IDENTITY_MISMATCH"
+    if any(row[name] is not None for name in ("usage_run_id", "usage_attempt_id", "request_group_id")) or row["legacy_imported"] != 0:
+        return "COUNT_NOT_PRE_V2"
+    if not isinstance(row["model"], str) or not row["model"]:
+        return "COUNT_MODEL_MISSING"
+    if row["status"] != "FAILED" or row["actual_input_tokens"] is not None or row["usage_metadata_status"] != "MISSING" or row["error_code"] != "TOKEN_COUNT_UNAVAILABLE":
+        return "COUNT_FAILURE_SHAPE_MISMATCH"
+    if row["provider_dispatched"] != 1:
+        return "COUNT_PROVIDER_NOT_DISPATCHED"
+    if row["token_provenance"] != "measured":
+        return "COUNT_TOKEN_PROVENANCE_MISMATCH"
+    return None
+
+
+def _timestamp_not_before(value: object, baseline: object) -> bool:
+    if not isinstance(value, str) or not isinstance(baseline, str):
+        return False
+    try:
+        return datetime.fromisoformat(value) >= datetime.fromisoformat(baseline)
+    except ValueError:
+        return False
+
+
+def _matching_companions(count_row: sqlite3.Row, generation_rows: list[sqlite3.Row]) -> list[sqlite3.Row]:
+    matches = []
+    for row in generation_rows:
+        gate_tokens = row["gate_input_tokens"]
+        if not isinstance(gate_tokens, int) or isinstance(gate_tokens, bool) or gate_tokens < 0:
+            continue
+        actual_tokens = row["actual_input_tokens"]
+        if actual_tokens is not None and actual_tokens != gate_tokens:
+            continue
+        if any(row[name] is not None for name in ("usage_run_id", "usage_attempt_id", "request_group_id")) or row["legacy_imported"] != 0:
+            continue
+        if not (
+            row["stage"] == "preflight"
+            and row["status"] == "SUCCEEDED"
+            and row["provider_dispatched"] == 1
+            and row["error_code"] is None
+            and row["key_slot_id"] == count_row["key_slot_id"]
+            and row["call_id"] == count_row["call_id"]
+            and row["lease_sequence"] == count_row["lease_sequence"]
+            and row["role"] == count_row["role"]
+            and row["attempt"] == count_row["attempt"]
+            and row["model"] == count_row["model"]
+            and row["run_identity"] == count_row["run_identity"]
+            and row["output_identity"] == count_row["output_identity"]
+            and _timestamp_not_before(row["utc_dispatch_ts"], count_row["utc_dispatch_ts"])
+            and _timestamp_not_before(row["created_at"], count_row["created_at"])
+        ):
+            continue
+        matches.append(row)
+    return matches
+
+
+def _repair_candidates(conn: sqlite3.Connection) -> tuple[list[dict], list[dict], int]:
+    count_rows = conn.execute(
+        "SELECT * FROM usage_events WHERE request_kind='count_tokens' AND event_id LIKE 'preflight:%:count_tokens:%' ORDER BY key_slot_id, event_id"
+    ).fetchall()
+    generation_rows = conn.execute("SELECT * FROM usage_events WHERE request_kind='generate_content'").fetchall()
+    candidates: list[dict] = []
+    unresolved: list[dict] = []
+    skipped = 0
+    for count_row in count_rows:
+        if _known_collision_repair(count_row["repair_provenance"]):
+            skipped += 1
+            continue
+        issue = _count_candidate_issue(count_row)
+        if issue is not None:
+            unresolved.append({"event_id": count_row["event_id"], "key_slot_id": count_row["key_slot_id"], "reason_code": issue})
+            continue
+        companions = _matching_companions(count_row, generation_rows)
+        if len(companions) != 1:
+            reason = "COMPANION_GENERATION_MISSING_OR_MISMATCH" if not companions else "COMPANION_GENERATION_AMBIGUOUS"
+            unresolved.append({"event_id": count_row["event_id"], "key_slot_id": count_row["key_slot_id"], "reason_code": reason})
+            continue
+        generation = companions[0]
+        candidates.append(
+            {
+                "event_id": count_row["event_id"],
+                "key_slot_id": count_row["key_slot_id"],
+                "repair_input_tokens": generation["gate_input_tokens"],
+                "companion_event_id": generation["event_id"],
+                "reason_code": "COMPANION_GENERATION_GATE_INPUT",
+                "_expected_updated_at": count_row["updated_at"],
+            }
+        )
+    return candidates, unresolved, skipped
+
+
+def _repair_summary(conn: sqlite3.Connection) -> dict:
+    row = conn.execute(
+        """
+        SELECT COUNT(*) AS row_count,
+               SUM(CASE WHEN provider_dispatched=1 THEN 1 ELSE 0 END) AS provider_requests,
+               SUM(CASE WHEN status='SUCCEEDED' THEN 1 ELSE 0 END) AS success_count,
+               SUM(CASE WHEN status='FAILED' THEN 1 ELSE 0 END) AS failed_count,
+               SUM(actual_input_tokens) AS recorded_input_tokens
+        FROM usage_events
+        """
+    ).fetchone()
+    return {key: row[key] if row[key] is not None else 0 for key in row.keys()}
+
+
+def _row_documents(conn: sqlite3.Connection) -> dict[str, dict]:
+    return {row["event_id"]: _row_dict(row) for row in conn.execute("SELECT * FROM usage_events ORDER BY event_id").fetchall()}
+
+
+def _backup_matches_completed_repair(current: sqlite3.Connection, backup: sqlite3.Connection) -> bool:
+    backup_candidates, backup_unresolved, _ = _repair_candidates(backup)
+    if not backup_candidates or backup_unresolved:
+        return False
+    current_rows = _row_documents(current)
+    backup_rows = _row_documents(backup)
+    if current_rows.keys() != backup_rows.keys():
+        return False
+    candidates = {item["event_id"]: item for item in backup_candidates}
+    mutable = {"status", "actual_input_tokens", "usage_metadata_status", "error_code", "repair_provenance", "updated_at"}
+    for event_id, backup_row in backup_rows.items():
+        current_row = current_rows[event_id]
+        item = candidates.get(event_id)
+        if item is None:
+            if current_row != backup_row:
+                return False
+            continue
+        try:
+            provenance = json.loads(current_row["repair_provenance"])
+        except (TypeError, ValueError):
+            return False
+        if not (
+            provenance.get("repair_type") == "issue40_preflight_collision"
+            and provenance.get("source_evidence") == "companion_generation_gate_input"
+            and provenance.get("companion_event_id") == item["companion_event_id"]
+            and provenance.get("repair_version") == 1
+            and isinstance(provenance.get("applied_at"), str)
+            and current_row["status"] == "SUCCEEDED"
+            and current_row["actual_input_tokens"] == item["repair_input_tokens"]
+            and current_row["usage_metadata_status"] == "KNOWN"
+            and current_row["error_code"] is None
+        ):
+            return False
+        if any(current_row[key] != backup_row[key] for key in backup_row.keys() - mutable):
+            return False
+    return True
+
+
+def _validate_repair_backup(current: sqlite3.Connection, ledger_path: Path, backup_path: Path, current_fingerprint: dict, candidates: list[dict], unresolved: list[dict]) -> dict:
+    if not backup_path.exists() or not backup_path.is_file():
+        raise UsageLedgerError("USAGE_REPAIR_BACKUP_REQUIRED")
+    if ledger_path.resolve() == backup_path.resolve() or os.path.samefile(ledger_path, backup_path):
+        raise UsageLedgerError("USAGE_REPAIR_BACKUP_INVALID")
+    try:
+        with _read_only_connection(backup_path) as backup:
+            backup_fingerprint = _database_fingerprint(backup, backup_path)
+            for key in ("schema_version", "row_count", "core_schema"):
+                if current_fingerprint[key] != backup_fingerprint[key]:
+                    raise UsageLedgerError("USAGE_REPAIR_BACKUP_FINGERPRINT_MISMATCH")
+            backup_candidates, backup_unresolved, _ = _repair_candidates(backup)
+            if not backup_candidates or backup_unresolved:
+                raise UsageLedgerError("USAGE_REPAIR_BACKUP_NOT_PRE_REPAIR")
+            if not _fingerprints_match(current_fingerprint, backup_fingerprint):
+                if candidates or unresolved or not _backup_matches_completed_repair(current, backup):
+                    raise UsageLedgerError("USAGE_REPAIR_BACKUP_FINGERPRINT_MISMATCH")
+            return backup_fingerprint
+    except Exception as error:
+        if isinstance(error, UsageLedgerError):
+            raise
+        raise UsageLedgerError("USAGE_REPAIR_BACKUP_INVALID") from error
+
+
+def _public_candidates(candidates: list[dict]) -> list[dict]:
+    return [{key: value for key, value in item.items() if not key.startswith("_")} for item in candidates]
 
 
 def repair_preflight_collision(ledger: UsageLedger, *, apply: bool = False, backup_path: Path | None = None) -> dict:
-    if apply:
-        if backup_path is None or not backup_path.exists():
-            raise UsageLedgerError("USAGE_REPAIR_BACKUP_REQUIRED")
-        with sqlite3.connect(backup_path) as conn:
-            if conn.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
-                raise UsageLedgerError("USAGE_REPAIR_BACKUP_INVALID")
     ledger.ensure()
-    candidates: list[dict] = []
-    unresolved: list[dict] = []
-    with ledger._connect() as conn:
-        count_rows = conn.execute(
-            """
-            SELECT * FROM usage_events
-            WHERE request_kind='count_tokens'
-              AND stage='preflight'
-              AND status='FAILED'
-              AND actual_input_tokens IS NULL
-              AND error_code='TOKEN_COUNT_UNAVAILABLE'
-            ORDER BY key_slot_id, event_id
-            """
-        ).fetchall()
-        for count_row in count_rows:
-            generation = conn.execute(
-                """
-                SELECT * FROM usage_events
-                WHERE request_kind='generate_content'
-                  AND stage='preflight'
-                  AND key_slot_id=?
-                  AND call_id=?
-                  AND ((lease_sequence IS NULL AND ? IS NULL) OR lease_sequence=?)
-                  AND status='SUCCEEDED'
-                  AND provider_dispatched=1
-                  AND typeof(gate_input_tokens)='integer'
-                ORDER BY utc_dispatch_ts
-                LIMIT 1
-                """,
-                (count_row["key_slot_id"], count_row["call_id"], count_row["lease_sequence"], count_row["lease_sequence"]),
-            ).fetchone()
-            if generation is None:
-                unresolved.append({"event_id": count_row["event_id"], "key_slot_id": count_row["key_slot_id"], "reason_code": "COMPANION_GENERATION_MISSING"})
-                continue
-            candidates.append({"event_id": count_row["event_id"], "key_slot_id": count_row["key_slot_id"], "repair_input_tokens": generation["gate_input_tokens"], "companion_event_id": generation["event_id"], "reason_code": "COMPANION_GENERATION_GATE_INPUT"})
     applied = 0
-    if apply and candidates:
-        provenance = json.dumps({"repair": "issue40_preflight_collision", "source": "companion_generation_gate_input"}, sort_keys=True)
-        with ledger._connect() as conn:
-            try:
-                conn.execute("BEGIN")
+    backup_fingerprint = None
+    with ledger._connect() as conn:
+        try:
+            conn.execute("BEGIN IMMEDIATE" if apply else "BEGIN")
+            before = _repair_summary(conn)
+            baseline_fingerprint = _database_fingerprint(conn, ledger.path)
+            candidates, unresolved, skipped = _repair_candidates(conn)
+            if apply:
+                if backup_path is None:
+                    raise UsageLedgerError("USAGE_REPAIR_BACKUP_REQUIRED")
+                backup_fingerprint = _validate_repair_backup(conn, ledger.path, Path(backup_path), baseline_fingerprint, candidates, unresolved)
+                pending_applied = 0
+                applied_at = datetime.now(timezone.utc).isoformat()
                 for item in candidates:
+                    provenance = json.dumps(
+                        {
+                            "repair_type": "issue40_preflight_collision",
+                            "source_evidence": "companion_generation_gate_input",
+                            "companion_event_id": item["companion_event_id"],
+                            "repair_version": 1,
+                            "applied_at": applied_at,
+                        },
+                        sort_keys=True,
+                    )
                     cursor = conn.execute(
                         """
                         UPDATE usage_events
@@ -640,20 +878,46 @@ def repair_preflight_collision(ledger: UsageLedger, *, apply: bool = False, back
                             updated_at=?
                         WHERE event_id=?
                           AND request_kind='count_tokens'
+                          AND stage='preflight'
                           AND status='FAILED'
+                          AND provider_dispatched=1
                           AND actual_input_tokens IS NULL
+                          AND usage_metadata_status='MISSING'
                           AND error_code='TOKEN_COUNT_UNAVAILABLE'
+                          AND repair_provenance IS NULL
+                          AND usage_run_id IS NULL
+                          AND usage_attempt_id IS NULL
+                          AND request_group_id IS NULL
+                          AND updated_at=?
                         """,
-                        (item["repair_input_tokens"], provenance, datetime.now(timezone.utc).isoformat(), item["event_id"]),
+                        (item["repair_input_tokens"], provenance, applied_at, item["event_id"], item["_expected_updated_at"]),
                     )
                     if cursor.rowcount != 1:
                         raise UsageLedgerError("USAGE_REPAIR_STATE_CONFLICT")
-                    applied += 1
+                    pending_applied += 1
                 conn.commit()
-            except Exception:
+                applied = pending_applied
+            else:
                 conn.rollback()
+            after = _repair_summary(conn) if apply else before
+        except Exception as error:
+            conn.rollback()
+            if isinstance(error, UsageLedgerError):
                 raise
-    return {"mode": "apply" if apply else "dry-run", "repairable": len(candidates), "applied": applied, "skipped": 0, "unresolved": len(unresolved), "candidates": candidates, "unresolved_rows": unresolved}
+            raise UsageLedgerError("USAGE_REPAIR_FAILED") from error
+    return {
+        "mode": "apply" if apply else "dry-run",
+        "repairable": len(candidates),
+        "applied": applied,
+        "skipped": skipped,
+        "unresolved": len(unresolved),
+        "candidates": _public_candidates(candidates),
+        "unresolved_rows": unresolved,
+        "before": before,
+        "after": after,
+        "baseline_fingerprint": baseline_fingerprint,
+        "backup_fingerprint": backup_fingerprint,
+    }
 
 
 class TokenGate:

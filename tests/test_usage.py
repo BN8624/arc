@@ -20,6 +20,7 @@ from arc.usage import (
     UsageLedger,
     UsageLedgerError,
     UsageNumbers,
+    backup_usage_db,
     decide_admission,
     pacific_fields,
     repair_preflight_collision,
@@ -86,6 +87,48 @@ def _preflight_call(slot: str) -> dict:
 def _rows_for_run(path: Path, usage_run_id: str) -> list[tuple]:
     with sqlite3.connect(path) as conn:
         return conn.execute("SELECT * FROM usage_events WHERE usage_run_id=? ORDER BY event_id", (usage_run_id,)).fetchall()
+
+
+def _insert_repair_count(ledger: UsageLedger, *, slot: str = "K01", event_id: str | None = None, **overrides: object) -> str:
+    call = _preflight_call(slot)
+    values = {
+        "event_id": event_id or f"preflight:{slot}:L000-A001:count_tokens:None",
+        "request_kind": "count_tokens",
+        "key_slot_id": slot,
+        "model": "gemma-4-31b-it",
+        "call": call,
+        "provider_dispatched": True,
+        "status": "FAILED",
+        "usage_metadata_status": "MISSING",
+        "error_code": "TOKEN_COUNT_UNAVAILABLE",
+        "token_provenance": "measured",
+    }
+    values.update(overrides)
+    ledger.insert_event(**values)
+    return str(values["event_id"])
+
+
+def _insert_repair_generation(ledger: UsageLedger, *, slot: str = "K01", event_id: str | None = None, call: dict | None = None, **overrides: object) -> str:
+    values = {
+        "event_id": event_id or f"preflight:{slot}:L000-A001:generate_content:None",
+        "request_kind": "generate_content",
+        "key_slot_id": slot,
+        "model": "gemma-4-31b-it",
+        "call": call or _preflight_call(slot),
+        "gate_input_tokens": 15,
+        "actual_input_tokens": 15,
+        "provider_dispatched": True,
+        "status": "SUCCEEDED",
+        "usage_metadata_status": "KNOWN",
+        "token_provenance": "provider",
+    }
+    values.update(overrides)
+    ledger.insert_event(**values)
+    return str(values["event_id"])
+
+
+def _insert_repair_pair(ledger: UsageLedger, *, slot: str = "K01") -> tuple[str, str]:
+    return _insert_repair_count(ledger, slot=slot), _insert_repair_generation(ledger, slot=slot)
 
 
 def test_pacific_fields_use_los_angeles_date_across_utc_midnight() -> None:
@@ -430,25 +473,206 @@ def test_concurrent_finish_has_exactly_one_winner(tmp_path: Path) -> None:
 
 
 def test_preflight_collision_repair_uses_companion_generation(tmp_path: Path) -> None:
-    ledger = UsageLedger(tmp_path / "usage.sqlite3")
-    call = _preflight_call("K01")
-    ledger.insert_event(event_id="count", request_kind="count_tokens", key_slot_id="K01", model="gemma-4-31b-it", call=call, provider_dispatched=True, status="FAILED", usage_metadata_status="MISSING", error_code="TOKEN_COUNT_UNAVAILABLE", token_provenance="measured")
-    ledger.insert_event(event_id="generation", request_kind="generate_content", key_slot_id="K01", model="gemma-4-31b-it", call=call, gate_input_tokens=15, provider_dispatched=True, status="SUCCEEDED", usage_metadata_status="KNOWN", token_provenance="provider")
+    db = tmp_path / "usage.sqlite3"
+    ledger = UsageLedger(db)
+    count_event, generation_event = _insert_repair_pair(ledger)
 
     dry_run = repair_preflight_collision(ledger)
     assert dry_run["repairable"] == 1
     assert dry_run["applied"] == 0
+    assert dry_run["candidates"][0]["companion_event_id"] == generation_event
     backup = tmp_path / "backup.sqlite3"
-    with sqlite3.connect(tmp_path / "usage.sqlite3") as src, sqlite3.connect(backup) as dst:
-        src.backup(dst)
+    backup_usage_db(db, backup)
     applied = repair_preflight_collision(ledger, apply=True, backup_path=backup)
     assert applied["applied"] == 1
+    assert applied["before"]["row_count"] == applied["after"]["row_count"] == 2
+    assert applied["after"]["success_count"] == applied["before"]["success_count"] + 1
+    assert applied["after"]["failed_count"] == applied["before"]["failed_count"] - 1
+    assert applied["after"]["recorded_input_tokens"] == applied["before"]["recorded_input_tokens"] + 15
     second = repair_preflight_collision(ledger, apply=True, backup_path=backup)
     assert second["applied"] == 0
-    with sqlite3.connect(tmp_path / "usage.sqlite3") as conn:
-        row = conn.execute("SELECT status, actual_input_tokens, usage_metadata_status, error_code, repair_provenance FROM usage_events WHERE event_id='count'").fetchone()
+    with sqlite3.connect(db) as conn:
+        row = conn.execute("SELECT status, actual_input_tokens, usage_metadata_status, error_code, repair_provenance FROM usage_events WHERE event_id=?", (count_event,)).fetchone()
     assert row[:4] == ("SUCCEEDED", 15, "KNOWN", None)
-    assert "issue40_preflight_collision" in row[4]
+    provenance = json.loads(row[4])
+    assert provenance["repair_type"] == "issue40_preflight_collision"
+    assert provenance["source_evidence"] == "companion_generation_gate_input"
+    assert provenance["companion_event_id"] == generation_event
+    assert provenance["repair_version"] == 1
+    assert isinstance(provenance["applied_at"], str)
+
+
+def test_preflight_collision_repair_requires_exactly_one_companion(tmp_path: Path) -> None:
+    missing = UsageLedger(tmp_path / "missing.sqlite3")
+    _insert_repair_count(missing)
+    assert repair_preflight_collision(missing)["unresolved"] == 1
+
+    ambiguous = UsageLedger(tmp_path / "ambiguous.sqlite3")
+    _insert_repair_pair(ambiguous)
+    _insert_repair_generation(ambiguous, event_id="duplicate-generation")
+    result = repair_preflight_collision(ambiguous)
+    assert result["repairable"] == 0
+    assert result["unresolved_rows"][0]["reason_code"] == "COMPANION_GENERATION_AMBIGUOUS"
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("key_slot_id", "K02"),
+        ("call_id", "L000-A002"),
+        ("role", "K02"),
+        ("attempt", 2),
+        ("model", "other-model"),
+    ],
+)
+def test_preflight_collision_repair_rejects_companion_identity_mismatch(tmp_path: Path, field: str, value: object) -> None:
+    ledger = UsageLedger(tmp_path / "usage.sqlite3")
+    _insert_repair_count(ledger)
+    call = _preflight_call("K01")
+    overrides: dict[str, object] = {}
+    if field in call:
+        call[field] = value
+    else:
+        overrides[field] = value
+    _insert_repair_generation(ledger, call=call, **overrides)
+
+    result = repair_preflight_collision(ledger)
+    assert result["repairable"] == 0
+    assert result["unresolved"] == 1
+
+
+def test_preflight_collision_repair_rejects_invalid_evidence(tmp_path: Path) -> None:
+    not_dispatched = UsageLedger(tmp_path / "not-dispatched.sqlite3")
+    _insert_repair_count(not_dispatched, provider_dispatched=False)
+    _insert_repair_generation(not_dispatched)
+    assert repair_preflight_collision(not_dispatched)["unresolved_rows"][0]["reason_code"] == "COUNT_PROVIDER_NOT_DISPATCHED"
+
+    invalid_tokens = UsageLedger(tmp_path / "invalid-tokens.sqlite3")
+    _insert_repair_count(invalid_tokens)
+    _insert_repair_generation(invalid_tokens, gate_input_tokens=-1, actual_input_tokens=-1)
+    assert repair_preflight_collision(invalid_tokens)["unresolved"] == 1
+
+    conflicting_repair = UsageLedger(tmp_path / "conflicting-repair.sqlite3")
+    _insert_repair_count(conflicting_repair, repair_provenance=json.dumps({"repair_type": "other"}))
+    _insert_repair_generation(conflicting_repair)
+    assert repair_preflight_collision(conflicting_repair)["unresolved_rows"][0]["reason_code"] == "REPAIR_PROVENANCE_CONFLICT"
+
+
+def test_preflight_collision_repair_leaves_unrelated_episode_row_unchanged(tmp_path: Path) -> None:
+    db = tmp_path / "usage.sqlite3"
+    ledger = UsageLedger(db)
+    _insert_repair_pair(ledger)
+    ledger.insert_event(event_id="episode-count", request_kind="count_tokens", key_slot_id="K01", model="gemma-4-31b-it", call=_call(), provider_dispatched=True, status="FAILED", usage_metadata_status="MISSING", error_code="TOKEN_COUNT_UNAVAILABLE", token_provenance="measured")
+    with sqlite3.connect(db) as conn:
+        before = conn.execute("SELECT * FROM usage_events WHERE event_id='episode-count'").fetchone()
+    backup = tmp_path / "backup.sqlite3"
+    backup_usage_db(db, backup)
+
+    assert repair_preflight_collision(ledger, apply=True, backup_path=backup)["applied"] == 1
+
+    with sqlite3.connect(db) as conn:
+        after = conn.execute("SELECT * FROM usage_events WHERE event_id='episode-count'").fetchone()
+    assert after == before
+
+
+def test_preflight_collision_repair_rolls_back_all_rows_on_state_conflict(tmp_path: Path) -> None:
+    db = tmp_path / "usage.sqlite3"
+    ledger = UsageLedger(db)
+    first, _ = _insert_repair_pair(ledger, slot="K01")
+    second, _ = _insert_repair_pair(ledger, slot="K02")
+    backup = tmp_path / "backup.sqlite3"
+    backup_usage_db(db, backup)
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            f"""
+            CREATE TRIGGER block_second_repair BEFORE UPDATE ON usage_events
+            WHEN OLD.event_id='{second}'
+            BEGIN
+                SELECT RAISE(IGNORE);
+            END
+            """
+        )
+
+    with pytest.raises(UsageLedgerError, match="USAGE_REPAIR_STATE_CONFLICT"):
+        repair_preflight_collision(ledger, apply=True, backup_path=backup)
+
+    with sqlite3.connect(db) as conn:
+        rows = conn.execute("SELECT event_id, status, actual_input_tokens, repair_provenance FROM usage_events WHERE event_id IN (?, ?) ORDER BY event_id", (first, second)).fetchall()
+    assert rows == [(first, "FAILED", None, None), (second, "FAILED", None, None)]
+
+
+def test_usage_backup_returns_matching_fingerprints(tmp_path: Path) -> None:
+    source = tmp_path / "usage.sqlite3"
+    ledger = UsageLedger(source)
+    _insert_repair_pair(ledger)
+    destination = tmp_path / "backup.sqlite3"
+
+    result = backup_usage_db(source, destination)
+
+    assert destination.is_file()
+    assert result["integrity_check"] == "ok"
+    assert result["source_fingerprint"]["schema_version"] == 2
+    assert result["source_fingerprint"]["row_count"] == 2
+    assert result["source_fingerprint"]["content_sha256"] == result["backup_fingerprint"]["content_sha256"]
+    assert result["source_fingerprint"]["core_schema"] == result["backup_fingerprint"]["core_schema"]
+    assert isinstance(result["backup_created_at"], str)
+
+
+def test_usage_backup_rejects_missing_source_without_creating_database(tmp_path: Path) -> None:
+    source = tmp_path / "missing.sqlite3"
+    with pytest.raises(UsageLedgerError, match="USAGE_DB_NOT_FOUND"):
+        backup_usage_db(source, tmp_path / "backup.sqlite3")
+    assert not source.exists()
+
+
+def test_usage_backup_rejects_same_or_existing_destination(tmp_path: Path) -> None:
+    source = tmp_path / "usage.sqlite3"
+    UsageLedger(source).ensure()
+    with pytest.raises(UsageLedgerError, match="USAGE_BACKUP_SOURCE_DESTINATION_SAME"):
+        backup_usage_db(source, source)
+
+    destination = tmp_path / "backup.sqlite3"
+    destination.write_bytes(b"existing")
+    with pytest.raises(UsageLedgerError, match="USAGE_BACKUP_EXISTS"):
+        backup_usage_db(source, destination)
+    assert destination.read_bytes() == b"existing"
+
+
+def test_repair_rejects_invalid_unrelated_and_stale_backups(tmp_path: Path) -> None:
+    db = tmp_path / "usage.sqlite3"
+    ledger = UsageLedger(db)
+    _insert_repair_pair(ledger)
+
+    invalid = tmp_path / "invalid.sqlite3"
+    invalid.write_bytes(b"not sqlite")
+    with pytest.raises(UsageLedgerError, match="USAGE_REPAIR_BACKUP_INVALID"):
+        repair_preflight_collision(ledger, apply=True, backup_path=invalid)
+
+    unrelated = tmp_path / "unrelated.sqlite3"
+    unrelated_ledger = UsageLedger(unrelated)
+    _insert_repair_pair(unrelated_ledger, slot="K02")
+    with pytest.raises(UsageLedgerError, match="USAGE_REPAIR_BACKUP_FINGERPRINT_MISMATCH"):
+        repair_preflight_collision(ledger, apply=True, backup_path=unrelated)
+
+    stale = tmp_path / "stale.sqlite3"
+    backup_usage_db(db, stale)
+    ledger.insert_event(event_id="unrelated", request_kind="generate_content", key_slot_id="K09", model="model", call=_call(), provider_dispatched=False, status="BLOCKED", usage_metadata_status="NOT_APPLICABLE", token_provenance="provider")
+    with pytest.raises(UsageLedgerError, match="USAGE_REPAIR_BACKUP_FINGERPRINT_MISMATCH"):
+        repair_preflight_collision(ledger, apply=True, backup_path=stale)
+
+
+def test_repair_rejects_snapshot_created_after_repair(tmp_path: Path) -> None:
+    db = tmp_path / "usage.sqlite3"
+    ledger = UsageLedger(db)
+    _insert_repair_pair(ledger)
+    before = tmp_path / "before.sqlite3"
+    backup_usage_db(db, before)
+    assert repair_preflight_collision(ledger, apply=True, backup_path=before)["applied"] == 1
+    after = tmp_path / "after.sqlite3"
+    backup_usage_db(db, after)
+
+    with pytest.raises(UsageLedgerError, match="USAGE_REPAIR_BACKUP_NOT_PRE_REPAIR"):
+        repair_preflight_collision(ledger, apply=True, backup_path=after)
 
 
 def test_thoughts_zero_is_distinct_from_missing(tmp_path: Path) -> None:
