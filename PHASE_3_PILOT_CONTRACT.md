@@ -52,4 +52,14 @@ Live acceptance prompts include the canonical pilot evidence packet, dimension q
 
 `pilot-live-run` requires an accepted existing `live-preflight` artifact and does not create a new pilot-specific preflight. `pilot-live-status` validates root telemetry, episode projections, routing state presence, canonical artifacts, memory chain, and acceptance call counts.
 
+## Prose Length Reliability Validation
+
+The canonical prose hard contract remains 4,000 to 8,000 characters, with 3,000 to 3,999 characters remaining repairable only for a writer draft. Prompt reliability is not improved by merely raising the numeric target. Writer and revision prompts retain the 5,200-to-6,400-character target while requiring the model to develop the objective, obstacle, protagonist action, counteraction, consequence, changed situation or relationship, aftermath, payoff, and ending hook as coherent scenes. They guide the model to plan roughly 14 to 18 natural paragraphs without emitting headings or paragraph numbers and forbid summary compression, repetitive padding, and unsupported central conflicts.
+
+A repairable-draft revision remains one coherent full replacement. Its prompt includes the persisted current draft character count, `hard_gap = max(0, 4000 - current_character_count)`, and `safe_expansion = max(1200, hard_gap + 1000)`. Safe expansion is guidance for meaningful scene, action, dialogue, reaction, consequence, and aftermath development; it is not a new validator or permission to append a fragment. Writer and revision each retain the limit of one actual provider content response. Transport-only failures do not consume that response, and an invalid or underlength content response is never followed by an automatic prose retry.
+
+`prose-live-probe` is a bounded live validation before a new full pilot. It reads the preserved Episode 2 context, plan, repairable draft contract, draft, and review decision from the designated HOLD pilot, verifies their hashes and rejection state, and invokes only the canonical writer and canonical revision prompts once each. It stores metadata, hashes, character counts, contract results, call identities, telemetry, and usage identity, but never raw prompts, raw responses, provider response objects, request headers, API keys, or secrets. A PASS requires both independent responses to satisfy the unchanged 4,000-to-8,000-character prose contract.
+
+A probe PASS demonstrates only bounded prose-length reliability. It is not Phase 3 pilot acceptance, does not run planning, review, memory, transition, or acceptance stages, and does not authorize a five-episode live pilot. A new full pilot remains a separate task, and Phase 4 remains a separate user decision.
+
 This is a pre-live integration proof. Actual Phase 3 live validation, ARC's first real work, and Phase 4 remain separate work.
