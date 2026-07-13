@@ -131,6 +131,35 @@ def _insert_repair_pair(ledger: UsageLedger, *, slot: str = "K01") -> tuple[str,
     return _insert_repair_count(ledger, slot=slot), _insert_repair_generation(ledger, slot=slot)
 
 
+def _make_v1_fixture(path: Path, *, missing_columns: tuple[str, ...] = ("usage_run_id", "usage_attempt_id", "request_group_id", "repair_provenance")) -> None:
+    ledger = UsageLedger(path)
+    ledger.insert_event(
+        event_id="v1-event",
+        dispatch_utc=datetime(2026, 1, 13, 12, 0, tzinfo=timezone.utc),
+        request_kind="generate_content",
+        key_slot_id="K03",
+        model="gemma-4-31b-it",
+        call={"scope_id": "episode:episode_003", "call_id": "L123-A002", "lease_sequence": 17, "stage": "writer", "role": "canonical", "attempt": 2},
+        usage_run_id="preserved-run",
+        usage_attempt_id="preserved-attempt",
+        request_group_id="preserved-group",
+        gate_input_tokens=10,
+        actual_input_tokens=11,
+        candidate_tokens=12,
+        reasoning_tokens=13,
+        combined_output_tokens=25,
+        provider_total_tokens=36,
+        provider_dispatched=True,
+        status="SUCCEEDED",
+        usage_metadata_status="KNOWN",
+        token_provenance="provider",
+    )
+    with sqlite3.connect(path) as conn:
+        for column in missing_columns:
+            conn.execute(f"ALTER TABLE usage_events DROP COLUMN {column}")
+        conn.execute("UPDATE schema_version SET version=1")
+
+
 def test_pacific_fields_use_los_angeles_date_across_utc_midnight() -> None:
     _, _, date = pacific_fields(datetime(2026, 7, 13, 1, 30, tzinfo=timezone.utc))
     assert date == "2026-07-12"
@@ -845,6 +874,95 @@ def test_legacy_reconciliation_rejects_nonlegacy_collision(tmp_path: Path) -> No
 
     with pytest.raises(UsageLedgerError, match="USAGE_EVENT_ID_COLLISION"):
         ledger.import_pilot(output)
+
+
+def test_v1_schema_migrates_in_place_and_preserves_existing_values(tmp_path: Path) -> None:
+    db = tmp_path / "usage.sqlite3"
+    _make_v1_fixture(db)
+    with sqlite3.connect(db) as conn:
+        before_columns = [row[1] for row in conn.execute("PRAGMA table_info(usage_events)")]
+        before_row = conn.execute(f"SELECT {','.join(before_columns)} FROM usage_events").fetchone()
+        before_rootpage = conn.execute("SELECT rootpage FROM sqlite_master WHERE type='table' AND name='usage_events'").fetchone()[0]
+
+    UsageLedger(db).ensure()
+
+    with sqlite3.connect(db) as conn:
+        after_row = conn.execute(f"SELECT {','.join(before_columns)} FROM usage_events").fetchone()
+        after_rootpage = conn.execute("SELECT rootpage FROM sqlite_master WHERE type='table' AND name='usage_events'").fetchone()[0]
+        migrated = conn.execute("SELECT usage_run_id, usage_attempt_id, request_group_id, repair_provenance, utc_dispatch_ts, pacific_dispatch_ts, pacific_date FROM usage_events").fetchone()
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 2
+        assert conn.execute("SELECT COUNT(*) FROM usage_events").fetchone()[0] == 1
+    assert after_row == before_row
+    assert after_rootpage == before_rootpage
+    assert migrated[:4] == (None, None, None, None)
+    assert migrated[4:] == ("2026-01-13T12:00:00+00:00", "2026-01-13T04:00:00-08:00", "2026-01-13")
+
+
+def test_usage_schema_migration_and_v2_ensure_are_repeatable_no_ops(tmp_path: Path) -> None:
+    db = tmp_path / "usage.sqlite3"
+    _make_v1_fixture(db)
+    UsageLedger(db).ensure()
+    with sqlite3.connect(db) as conn:
+        before = conn.execute("SELECT * FROM usage_events").fetchall()
+        before_columns = conn.execute("PRAGMA table_info(usage_events)").fetchall()
+
+    UsageLedger(db).ensure()
+    UsageLedger(db).ensure()
+
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 2
+        assert conn.execute("SELECT * FROM usage_events").fetchall() == before
+        assert conn.execute("PRAGMA table_info(usage_events)").fetchall() == before_columns
+
+
+def test_usage_schema_migration_preserves_existing_partial_v2_columns(tmp_path: Path) -> None:
+    db = tmp_path / "usage.sqlite3"
+    _make_v1_fixture(db, missing_columns=("usage_attempt_id", "repair_provenance"))
+
+    UsageLedger(db).ensure()
+
+    with sqlite3.connect(db) as conn:
+        row = conn.execute("SELECT usage_run_id, usage_attempt_id, request_group_id, repair_provenance, call_id, actual_input_tokens FROM usage_events").fetchone()
+        columns = {item[1] for item in conn.execute("PRAGMA table_info(usage_events)")}
+    assert row == ("preserved-run", None, "preserved-group", None, "L123-A002", 11)
+    assert {"usage_run_id", "usage_attempt_id", "request_group_id", "repair_provenance"} <= columns
+
+
+def test_usage_schema_migration_rolls_back_on_mid_migration_failure(tmp_path: Path) -> None:
+    db = tmp_path / "usage.sqlite3"
+    _make_v1_fixture(db)
+    with sqlite3.connect(db) as conn:
+        before_columns = conn.execute("PRAGMA table_info(usage_events)").fetchall()
+        before_rows = conn.execute("SELECT * FROM usage_events").fetchall()
+
+    class FailingMigrationLedger(UsageLedger):
+        def _migrate_v1_to_v2(self, conn: sqlite3.Connection) -> None:
+            conn.execute("ALTER TABLE usage_events ADD COLUMN usage_run_id TEXT")
+            raise RuntimeError("forced migration failure")
+
+    with pytest.raises(UsageLedgerError, match="USAGE_DB_UNAVAILABLE"):
+        FailingMigrationLedger(db).ensure()
+
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 1
+        assert conn.execute("PRAGMA table_info(usage_events)").fetchall() == before_columns
+        assert conn.execute("SELECT * FROM usage_events").fetchall() == before_rows
+
+
+def test_usage_schema_rejects_future_version_without_changing_rows(tmp_path: Path) -> None:
+    db = tmp_path / "usage.sqlite3"
+    ledger = UsageLedger(db)
+    ledger.insert_event(event_id="future-event", request_kind="count_tokens", key_slot_id="K01", model="model", call=_call(), provider_dispatched=False, status="BLOCKED", usage_metadata_status="NOT_APPLICABLE", token_provenance="measured")
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE schema_version SET version=3")
+        before = conn.execute("SELECT * FROM usage_events").fetchall()
+
+    with pytest.raises(UsageLedgerError, match="UNSUPPORTED_USAGE_SCHEMA_VERSION"):
+        UsageLedger(db).ensure()
+
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 3
+        assert conn.execute("SELECT * FROM usage_events").fetchall() == before
 
 
 def test_usage_cli_db_check_and_json_status(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

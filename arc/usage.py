@@ -182,7 +182,14 @@ class UsageLedger:
                     if version > SCHEMA_VERSION:
                         raise UsageLedgerError("UNSUPPORTED_USAGE_SCHEMA_VERSION")
                     if version < 2:
-                        self._migrate_v1_to_v2(conn)
+                        conn.execute("SAVEPOINT usage_v1_to_v2")
+                        try:
+                            self._migrate_v1_to_v2(conn)
+                            conn.execute("RELEASE SAVEPOINT usage_v1_to_v2")
+                        except Exception:
+                            conn.execute("ROLLBACK TO SAVEPOINT usage_v1_to_v2")
+                            conn.execute("RELEASE SAVEPOINT usage_v1_to_v2")
+                            raise
                 self._ready = True
             except Exception as error:
                 if isinstance(error, UsageLedgerError):

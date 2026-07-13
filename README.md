@@ -49,6 +49,12 @@ arc pilot-live-status .tmp/phase3b-pilot-live
 
 The single-episode live commands above are historical Phase 2 validation commands. The pilot live commands use fake-test-covered runtime integration and still require a separate real validation issue before Phase 4. `ARC_CANON.md` remains the canonical contract.
 
+## Usage Ledger Safety
+
+Runtime usage events are owned by a unique `usage_run_id` and `usage_attempt_id`; their count-token and generation rows share one `request_group_id` while retaining distinct request kinds. `SUCCEEDED`, `FAILED`, `USAGE_UNKNOWN`, and `BLOCKED` are terminal and cannot be changed by general runtime updates. Runtime transitions use atomic conditional updates that verify the prior state and event ownership.
+
+`provider_dispatched` on a count-token row means the provider endpoint was actually entered; injected counters do not set it. Collision repair is isolated from runtime updates, accepts only one exact pre-v2 companion generation, and requires a verified pre-repair online backup whose schema, row count, and content fingerprint match the target ledger. Repair verification does not perform a real preflight or resume Phase 3 Live; those remain separate operations.
+
 Current deliverables:
 
 - `README.md`
