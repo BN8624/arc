@@ -80,6 +80,8 @@ class MockPipeline:
             if manifest["source_hash"] != source_hash or manifest["scenario"] != scenario or manifest.get("mode", "mock") != self.mode:
                 raise PipelineError("source or scenario changed; refusing reuse")
             verify_artifacts(run_dir, manifest, self._operational_files() if self.mode == "live" else None)
+            if "PLAN_MERGED" in manifest["completed_stages"] and ("episode_plan.json" not in manifest["artifact_hashes"] or not (run_dir / "episode_plan.json").exists()):
+                raise PipelineError("PLAN_MERGED without episode plan")
             if self.mode == "live" and (run_dir / "live_calls.json").exists():
                 self.client.restore_telemetry(read_json(run_dir / "live_calls.json"))
                 self._reconcile_invalid_memory_merge(source, run_dir, manifest)
@@ -111,6 +113,8 @@ class MockPipeline:
             self._commit(run_dir, manifest, "planning_workers.json", workers, "PLANNING_WAVE_COMPLETED")
             (run_dir / "planning_workers.partial.json").unlink(missing_ok=True)
         else:
+            if self.mode == "live" and (run_dir / "planning_workers.partial.json").exists():
+                raise PipelineError("stale planning partial after completed wave")
             (run_dir / "planning_workers.partial.json").unlink(missing_ok=True)
         planning = read_json(run_dir / "planning_workers.json")
         if "PLAN_MERGED" not in manifest["completed_stages"]:

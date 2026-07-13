@@ -79,12 +79,13 @@ class _PilotProvider:
 
 
 class _PilotProviderRoot:
-    def __init__(self, fail_once_at: str | None = None, hold_episode: str | None = None, fail_status_code: int = 500, hold_dimension: str | None = None, wrong_plan_once: bool = False):
+    def __init__(self, fail_once_at: str | None = None, hold_episode: str | None = None, fail_status_code: int = 500, hold_dimension: str | None = None, wrong_plan_once: bool = False, wrong_plan_episode: str | None = None):
         self.fail_once_at = fail_once_at
         self.hold_episode = hold_episode
         self.fail_status_code = fail_status_code
         self.hold_dimension = hold_dimension
         self.wrong_plan_once = wrong_plan_once
+        self.wrong_plan_episode = wrong_plan_episode
         self.malformed_once_at: str | None = None
         self.failed: set[str] = set()
         self.malformed: set[str] = set()
@@ -106,7 +107,7 @@ class _PilotProviderRoot:
             hold = role == self.hold_dimension
             return json.dumps({"worker_id": f"pilot_review-{role}", "role": role, "verdict": "OK", "primary_finding": f"synthetic {role} finding", "primary_risk": f"synthetic {role} risk", "evidence_refs": ["pilot_evidence_packet.json"], "proposal": {"dimension_result": "HOLD" if hold else "PASS", "critical_finding": f"synthetic {role} hold" if hold else None}})
         if stage == "planning_merge":
-            if self.wrong_plan_once and "planning_merge:merge" not in self.malformed:
+            if self.wrong_plan_once and "planning_merge:merge" not in self.malformed and (self.wrong_plan_episode is None or episode_id == self.wrong_plan_episode):
                 self.malformed.add("planning_merge:merge")
                 return json.dumps({"episode_id": "wrong_episode", "immediate_objective": "synthetic objective", "obstacle": "synthetic obstacle", "protagonist_action": "synthetic action", "meaningful_change": "synthetic change", "episode_ending": "synthetic ending", "selected_worker_ids": ["planning-event"], "continuity_constraints": ["synthetic constraint"]})
             return json.dumps({"episode_id": episode_id, "immediate_objective": "synthetic objective", "obstacle": "synthetic obstacle", "protagonist_action": "synthetic action", "meaningful_change": "synthetic change", "episode_ending": "synthetic ending", "selected_worker_ids": ["planning-event"], "continuity_constraints": ["synthetic constraint"]})
@@ -260,6 +261,20 @@ def _run_planning_merge_contract_failure(tmp_path: Path):
     telemetry = read_json(output / "live_calls.json")
     manifest = read_json(output / "manifest.json")
     return output, root, telemetry, manifest
+
+
+def _make_episode_four_plan_error_output(tmp_path: Path) -> Path:
+    output = tmp_path / "pilot-live"
+    client, _ = _pilot_client(output, _PilotProviderRoot(wrong_plan_once=True, wrong_plan_episode="episode_004"))
+    with pytest.raises(Exception):
+        PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    return output
+
+
+def _resume_episode_four_output(output: Path, root: _PilotProviderRoot | None = None):
+    fresh_client, provider_root = _pilot_client(output, root)
+    result = PilotPipeline(fresh_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    return result, provider_root
 
 
 def _planning_merge_contract_event(telemetry: dict) -> dict:
@@ -555,6 +570,112 @@ def test_restored_telemetry_keeps_contract_failure_event_ids_unique(tmp_path):
     client.record_contract_failure("planning_merge", "merge", contract_code="PLAN_FIELDS_MISMATCH")
     event_ids = [event["event_id"] for event in client.telemetry()["contract_failures"]]
     assert len(event_ids) == len(set(event_ids))
+
+
+def test_pilot_resumes_episode_four_from_planning_merge_contract_error(tmp_path):
+    output = _make_episode_four_plan_error_output(tmp_path)
+    result, provider_root = _resume_episode_four_output(output)
+    manifest = result["manifest"]
+    assert manifest["status"] == "COMPLETE"
+    assert manifest["completed_episodes"] == manifest["episode_ids"]
+    assert len(manifest["completed_transitions"]) == 4
+    assert any(marker == "planning_merge:merge" and _episode_from_prompt(prompt) == "episode_004" for _, marker, prompt in provider_root.provider_calls)
+
+
+def test_planning_merge_resume_does_not_recall_planning_workers(tmp_path):
+    output = _make_episode_four_plan_error_output(tmp_path)
+    _, provider_root = _resume_episode_four_output(output)
+    resumed = {(_episode_from_prompt(prompt), marker) for _, marker, prompt in provider_root.provider_calls}
+    assert not any(episode in {"episode_001", "episode_002", "episode_003"} for episode, _ in resumed)
+    assert not any(episode == "episode_004" and marker.startswith("planning:") for episode, marker in resumed)
+
+
+def test_planning_merge_resume_preserves_contract_failure_and_attempt_sequence(tmp_path):
+    output = _make_episode_four_plan_error_output(tmp_path)
+    before = read_json(output / "pilot_live_calls.json")
+    before_events = list(before["contract_failures"])
+    _resume_episode_four_output(output)
+    after = read_json(output / "pilot_live_calls.json")
+    merge_calls = [call for call in after["calls"] if call["desk_id"] == "episode:episode_004:planning_merge:merge"]
+    assert before_events[0] in after["contract_failures"]
+    assert [call["attempt"] for call in merge_calls] == [1, 2]
+    assert [call["status"] for call in merge_calls] == ["PASS", "PASS"]
+    assert len({call["call_id"] for call in after["calls"]}) == len(after["calls"])
+    assert len({call["lease_sequence"] for call in after["calls"]}) == len(after["calls"])
+
+
+def test_planning_merge_resume_does_not_rebuild_completed_pilot_prefix(tmp_path):
+    output = _make_episode_four_plan_error_output(tmp_path)
+    before = {name: (output / name).read_bytes() for name in ["transitions/episode_001_to_episode_002.json", "transitions/episode_002_to_episode_003.json", "transitions/episode_003_to_episode_004.json"]}
+    _resume_episode_four_output(output)
+    after = {name: (output / name).read_bytes() for name in before}
+    assert after == before
+
+
+def test_planning_merge_resume_keeps_key_available_after_contract_failure(tmp_path):
+    output = _make_episode_four_plan_error_output(tmp_path)
+    before_state = read_json(output / "routing_state.json")
+    event = read_json(output / "pilot_live_calls.json")["contract_failures"][0]
+    assert before_state["keys"][event["key_slot"]]["state"] == "AVAILABLE"
+    _resume_episode_four_output(output)
+    after_state = read_json(output / "routing_state.json")
+    assert after_state["keys"][event["key_slot"]]["state"] in {"AVAILABLE", "COOLDOWN"}
+
+
+def test_planning_merge_resume_rejects_tampered_planning_workers(tmp_path):
+    output = _make_episode_four_plan_error_output(tmp_path)
+    planning = output / "episodes" / "episode_004" / "planning_workers.json"
+    planning.write_text("[]\n", encoding="utf-8")
+    with pytest.raises(StorageError):
+        _resume_episode_four_output(output)
+
+
+def test_planning_merge_resume_rejects_root_projection_mismatch(tmp_path):
+    output = _make_episode_four_plan_error_output(tmp_path)
+    episode_live = output / "episodes" / "episode_004" / "live_calls.json"
+    value = read_json(episode_live)
+    value["calls"] = []
+    digest = write_json(episode_live, value)
+    episode_manifest = read_json(output / "episodes" / "episode_004" / "manifest.json")
+    episode_manifest["artifact_hashes"]["live_calls.json"] = digest
+    write_json(output / "episodes" / "episode_004" / "manifest.json", episode_manifest)
+    with pytest.raises(StorageError, match="telemetry projection mismatch"):
+        _resume_episode_four_output(output)
+
+
+def test_planning_merge_resume_rejects_stale_planning_partial(tmp_path):
+    output = _make_episode_four_plan_error_output(tmp_path)
+    write_json(output / "episodes" / "episode_004" / "planning_workers.partial.json", {"stale": True})
+    with pytest.raises(Exception, match="stale planning partial"):
+        _resume_episode_four_output(output)
+
+
+def test_planning_merge_resume_rejects_routing_sequence_behind_telemetry(tmp_path):
+    output = _make_episode_four_plan_error_output(tmp_path)
+    routing = read_json(output / "routing_state.json")
+    routing["next_lease_sequence"] = 1
+    write_json(output / "routing_state.json", routing)
+    with pytest.raises(StorageError, match="routing lease sequence behind telemetry"):
+        _resume_episode_four_output(output)
+
+
+def test_planning_merge_resume_rejects_episode_source_hash_mismatch(tmp_path):
+    output = _make_episode_four_plan_error_output(tmp_path)
+    source = read_json(output / "episode_sources" / "episode_004.json")
+    source["current_episode"]["required_role"] = "tampered"
+    write_json(output / "episode_sources" / "episode_004.json", source)
+    with pytest.raises(StorageError):
+        _resume_episode_four_output(output)
+
+
+def test_planning_merge_resume_rejects_plan_merged_without_artifact(tmp_path):
+    output = _make_episode_four_plan_error_output(tmp_path)
+    manifest_path = output / "episodes" / "episode_004" / "manifest.json"
+    manifest = read_json(manifest_path)
+    manifest["completed_stages"].append("PLAN_MERGED")
+    write_json(manifest_path, manifest)
+    with pytest.raises(Exception, match="PLAN_MERGED without episode plan"):
+        _resume_episode_four_output(output)
 
 
 def test_live_pilot_rejects_root_and_episode_telemetry_mismatch(tmp_path):

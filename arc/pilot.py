@@ -54,6 +54,7 @@ class PilotPipeline:
                 child = read_json(run_dir / "episodes" / active / "manifest.json") if active and (run_dir / "episodes" / active / "manifest.json").exists() else {}
                 child_error = child.get("last_error") if isinstance(child.get("last_error"), dict) else None
                 manifest["last_error"] = {"error_class": (child_error or {}).get("error_class", "CONTRACT_ERROR" if isinstance(error, ContractError) else "PIPELINE_ERROR"), "active_episode_id": active, "stage": (child_error or {}).get("stage"), "role": (child_error or {}).get("role"), "contract_code": (child_error or {}).get("contract_code"), "message": "sanitized child episode failure"}
+                self._save_pilot_live_calls(run_dir, manifest)
             else:
                 manifest["last_error"] = str(error)
             self._save_manifest(run_dir, manifest)
@@ -326,6 +327,10 @@ def _verify_live_telemetry_projections(run_dir: Path, manifest: dict) -> None:
         raise StorageError("duplicate pilot live call id")
     if len(lease_sequences) != len(set(lease_sequences)):
         raise StorageError("duplicate pilot live lease sequence")
+    if lease_sequences and (run_dir / "routing_state.json").exists():
+        routing = read_json(run_dir / "routing_state.json")
+        if routing.get("next_lease_sequence", 0) <= max(lease_sequences):
+            raise StorageError("routing lease sequence behind telemetry")
     root_by_scope = {}
     for call in root.get("calls", []):
         root_by_scope.setdefault(call.get("scope_id"), []).append(call)
