@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from arc.contracts import ContractError, PROSE_FORBIDDEN_MARKERS, validate_draft_prose, validate_prose
+from arc.contracts import ContractError, PROSE_FORBIDDEN_MARKERS, PROSE_MAX_CHARACTERS, PROSE_MIN_CHARACTERS, PROSE_REPAIRABLE_MIN_CHARACTERS, validate_draft_prose, validate_prose
 from arc.live_model import AtomicTelemetryStore, GemmaPoolClient, LiveConfig, MODEL_NAME, RoutingStateStore
 from arc.pipeline import PLANNING_ROLES, MockPipeline, WaveCheckpoint, status
 from arc.pilot_contracts import PILOT_REVIEW_ROLES
@@ -569,6 +569,9 @@ def test_phase2_live_telemetry_contract_remains_compatible(tmp_path):
 
 def test_validate_prose_accepts_normal_range():
     assert validate_prose("A" * 4000) == "A" * 4000
+    assert PROSE_MIN_CHARACTERS == 4000
+    assert PROSE_MAX_CHARACTERS == 8000
+    assert PROSE_REPAIRABLE_MIN_CHARACTERS == 3000
 
 
 def test_validate_prose_rejects_short_with_code():
@@ -576,6 +579,13 @@ def test_validate_prose_rejects_short_with_code():
         validate_prose("A" * 3999)
     assert error.value.contract_code == "PROSE_TOO_SHORT"
     assert error.value.character_count == 3999
+
+
+def test_validate_prose_rejects_3709_revision_as_short():
+    with pytest.raises(ContractError) as error:
+        validate_prose("A" * 3709)
+    assert error.value.contract_code == "PROSE_TOO_SHORT"
+    assert error.value.character_count == 3709
 
 
 def test_validate_prose_rejects_long_with_code():
@@ -684,12 +694,33 @@ def test_writer_failure_checkpoint_resumes_from_writer_without_recalling_prefix(
 
 
 def test_writer_prompt_reinforces_safe_character_band():
-    from arc.prompts import build_prompt
+    from arc.prompts import build_prompt, prose_target_band
 
     prompt = build_prompt("writer", "canonical", {"context": {}, "plan": {}})
 
-    assert "5000 and 7000 characters" in prompt
+    assert prose_target_band() == (5200, 6400)
+    assert "5200 to 6400 characters" in prompt
+    assert "barely clearing the validation floor" in prompt
+    assert "Expand causes, actions, dialogue" in prompt
     assert "never mention the character count" in prompt
+
+
+def test_prose_target_band_uses_contract_minimum_and_hard_maximum():
+    from arc.prompts import prose_target_band
+
+    assert prose_target_band(5000, None) == (6500, 8000)
+    assert prose_target_band(4000, 6000) == (5200, 6000)
+
+
+def test_underlength_revision_prompt_requires_full_replacement():
+    from arc.prompts import build_prompt
+
+    prompt = build_prompt("revision", "canonical", {"draft_contract": {"verdict": "REVISE_REQUIRED"}, "draft": "A" * 3500})
+
+    assert "5200 to 6400 characters" in prompt
+    assert "one full replacement from beginning to end" in prompt
+    assert "do not append fragments" in prompt
+    assert "Do not change canon outside review requirements" in prompt
 
 
 def test_repairable_draft_is_saved_and_revised_once(tmp_path):

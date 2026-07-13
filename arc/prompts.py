@@ -1,12 +1,28 @@
-# Phase 2 live 단계별 최소 프롬프트를 구성한다.
+# Phase 2 live 단계별 prompt contract를 구성한다.
 from __future__ import annotations
 
 import json
+from math import ceil
 
-from .contracts import ContractError
+from .contracts import ContractError, PROSE_MAX_CHARACTERS, PROSE_MIN_CHARACTERS
 
 
 JSON_STAGES = {"planning", "planning_merge", "review", "review_merge", "memory", "memory_merge", "preflight"}
+
+
+def prose_target_band(hard_min: int = PROSE_MIN_CHARACTERS, hard_max: int | None = PROSE_MAX_CHARACTERS) -> tuple[int, int]:
+    target_min = ceil(hard_min * 1.30)
+    target_max = ceil(hard_min * 1.60)
+    if hard_max is not None:
+        if target_min > hard_max:
+            raise ContractError("prose target band is incompatible with hard maximum", "PROSE_TARGET_BAND_INCOMPATIBLE")
+        target_max = min(target_max, hard_max)
+    return target_min, target_max
+
+
+def _prose_target_text() -> str:
+    target_min, target_max = prose_target_band()
+    return f"{target_min} to {target_max} characters"
 
 
 def _planning_merge_rule(payload: dict) -> str:
@@ -29,16 +45,29 @@ def _planning_merge_rule(payload: dict) -> str:
 
 
 def build_prompt(stage: str, role: str, payload: dict) -> str:
+    target_band = _prose_target_text()
     if stage in JSON_STAGES:
         instruction = "Return exactly one JSON object. Do not use Markdown fences or add explanation."
     elif stage == "writer":
-        instruction = "한국어 산문 한 회차 본문만 작성하세요. 공백 포함 5000~7000자로 작성해 4000~8000자 검증 범위를 안전하게 만족하세요. 설명, 표식, JSON, Markdown, 생성 과정 언급을 포함하지 마세요."
+        instruction = (
+            f"Write only the complete Korean novel prose for this episode. Target {target_band} so the draft is fully developed "
+            "instead of barely clearing the validation floor. Expand causes, actions, dialogue, sensory details, reactions, "
+            "transitions, and consequences naturally within the existing plan and canon. Do not add unsupported new settings, "
+            "repeat sentences, pad with filler modifiers, summarize yourself, report a character count, or include headings, "
+            "scene numbers, SCENE 1, Markdown fences, JSON, or process notes."
+        )
     else:
-        instruction = "한국어 수정본 본문만 작성하세요. 공백 포함 5000~7000자로 작성해 4000~8000자 검증 범위를 안전하게 만족하세요. 설명, 표식, JSON, Markdown을 포함하지 마세요."
+        instruction = (
+            f"Write only the complete revised Korean novel prose. Target {target_band} while preserving the draft's facts, "
+            "characters, order, point of view, and ending. Return one full replacement from beginning to end; do not append "
+            "fragments to the original. Expand rushed actions, dialogue, transitions, and aftermath inside the prose. Do not "
+            "change canon outside review requirements, repeat sentences, pad with filler, report a character count, or include "
+            "headings, scene numbers, Markdown fences, JSON, or process notes."
+        )
     if stage == "writer":
-        instruction += " Write only novel prose. Before answering, silently verify the prose is safely between 5000 and 7000 characters, and never mention the character count or this self-check."
+        instruction += f" Before answering, silently verify the prose is safely within {target_band}; the validator checks the real length, so never mention the character count or this self-check."
     elif stage == "revision":
-        instruction += " Write only revised novel prose. Before answering, silently verify the prose is safely between 5000 and 7000 characters, and never mention the character count or this self-check."
+        instruction += f" Before answering, silently verify the replacement is safely within {target_band}; the validator checks the real length, so never mention the character count or this self-check."
     worker_id = f"{stage}-{role}"
     worker_rule = f'Use exactly these keys and no others: {{"worker_id":"{worker_id}","role":"{role}","verdict":"OK","primary_finding":"one concise finding","primary_risk":"one concise risk","evidence_refs":["source:current_episode"],"proposal":{{"role":"{role}"}}}}.'
     conflicts = payload.get("open_conflicts", [])
@@ -58,9 +87,9 @@ Select resolved existing conflicts only by ID from CURRENT_OPEN_CONFLICT_OPTIONS
     elif stage == "planning_merge":
         role_rule = _planning_merge_rule(payload)
     elif stage == "review_merge":
-        role_rule = "Return exactly these keys: verdict, strengths_to_preserve, required_changes, evidence_refs. verdict is PASS, REVISE_ONCE, or HOLD. PASS has no required_changes; REVISE_ONCE has one to three. If draft_contract.verdict is REVISE_REQUIRED and there is no HOLD-level defect, verdict must be REVISE_ONCE. Required changes must preserve the draft's strengths, events, and causality; forbid adding a new central conflict; forbid padding with repeated sentences; and require a coherent full rewrite targeting 5000 to 7000 characters."
+        role_rule = f"Return exactly these keys: verdict, strengths_to_preserve, required_changes, evidence_refs. verdict is PASS, REVISE_ONCE, or HOLD. PASS has no required_changes; REVISE_ONCE has one to three. If draft_contract.verdict is REVISE_REQUIRED and there is no HOLD-level defect, verdict must be REVISE_ONCE. Required changes must preserve the draft's strengths, events, and causality; forbid adding a new central conflict; forbid padding with repeated sentences; and require a coherent full rewrite targeting {target_band}."
     elif stage == "memory_merge":
         role_rule = memory_merge_rule + " Do not add an item already present in memory_before. Existing memory is not evidence; final.md is the only evidence for new memory."
     else:
-        role_rule = "Perform only the assigned task. If this is revision with draft_contract.verdict REVISE_REQUIRED, rewrite the whole draft as one coherent 5000 to 7000 character novel prose passage. Do not append fragments to the original draft."
+        role_rule = f"Perform only the assigned task. If this is revision with draft_contract.verdict REVISE_REQUIRED, rewrite the whole draft as one coherent {target_band} novel prose passage. Do not append fragments to the original draft."
     return f"{instruction}\n{role_rule}\nStage: {stage}\nRole: {role}\nInput JSON:\n{json.dumps(payload, ensure_ascii=False)}"

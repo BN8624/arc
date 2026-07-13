@@ -19,6 +19,9 @@ class ModelClient(Protocol):
 
 
 PROSE_FORBIDDEN_MARKERS = ("[화면]", "[음향]", "[카메라]", "장면 1", "장면 2", "SCENE 1", "CUT TO:", "```")
+PROSE_MIN_CHARACTERS = 4000
+PROSE_MAX_CHARACTERS = 8000
+PROSE_REPAIRABLE_MIN_CHARACTERS = 3000
 
 
 REQUIRED_FIXTURE_KEYS = {
@@ -45,11 +48,11 @@ def validate_prose(value: object) -> str:
         error.character_count = count
         raise error
     count = len(value)
-    if count < 4000:
+    if count < PROSE_MIN_CHARACTERS:
         error = ContractError("canonical prose is too short", "PROSE_TOO_SHORT")
         error.character_count = count
         raise error
-    if count > 8000:
+    if count > PROSE_MAX_CHARACTERS:
         error = ContractError("canonical prose is too long", "PROSE_TOO_LONG")
         error.character_count = count
         raise error
@@ -71,28 +74,28 @@ def validate_draft_prose(value: object) -> tuple[str, dict]:
         error = ContractError("canonical prose contains forbidden marker", "PROSE_FORBIDDEN_MARKER")
         error.character_count = count
         raise error
-    if count > 8000:
+    if count > PROSE_MAX_CHARACTERS:
         error = ContractError("canonical prose is too long", "PROSE_TOO_LONG")
         error.character_count = count
         raise error
-    if count < 3000:
+    if count < PROSE_REPAIRABLE_MIN_CHARACTERS:
         error = ContractError("canonical prose is too short", "PROSE_TOO_SHORT")
         error.character_count = count
         raise error
-    if count < 4000:
+    if count < PROSE_MIN_CHARACTERS:
         return value, {
             "verdict": "REVISE_REQUIRED",
             "contract_code": "PROSE_UNDERLENGTH_REPAIRABLE",
             "character_count": count,
-            "minimum_final_characters": 4000,
-            "maximum_final_characters": 8000,
+            "minimum_final_characters": PROSE_MIN_CHARACTERS,
+            "maximum_final_characters": PROSE_MAX_CHARACTERS,
         }
     return value, {
         "verdict": "PASS",
         "contract_code": None,
         "character_count": count,
-        "minimum_final_characters": 4000,
-        "maximum_final_characters": 8000,
+        "minimum_final_characters": PROSE_MIN_CHARACTERS,
+        "maximum_final_characters": PROSE_MAX_CHARACTERS,
     }
 
 

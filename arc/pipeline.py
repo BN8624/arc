@@ -7,7 +7,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from .contracts import ContractError, ModelClient, apply_conflict_selectors, apply_memory_update, parse_object, validate_draft_prose, validate_fixture, validate_memory, validate_plan, validate_prose, validate_review, validate_worker
+from .contracts import ContractError, ModelClient, PROSE_MAX_CHARACTERS, PROSE_MIN_CHARACTERS, apply_conflict_selectors, apply_memory_update, parse_object, validate_draft_prose, validate_fixture, validate_memory, validate_plan, validate_prose, validate_review, validate_worker
 from .storage import StorageError, read_json, sha256_bytes, sha256_file, verify_artifacts, write_json, write_text
 
 PLANNING_ROLES = ["event", "protagonist_action", "relationship", "continuity", "readability_weight", "reader_payoff"]
@@ -237,7 +237,7 @@ class MockPipeline:
                 raise
         if not isinstance(text, str) or not text.strip() or text.lstrip().startswith(("{", "[")):
             raise ContractError("invalid canonical prose")
-        if self.mode == "live" and (not 4000 <= len(text) <= 8000 or any(marker in text for marker in ("[화면]", "[음향]", "[카메라]", "장면 1", "장면 2", "SCENE 1", "CUT TO:", "```"))):
+        if self.mode == "live" and (not PROSE_MIN_CHARACTERS <= len(text) <= PROSE_MAX_CHARACTERS or any(marker in text for marker in ("[화면]", "[음향]", "[카메라]", "장면 1", "장면 2", "SCENE 1", "CUT TO:", "```"))):
             raise ContractError("live prose contract failed")
         return text
 
@@ -256,7 +256,7 @@ class MockPipeline:
             raise
 
     def _draft_contract_value(self, character_count: int, verdict: str, contract_code: str | None) -> dict:
-        return {"schema_version": 1, "episode_id": None, "verdict": verdict, "contract_code": contract_code, "character_count": character_count, "minimum_final_characters": 4000, "maximum_final_characters": 8000, "evidence_ref": "draft.md"}
+        return {"schema_version": 1, "episode_id": None, "verdict": verdict, "contract_code": contract_code, "character_count": character_count, "minimum_final_characters": PROSE_MIN_CHARACTERS, "maximum_final_characters": PROSE_MAX_CHARACTERS, "evidence_ref": "draft.md"}
 
     def _commit_draft(self, run_dir: Path, manifest: dict, text: str, draft_contract: dict) -> None:
         self._commit_artifact(run_dir, manifest, "draft.md", text, text=True)
@@ -270,7 +270,7 @@ class MockPipeline:
     def _draft_contract(self, run_dir: Path, manifest: dict, draft: str) -> dict:
         if "draft_contract.json" in manifest["artifact_hashes"] and (run_dir / "draft_contract.json").exists():
             return read_json(run_dir / "draft_contract.json")
-        return {"schema_version": 1, "episode_id": manifest["episode_id"], "verdict": "PASS", "contract_code": None, "character_count": len(draft), "minimum_final_characters": 4000, "maximum_final_characters": 8000, "evidence_ref": "draft.md"}
+        return {"schema_version": 1, "episode_id": manifest["episode_id"], "verdict": "PASS", "contract_code": None, "character_count": len(draft), "minimum_final_characters": PROSE_MIN_CHARACTERS, "maximum_final_characters": PROSE_MAX_CHARACTERS, "evidence_ref": "draft.md"}
 
     def _save_live_calls(self, run_dir: Path, manifest: dict) -> None:
         if self.mode == "live":
