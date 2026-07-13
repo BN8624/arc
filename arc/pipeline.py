@@ -1,10 +1,12 @@
 # Phase 1 합성 회차의 재개 가능한 수직 루프를 실행한다.
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .contracts import ContractError, ModelClient, PROSE_MAX_CHARACTERS, PROSE_MIN_CHARACTERS, apply_conflict_selectors, apply_memory_update, parse_object, validate_draft_prose, validate_fixture, validate_memory, validate_plan, validate_prose, validate_review, validate_worker
@@ -85,11 +87,12 @@ class MockPipeline:
             if self.mode == "live" and (run_dir / "live_calls.json").exists():
                 self.client.restore_telemetry(read_json(run_dir / "live_calls.json"))
                 self._reconcile_invalid_memory_merge(source, run_dir, manifest)
+            self._prepare_revision_state(run_dir, manifest)
             if manifest["status"] in {"COMPLETE", "HOLD"}:
                 return {"no_op": True, "manifest": manifest}
         else:
             run_dir.mkdir(parents=True, exist_ok=True)
-            manifest = {"schema_version": 1, "mode": self.mode, "fixture_id": source["fixture_id"], "episode_id": source["current_episode"]["episode_id"], "scenario": scenario, "status": "RUNNING", "completed_stages": [], "source_hash": source_hash, "artifact_hashes": {}, "writer_call_count": 0, "revision_count": 0, "review_verdict": None, "last_error": None}
+            manifest = {"schema_version": 1, "mode": self.mode, "fixture_id": source["fixture_id"], "episode_id": source["current_episode"]["episode_id"], "scenario": scenario, "status": "RUNNING", "completed_stages": [], "source_hash": source_hash, "artifact_hashes": {}, "writer_call_count": 0, "revision_count": 0, "review_verdict": None, "last_error": None, **self._initial_revision_state()}
             if self.mode == "live":
                 manifest.update({"provider": "gemini_developer_api", "model": self.client.config.model, "sdk_version": self.client.sdk_version, "key_pool_size": 11, "max_live": self.client.config.max_live, "live_call_count": 0, "routing_schema_version": 2, "routing_mode": "dynamic_key_pool"})
             write_json(manifest_path, manifest)
@@ -104,6 +107,7 @@ class MockPipeline:
         return {"no_op": False, "manifest": manifest}
 
     def _advance(self, source: dict, run_dir: Path, manifest: dict) -> None:
+        self._prepare_revision_state(run_dir, manifest)
         if "CONTEXT_ASSEMBLED" not in manifest["completed_stages"]:
             context = {"fixture_id": source["fixture_id"], "episode_id": source["current_episode"]["episode_id"], "current_episode": source["current_episode"], "series_compass": source["series_compass"], "world_rules": source["world_rules"], "characters": source["characters"], "confirmed_facts": source["confirmed_facts"], "relationship_state": source["relationship_state"], "open_conflicts": source["open_conflicts"], "promises": source["promises"], "recent_summaries": source["episode_summaries"], "important_excerpts": source["important_excerpts"], "rolling_plan": source["rolling_plan"], "required_next_episode_continuity": source["required_next_episode_continuity"], "source_hash": manifest["source_hash"]}
             self._commit(run_dir, manifest, "context_packet.json", context, "CONTEXT_ASSEMBLED")
@@ -155,9 +159,23 @@ class MockPipeline:
             self._save_manifest(run_dir, manifest)
             return
         if decision["verdict"] == "REVISE_ONCE" and "REVISION_COMPLETED" not in manifest["completed_stages"]:
-            text = self._prose("revision", {"context": context, "plan": plan, "draft": draft, "draft_contract": draft_contract, "decision": decision})
-            manifest["revision_count"] = 1
-            self._commit(run_dir, manifest, "revised.md", text, "REVISION_COMPLETED", text=True)
+            if manifest["revision_attempt_state"] == "RESPONSE_RECEIVED":
+                self._reject_consumed_revision(run_dir, manifest, "REVISION_RESPONSE_ALREADY_CONSUMED")
+                return
+            if manifest["revision_attempt_state"] == "REJECTED":
+                manifest["status"] = "HOLD"
+                self._save_manifest(run_dir, manifest)
+                return
+            text = self._revision_prose(run_dir, manifest, {"context": context, "plan": plan, "draft": draft, "draft_contract": draft_contract, "decision": decision})
+            if text is None:
+                return
+            self._commit_artifact(run_dir, manifest, "revised.md", text, text=True)
+            manifest["completed_stages"].append("REVISION_COMPLETED")
+            manifest["revision_attempt_state"] = "COMPLETED"
+            manifest["revision_contract_code"] = None
+            manifest["status"] = "RUNNING"
+            manifest["last_error"] = None
+            self._save_manifest(run_dir, manifest)
         if "FINALIZED" not in manifest["completed_stages"]:
             source_path = run_dir / ("revised.md" if decision["verdict"] == "REVISE_ONCE" else "draft.md")
             self._commit(run_dir, manifest, "final.md", source_path.read_text(encoding="utf-8"), "FINALIZED", text=True)
@@ -240,6 +258,88 @@ class MockPipeline:
         if self.mode == "live" and (not PROSE_MIN_CHARACTERS <= len(text) <= PROSE_MAX_CHARACTERS or any(marker in text for marker in ("[화면]", "[음향]", "[카메라]", "장면 1", "장면 2", "SCENE 1", "CUT TO:", "```"))):
             raise ContractError("live prose contract failed")
         return text
+
+    @staticmethod
+    def _initial_revision_state() -> dict:
+        return {"revision_attempt_state": "NOT_STARTED", "revision_exhausted": False, "revision_response_sha256": None, "revision_character_count": None, "revision_contract_code": None, "revision_response_received_at": None, "revision_call_id": None, "revision_lease_sequence": None}
+
+    def _prepare_revision_state(self, run_dir: Path, manifest: dict) -> None:
+        keys = set(self._initial_revision_state())
+        present = keys & set(manifest)
+        if not present:
+            error = manifest.get("last_error") if isinstance(manifest.get("last_error"), dict) else {}
+            if manifest.get("review_verdict") == "REVISE_ONCE" and error.get("stage") == "revision":
+                raise PipelineError("REVISION_RECONCILIATION_REQUIRED")
+            manifest.update(self._initial_revision_state())
+            self._save_manifest(run_dir, manifest)
+        elif present != keys:
+            raise PipelineError("invalid revision evidence")
+        self._validate_revision_state(run_dir, manifest)
+        if manifest["revision_attempt_state"] == "RESPONSE_RECEIVED":
+            self._reject_consumed_revision(run_dir, manifest, "REVISION_RESPONSE_ALREADY_CONSUMED")
+
+    def _validate_revision_state(self, run_dir: Path, manifest: dict) -> None:
+        count = manifest.get("revision_count")
+        state = manifest.get("revision_attempt_state")
+        exhausted = manifest.get("revision_exhausted")
+        if type(count) is not int or count not in {0, 1} or state not in {"NOT_STARTED", "RESPONSE_RECEIVED", "COMPLETED", "REJECTED"}:
+            raise PipelineError("invalid revision evidence")
+        if (state == "NOT_STARTED") != (count == 0) or exhausted is not (count == 1):
+            raise PipelineError("invalid revision evidence")
+        evidence = (manifest.get("revision_response_sha256"), manifest.get("revision_character_count"), manifest.get("revision_response_received_at"), manifest.get("revision_call_id"), manifest.get("revision_lease_sequence"))
+        if state == "NOT_STARTED":
+            if any(item is not None for item in evidence) or manifest.get("revision_contract_code") is not None or "REVISION_COMPLETED" in manifest["completed_stages"] or (run_dir / "revised.md").exists():
+                raise PipelineError("invalid revision evidence")
+            return
+        digest, characters, received_at, call_id, lease = evidence
+        if not isinstance(digest, str) or len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest) or type(characters) is not int or characters < 0 or not isinstance(received_at, str) or not isinstance(call_id, str) or type(lease) is not int:
+            raise PipelineError("invalid revision evidence")
+        completed = "REVISION_COMPLETED" in manifest["completed_stages"]
+        revised = run_dir / "revised.md"
+        if state == "COMPLETED":
+            if not completed or not revised.exists() or manifest.get("revision_contract_code") is not None:
+                raise PipelineError("invalid revision evidence")
+        elif completed or revised.exists():
+            raise PipelineError("invalid revision evidence")
+        if state == "REJECTED" and not manifest.get("revision_contract_code"):
+            raise PipelineError("invalid revision evidence")
+        telemetry_path = run_dir / "live_calls.json"
+        if self.mode == "live" and telemetry_path.exists():
+            calls = [call for call in read_json(telemetry_path).get("calls", []) if call.get("call_id") == call_id and call.get("stage") == "revision" and call.get("role") == "canonical"]
+            if len(calls) != 1 or calls[0].get("status") != "PASS" or calls[0].get("response_sha256") != digest or calls[0].get("output_characters") != characters or calls[0].get("lease_sequence") != lease:
+                raise PipelineError("invalid revision telemetry evidence")
+
+    def _revision_prose(self, run_dir: Path, manifest: dict, payload: dict) -> str | None:
+        if self.mode != "live":
+            text = self._prose("revision", payload)
+            manifest.update({"revision_count": 1, "revision_attempt_state": "RESPONSE_RECEIVED", "revision_exhausted": True, "revision_response_sha256": hashlib.sha256(text.encode()).hexdigest(), "revision_character_count": len(text), "revision_contract_code": None, "revision_response_received_at": datetime.now(timezone.utc).isoformat(), "revision_call_id": "MOCK", "revision_lease_sequence": 0})
+            self._save_manifest(run_dir, manifest)
+            return text
+        text = self._request("revision", "canonical", payload)
+        if not isinstance(text, str):
+            raise ContractError("invalid canonical prose")
+        digest = hashlib.sha256(text.encode()).hexdigest()
+        telemetry = self.client.telemetry() if hasattr(self.client, "telemetry") else {"calls": []}
+        calls = [call for call in telemetry.get("calls", []) if call.get("stage") == "revision" and call.get("role") == "canonical" and call.get("status") == "PASS" and call.get("response_sha256") == digest and call.get("output_characters") == len(text)]
+        call = calls[-1] if calls else {}
+        manifest.update({"revision_count": 1, "revision_attempt_state": "RESPONSE_RECEIVED", "revision_exhausted": True, "revision_response_sha256": digest, "revision_character_count": len(text), "revision_contract_code": None, "revision_response_received_at": call.get("finished_at") or datetime.now(timezone.utc).isoformat(), "revision_call_id": call.get("call_id") or "UNAVAILABLE", "revision_lease_sequence": call.get("lease_sequence", 0)})
+        self._save_live_calls(run_dir, manifest)
+        self._save_manifest(run_dir, manifest)
+        try:
+            return validate_prose(text)
+        except ContractError as error:
+            self.client.record_contract_failure("revision", "canonical", contract_code=error.contract_code, character_count=getattr(error, "character_count", None))
+            self._reject_consumed_revision(run_dir, manifest, error.contract_code or "REVISION_CONTRACT_REJECTED", error)
+            return None
+
+    def _reject_consumed_revision(self, run_dir: Path, manifest: dict, code: str, error: Exception | None = None) -> None:
+        manifest["revision_attempt_state"] = "REJECTED"
+        manifest["revision_exhausted"] = True
+        manifest["revision_contract_code"] = code
+        manifest["status"] = "HOLD"
+        manifest["last_error"] = self._error_record(error) if error else {"error_class": "CONTRACT_ERROR", "stage": "revision", "role": "canonical", "contract_code": code, "call_id": manifest.get("revision_call_id"), "character_count": manifest.get("revision_character_count"), "message": "revision response already consumed"}
+        self._save_live_calls(run_dir, manifest)
+        self._save_manifest(run_dir, manifest)
 
     def _draft_prose(self, payload: dict) -> tuple[str, dict]:
         raw = self._request("writer", "canonical", payload)

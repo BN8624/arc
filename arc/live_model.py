@@ -332,7 +332,7 @@ class GemmaPoolClient:
                 self.usage_gate.mark_dispatched(generation_event_id)
             response = self._clients[slot].models.generate_content(model=self.config.model, contents=prompt, config=config)
             text = getattr(response, "text", None)
-            if not isinstance(text, str) or not text.strip():
+            if not isinstance(text, str) or (stage != "revision" and not text.strip()):
                 if self.usage_gate and generation_event_id:
                     self.usage_gate.finish(event_id=generation_event_id, response=response, succeeded=False, error_code="EMPTY_RESPONSE")
                 self._append(stage, role, slot, "FAIL", started, tick, prompt, "", response, "EMPTY_RESPONSE", None, reservation, launch_sequence, scheduled, provider_start)
@@ -371,7 +371,7 @@ class GemmaPoolClient:
         usage = getattr(response, "usage_metadata", None) if response else None
         with self._lock:
             previous = max((call.get("provider_started_monotonic", 0.0) for call in self.calls), default=0.0)
-            self.calls.append({**(reservation or {}), "stage": stage, "role": role, "key_slot": slot, "status": status, "started_at": datetime.now(timezone.utc).isoformat(), "provider_started_at": datetime.now(timezone.utc).isoformat(), "provider_started_monotonic": provider_start, "scheduled_start_at": scheduled, "launch_sequence": launch_sequence, "launch_wait_ms": round(max(0, (provider_start or 0)-(scheduled or 0))*1000), "previous_launch_gap_ms": None if not previous or provider_start is None else round((provider_start-previous)*1000), "finished_at": datetime.now(timezone.utc).isoformat(), "latency_ms": round((time.perf_counter() - tick) * 1000), "input_characters": len(prompt), "output_characters": len(text), "prompt_tokens": getattr(usage, "prompt_token_count", None), "output_tokens": getattr(usage, "candidates_token_count", None), "total_tokens": getattr(usage, "total_token_count", None), "response_sha256": hashlib.sha256(text.encode()).hexdigest() if text else None, "error_class": error_class, "http_status": http_status, "provider_code": None})
+            self.calls.append({**(reservation or {}), "stage": stage, "role": role, "key_slot": slot, "status": status, "started_at": datetime.now(timezone.utc).isoformat(), "provider_started_at": datetime.now(timezone.utc).isoformat(), "provider_started_monotonic": provider_start, "scheduled_start_at": scheduled, "launch_sequence": launch_sequence, "launch_wait_ms": round(max(0, (provider_start or 0)-(scheduled or 0))*1000), "previous_launch_gap_ms": None if not previous or provider_start is None else round((provider_start-previous)*1000), "finished_at": datetime.now(timezone.utc).isoformat(), "latency_ms": round((time.perf_counter() - tick) * 1000), "input_characters": len(prompt), "output_characters": len(text), "prompt_tokens": getattr(usage, "prompt_token_count", None), "output_tokens": getattr(usage, "candidates_token_count", None), "total_tokens": getattr(usage, "total_token_count", None), "response_sha256": hashlib.sha256(text.encode()).hexdigest() if isinstance(text, str) else None, "error_class": error_class, "http_status": http_status, "provider_code": None})
             if self._telemetry_sink:
                 self._telemetry_sink(self._telemetry_snapshot())
 
