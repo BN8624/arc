@@ -20,6 +20,8 @@ Each transition stores its canonical input hash and next-source hash. On restart
 
 Completed episodes and transitions are never rerun. A current episode delegates resume to the existing single-episode pipeline. COMPLETE and HOLD pilot reruns are no-ops. Episode HOLD prevents later source, transition, and acceptance creation. Pilot acceptance HOLD preserves all episodes and never automatically revises or advances to Phase 4.
 
+Live writer drafts between 3,000 and 3,999 characters are repairable drafts, not final prose. They are saved as `draft.md` with `draft_contract.json`, pass through the existing review wave, and may receive at most one full-prose revision. The final prose contract remains 4,000 to 8,000 characters. ARC must not concatenate fragments to repair length. If the single revision fails the final prose contract, the run fails closed.
+
 The seven acceptance dimensions execute through `client.generate(stage="pilot_review", role=dimension, prompt=canonical_prompt)`. Their validated successes are atomically stored in `pilot_review_workers.partial.json`. Restart reuses completed dimensions and calls only missing ones. Terminal desk errors preserve other successful partial results. Canonical review workers and acceptance artifacts are committed before the partial checkpoint is removed.
 
 Malformed, hash-mismatched, unknown, or duplicate acceptance partial dimensions fail closed. COMPLETE and both HOLD no-op reruns make no episode, transition, or pilot-review calls and preserve canonical artifact hashes. A stale partial after a verified terminal pilot state is removed without changing canonical artifacts.

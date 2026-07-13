@@ -7,7 +7,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from .contracts import ContractError, ModelClient, apply_conflict_selectors, apply_memory_update, parse_object, validate_fixture, validate_memory, validate_plan, validate_prose, validate_review, validate_worker
+from .contracts import ContractError, ModelClient, apply_conflict_selectors, apply_memory_update, parse_object, validate_draft_prose, validate_fixture, validate_memory, validate_plan, validate_prose, validate_review, validate_worker
 from .storage import StorageError, read_json, sha256_bytes, sha256_file, verify_artifacts, write_json, write_text
 
 PLANNING_ROLES = ["event", "protagonist_action", "relationship", "continuity", "readability_weight", "reader_payoff"]
@@ -127,19 +127,24 @@ class MockPipeline:
             self._commit(run_dir, manifest, "episode_plan.json", value, "PLAN_MERGED")
         plan = read_json(run_dir / "episode_plan.json")
         if "DRAFT_COMPLETED" not in manifest["completed_stages"]:
-            text = self._prose("writer", {"context": context, "plan": plan})
+            text, draft_contract = self._draft_prose({"context": context, "plan": plan})
             manifest["writer_call_count"] += 1
-            self._commit(run_dir, manifest, "draft.md", text, "DRAFT_COMPLETED", text=True)
+            self._commit_draft(run_dir, manifest, text, draft_contract)
         draft = (run_dir / "draft.md").read_text(encoding="utf-8")
+        draft_contract = self._draft_contract(run_dir, manifest, draft)
         if "REVIEW_WAVE_COMPLETED" not in manifest["completed_stages"]:
-            workers = self._wave("review", REVIEW_ROLES, {"context": context, "plan": plan, "draft": draft}, run_dir)
+            workers = self._wave("review", REVIEW_ROLES, {"context": context, "plan": plan, "draft": draft, "draft_contract": draft_contract}, run_dir)
             self._commit(run_dir, manifest, "review_workers.json", workers, "REVIEW_WAVE_COMPLETED")
             (run_dir / "review_workers.partial.json").unlink(missing_ok=True)
         else:
             (run_dir / "review_workers.partial.json").unlink(missing_ok=True)
         review_workers = read_json(run_dir / "review_workers.json")
         if "REVIEW_MERGED" not in manifest["completed_stages"]:
-            decision = validate_review(parse_object(self._request("review_merge", "merge", {"context": context, "plan": plan, "draft": draft, "workers": review_workers})))
+            decision = validate_review(parse_object(self._request("review_merge", "merge", {"context": context, "plan": plan, "draft": draft, "draft_contract": draft_contract, "workers": review_workers})))
+            if draft_contract["verdict"] == "REVISE_REQUIRED" and decision["verdict"] == "PASS":
+                if self.mode == "live":
+                    self.client.record_contract_failure("review_merge", "merge", contract_code="PROSE_REPAIRABLE_PASS_INVALID", character_count=draft_contract["character_count"])
+                raise ContractError("repairable underlength draft cannot pass review merge", "PROSE_REPAIRABLE_PASS_INVALID")
             manifest["review_verdict"] = decision["verdict"]
             self._commit(run_dir, manifest, "review_decision.json", decision, "REVIEW_MERGED")
         decision = read_json(run_dir / "review_decision.json")
@@ -150,7 +155,7 @@ class MockPipeline:
             self._save_manifest(run_dir, manifest)
             return
         if decision["verdict"] == "REVISE_ONCE" and "REVISION_COMPLETED" not in manifest["completed_stages"]:
-            text = self._prose("revision", {"context": context, "plan": plan, "draft": draft, "decision": decision})
+            text = self._prose("revision", {"context": context, "plan": plan, "draft": draft, "draft_contract": draft_contract, "decision": decision})
             manifest["revision_count"] = 1
             self._commit(run_dir, manifest, "revised.md", text, "REVISION_COMPLETED", text=True)
         if "FINALIZED" not in manifest["completed_stages"]:
@@ -236,6 +241,37 @@ class MockPipeline:
             raise ContractError("live prose contract failed")
         return text
 
+    def _draft_prose(self, payload: dict) -> tuple[str, dict]:
+        raw = self._request("writer", "canonical", payload)
+        text = raw if self.mode == "live" else parse_object(raw).get("text")
+        if self.mode != "live":
+            if not isinstance(text, str) or not text.strip() or text.lstrip().startswith(("{", "[")):
+                raise ContractError("invalid canonical prose")
+            return text, self._draft_contract_value(len(text), "PASS", None)
+        try:
+            text, contract = validate_draft_prose(text)
+            return text, self._draft_contract_value(contract["character_count"], contract["verdict"], contract["contract_code"])
+        except ContractError as error:
+            self.client.record_contract_failure("writer", "canonical", contract_code=error.contract_code, character_count=getattr(error, "character_count", None))
+            raise
+
+    def _draft_contract_value(self, character_count: int, verdict: str, contract_code: str | None) -> dict:
+        return {"schema_version": 1, "episode_id": None, "verdict": verdict, "contract_code": contract_code, "character_count": character_count, "minimum_final_characters": 4000, "maximum_final_characters": 8000, "evidence_ref": "draft.md"}
+
+    def _commit_draft(self, run_dir: Path, manifest: dict, text: str, draft_contract: dict) -> None:
+        self._commit_artifact(run_dir, manifest, "draft.md", text, text=True)
+        draft_contract["episode_id"] = manifest["episode_id"]
+        self._commit_artifact(run_dir, manifest, "draft_contract.json", draft_contract)
+        manifest["completed_stages"].append("DRAFT_COMPLETED")
+        manifest["status"] = "RUNNING"
+        manifest["last_error"] = None
+        self._save_manifest(run_dir, manifest)
+
+    def _draft_contract(self, run_dir: Path, manifest: dict, draft: str) -> dict:
+        if "draft_contract.json" in manifest["artifact_hashes"] and (run_dir / "draft_contract.json").exists():
+            return read_json(run_dir / "draft_contract.json")
+        return {"schema_version": 1, "episode_id": manifest["episode_id"], "verdict": "PASS", "contract_code": None, "character_count": len(draft), "minimum_final_characters": 4000, "maximum_final_characters": 8000, "evidence_ref": "draft.md"}
+
     def _save_live_calls(self, run_dir: Path, manifest: dict) -> None:
         if self.mode == "live":
             telemetry = self.client.telemetry()
@@ -269,8 +305,8 @@ class MockPipeline:
         if isinstance(error, ContractError) and error.contract_code:
             telemetry = self.client.telemetry() if hasattr(self.client, "telemetry") else {"contract_failures": []}
             event = next((item for item in reversed(telemetry.get("contract_failures", [])) if item.get("contract_code") == error.contract_code), {})
-            stage = event.get("stage") or ("planning_merge" if str(error.contract_code).startswith("PLAN_") else None)
-            role = event.get("role") or ("merge" if stage == "planning_merge" else None)
+            stage = event.get("stage") or ("planning_merge" if str(error.contract_code).startswith("PLAN_") else "review_merge" if error.contract_code == "PROSE_REPAIRABLE_PASS_INVALID" else None)
+            role = event.get("role") or ("merge" if stage in {"planning_merge", "review_merge"} else None)
             message = "sanitized planning merge contract failure" if stage == "planning_merge" else "sanitized prose contract failure" if stage in {"writer", "revision"} else "sanitized contract failure"
             record = {"error_class": "CONTRACT_ERROR", "stage": stage, "role": role, "contract_code": error.contract_code, "key_slot": event.get("key_slot", "UNKNOWN"), "http_status": None, "provider_code": None, "message": message}
             if "character_count" in event:

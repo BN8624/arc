@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from arc.contracts import ContractError, PROSE_FORBIDDEN_MARKERS, validate_prose
+from arc.contracts import ContractError, PROSE_FORBIDDEN_MARKERS, validate_draft_prose, validate_prose
 from arc.live_model import AtomicTelemetryStore, GemmaPoolClient, LiveConfig, MODEL_NAME, RoutingStateStore
 from arc.pipeline import PLANNING_ROLES, MockPipeline, WaveCheckpoint, status
 from arc.pilot_contracts import PILOT_REVIEW_ROLES
@@ -80,7 +80,7 @@ class _PilotProvider:
 
 
 class _PilotProviderRoot:
-    def __init__(self, fail_once_at: str | None = None, hold_episode: str | None = None, fail_status_code: int = 500, hold_dimension: str | None = None, wrong_plan_once: bool = False, wrong_plan_episode: str | None = None, short_writer_once_episode: str | None = None):
+    def __init__(self, fail_once_at: str | None = None, hold_episode: str | None = None, fail_status_code: int = 500, hold_dimension: str | None = None, wrong_plan_once: bool = False, wrong_plan_episode: str | None = None, short_writer_once_episode: str | None = None, repairable_writer_once_episode: str | None = None, review_pass_on_repairable: bool = False, short_revision_once_episode: str | None = None):
         self.fail_once_at = fail_once_at
         self.hold_episode = hold_episode
         self.fail_status_code = fail_status_code
@@ -88,6 +88,9 @@ class _PilotProviderRoot:
         self.wrong_plan_once = wrong_plan_once
         self.wrong_plan_episode = wrong_plan_episode
         self.short_writer_once_episode = short_writer_once_episode
+        self.repairable_writer_once_episode = repairable_writer_once_episode
+        self.review_pass_on_repairable = review_pass_on_repairable
+        self.short_revision_once_episode = short_revision_once_episode
         self.malformed_once_at: str | None = None
         self.failed: set[str] = set()
         self.malformed: set[str] = set()
@@ -118,11 +121,22 @@ class _PilotProviderRoot:
             if self.short_writer_once_episode == episode_id and marker not in self.malformed:
                 self.malformed.add(marker)
                 return "short prose"
+            if self.repairable_writer_once_episode == episode_id and marker not in self.malformed:
+                self.malformed.add(marker)
+                return "A" * 3500
             return ("A synthetic live episode sentence. " * 160)[:4800]
         if stage == "review_merge":
             verdict = "HOLD" if episode_id == self.hold_episode else "PASS"
+            if verdict == "HOLD":
+                return json.dumps({"verdict": verdict, "strengths_to_preserve": ["synthetic agency"], "required_changes": [], "evidence_refs": ["draft.md"]})
+            if payload.get("draft_contract", {}).get("verdict") == "REVISE_REQUIRED" and not self.review_pass_on_repairable:
+                return json.dumps({"verdict": "REVISE_ONCE", "strengths_to_preserve": ["synthetic agency"], "required_changes": ["Preserve strengths, events, and causality while rewriting the whole draft.", "Do not add a new central conflict or pad with repeated sentences.", "Produce one coherent 5000 to 7000 character prose passage."], "evidence_refs": ["draft.md"]})
             return json.dumps({"verdict": verdict, "strengths_to_preserve": ["synthetic agency"], "required_changes": [], "evidence_refs": ["draft.md"]})
         if stage == "revision":
+            marker = f"revision:{episode_id}"
+            if self.short_revision_once_episode == episode_id and marker not in self.malformed:
+                self.malformed.add(marker)
+                return "B" * 3500
             return ("A revised synthetic live episode sentence. " * 150)[:4800]
         if stage == "memory_merge":
             return json.dumps({"episode_id": episode_id, "confirmed_facts_added": [f"synthetic fact {episode_id}"], "relationship_changes": [f"synthetic relationship {episode_id}"], "conflict_ids_resolved": [], "conflicts_opened": [f"synthetic opened conflict {episode_id}"], "promises_added": [f"synthetic promise {episode_id}"], "important_excerpts_added": [f"synthetic excerpt {episode_id}"], "episode_summary": f"synthetic episode summary {episode_id}", "required_next_episode_continuity": [f"synthetic continuity {episode_id}"], "evidence_refs": ["final.md"]})
@@ -605,6 +619,32 @@ def test_validate_prose_rejects_json_shape_with_code():
     assert error.value.contract_code == "PROSE_INVALID_SHAPE"
 
 
+def test_validate_draft_prose_rejects_2999_as_terminal_short():
+    with pytest.raises(ContractError) as error:
+        validate_draft_prose("A" * 2999)
+    assert error.value.contract_code == "PROSE_TOO_SHORT"
+
+
+@pytest.mark.parametrize("count", [3000, 3999])
+def test_validate_draft_prose_accepts_repairable_underlength(count):
+    text, contract = validate_draft_prose("A" * count)
+    assert text == "A" * count
+    assert contract["verdict"] == "REVISE_REQUIRED"
+    assert contract["contract_code"] == "PROSE_UNDERLENGTH_REPAIRABLE"
+
+
+def test_validate_draft_prose_accepts_4000_as_pass():
+    _, contract = validate_draft_prose("A" * 4000)
+    assert contract["verdict"] == "PASS"
+    assert contract["contract_code"] is None
+
+
+def test_validate_draft_prose_rejects_8001_as_too_long():
+    with pytest.raises(ContractError) as error:
+        validate_draft_prose("A" * 8001)
+    assert error.value.contract_code == "PROSE_TOO_LONG"
+
+
 def test_writer_contract_failure_keeps_provider_pass_and_records_code(tmp_path):
     output = _make_episode_four_writer_error_output(tmp_path)
     telemetry = read_json(output / "pilot_live_calls.json")
@@ -650,6 +690,67 @@ def test_writer_prompt_reinforces_safe_character_band():
 
     assert "5000 and 7000 characters" in prompt
     assert "never mention the character count" in prompt
+
+
+def test_repairable_draft_is_saved_and_revised_once(tmp_path):
+    output = tmp_path / "pilot-live"
+    client, _ = _pilot_client(output, _PilotProviderRoot(repairable_writer_once_episode="episode_004"))
+
+    result = PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    ep4 = output / "episodes" / "episode_004"
+    manifest = read_json(ep4 / "manifest.json")
+    draft_contract = read_json(ep4 / "draft_contract.json")
+
+    assert result["manifest"]["status"] == "COMPLETE"
+    assert draft_contract["verdict"] == "REVISE_REQUIRED"
+    assert draft_contract["contract_code"] == "PROSE_UNDERLENGTH_REPAIRABLE"
+    assert draft_contract["character_count"] == 3500
+    assert manifest["writer_call_count"] == 1
+    assert manifest["revision_count"] == 1
+    assert (ep4 / "final.md").read_text(encoding="utf-8") == (ep4 / "revised.md").read_text(encoding="utf-8")
+
+
+def test_repairable_draft_review_merge_pass_is_rejected(tmp_path):
+    output = tmp_path / "pilot-live"
+    client, _ = _pilot_client(output, _PilotProviderRoot(repairable_writer_once_episode="episode_004", review_pass_on_repairable=True))
+
+    with pytest.raises(Exception):
+        PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    ep4 = read_json(output / "episodes" / "episode_004" / "manifest.json")
+    assert ep4["last_error"]["contract_code"] == "PROSE_REPAIRABLE_PASS_INVALID"
+    assert "draft.md" in ep4["artifact_hashes"]
+
+
+def test_repairable_draft_review_hold_skips_revision(tmp_path):
+    output = tmp_path / "pilot-live"
+    client, provider_root = _pilot_client(output, _PilotProviderRoot(repairable_writer_once_episode="episode_004", hold_episode="episode_004"))
+
+    result = PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+
+    assert result["manifest"]["status"] == "HOLD"
+    assert not any(marker == "revision:canonical" and _episode_from_prompt(prompt) == "episode_004" for _, marker, prompt in provider_root.provider_calls)
+
+
+def test_repairable_draft_revision_failure_is_terminal(tmp_path):
+    output = tmp_path / "pilot-live"
+    client, _ = _pilot_client(output, _PilotProviderRoot(repairable_writer_once_episode="episode_004", short_revision_once_episode="episode_004"))
+
+    with pytest.raises(Exception):
+        PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    ep4 = read_json(output / "episodes" / "episode_004" / "manifest.json")
+    assert ep4["last_error"]["stage"] == "revision"
+    assert ep4["last_error"]["contract_code"] == "PROSE_TOO_SHORT"
+
+
+def test_normal_writer_path_does_not_force_revision(tmp_path):
+    output = tmp_path / "pilot-live"
+    client, _ = _pilot_client(output)
+
+    PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+
+    ep4 = read_json(output / "episodes" / "episode_004" / "manifest.json")
+    assert read_json(output / "episodes" / "episode_004" / "draft_contract.json")["verdict"] == "PASS"
+    assert ep4["revision_count"] == 0
 
 
 def test_pilot_live_status_reports_valid_checkpoint_without_writes(tmp_path):

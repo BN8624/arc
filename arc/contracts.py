@@ -60,6 +60,42 @@ def validate_prose(value: object) -> str:
     return value
 
 
+def validate_draft_prose(value: object) -> tuple[str, dict]:
+    if not isinstance(value, str) or not value.strip() or value.lstrip().startswith(("{", "[")):
+        count = len(value) if isinstance(value, str) else 0
+        error = ContractError("invalid canonical prose", "PROSE_INVALID_SHAPE")
+        error.character_count = count
+        raise error
+    count = len(value)
+    if any(marker in value for marker in PROSE_FORBIDDEN_MARKERS):
+        error = ContractError("canonical prose contains forbidden marker", "PROSE_FORBIDDEN_MARKER")
+        error.character_count = count
+        raise error
+    if count > 8000:
+        error = ContractError("canonical prose is too long", "PROSE_TOO_LONG")
+        error.character_count = count
+        raise error
+    if count < 3000:
+        error = ContractError("canonical prose is too short", "PROSE_TOO_SHORT")
+        error.character_count = count
+        raise error
+    if count < 4000:
+        return value, {
+            "verdict": "REVISE_REQUIRED",
+            "contract_code": "PROSE_UNDERLENGTH_REPAIRABLE",
+            "character_count": count,
+            "minimum_final_characters": 4000,
+            "maximum_final_characters": 8000,
+        }
+    return value, {
+        "verdict": "PASS",
+        "contract_code": None,
+        "character_count": count,
+        "minimum_final_characters": 4000,
+        "maximum_final_characters": 8000,
+    }
+
+
 def validate_fixture(source: dict) -> None:
     missing = REQUIRED_FIXTURE_KEYS - source.keys()
     if missing:

@@ -52,15 +52,15 @@ Select resolved existing conflicts only by ID from CURRENT_OPEN_CONFLICT_OPTIONS
     if stage == "planning":
         role_rule = f"Analyze only the assigned planning role. Do not write prose. {worker_rule}"
     elif stage == "review":
-        role_rule = f"Inspect only the assigned review role. {worker_rule}"
+        role_rule = f"Inspect only the assigned review role. If draft_contract.verdict is REVISE_REQUIRED, evaluate the existing draft as a repairable underlength draft and preserve strengths for one full rewrite. {worker_rule}"
     elif stage == "memory":
         role_rule = f'Canonical final prose is the only evidence for new memory. Existing memory only prevents duplicates and conflicts. Do not restate existing items or convert plans into facts. Return only the assigned role. Use exactly these keys and no others: {{"worker_id":"{worker_id}","role":"{role}","verdict":"OK","primary_finding":"one concise finding","primary_risk":"one concise risk","evidence_refs":["final.md"],"proposal":{{"role":"{role}"}}}}.'
     elif stage == "planning_merge":
         role_rule = _planning_merge_rule(payload)
     elif stage == "review_merge":
-        role_rule = "Return exactly these keys: verdict, strengths_to_preserve, required_changes, evidence_refs. verdict is PASS, REVISE_ONCE, or HOLD. PASS has no required_changes; REVISE_ONCE has one to three."
+        role_rule = "Return exactly these keys: verdict, strengths_to_preserve, required_changes, evidence_refs. verdict is PASS, REVISE_ONCE, or HOLD. PASS has no required_changes; REVISE_ONCE has one to three. If draft_contract.verdict is REVISE_REQUIRED and there is no HOLD-level defect, verdict must be REVISE_ONCE. Required changes must preserve the draft's strengths, events, and causality; forbid adding a new central conflict; forbid padding with repeated sentences; and require a coherent full rewrite targeting 5000 to 7000 characters."
     elif stage == "memory_merge":
         role_rule = memory_merge_rule + " Do not add an item already present in memory_before. Existing memory is not evidence; final.md is the only evidence for new memory."
     else:
-        role_rule = "Perform only the assigned task."
+        role_rule = "Perform only the assigned task. If this is revision with draft_contract.verdict REVISE_REQUIRED, rewrite the whole draft as one coherent 5000 to 7000 character novel prose passage. Do not append fragments to the original draft."
     return f"{instruction}\n{role_rule}\nStage: {stage}\nRole: {role}\nInput JSON:\n{json.dumps(payload, ensure_ascii=False)}"
