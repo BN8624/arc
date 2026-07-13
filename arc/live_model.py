@@ -332,7 +332,7 @@ class GemmaPoolClient:
                 self.usage_gate.mark_dispatched(generation_event_id)
             response = self._clients[slot].models.generate_content(model=self.config.model, contents=prompt, config=config)
             text = getattr(response, "text", None)
-            if not isinstance(text, str) or (stage != "revision" and not text.strip()):
+            if not isinstance(text, str) or (stage not in {"writer", "revision"} and not text.strip()):
                 if self.usage_gate and generation_event_id:
                     self.usage_gate.finish(event_id=generation_event_id, response=response, succeeded=False, error_code="EMPTY_RESPONSE")
                 self._append(stage, role, slot, "FAIL", started, tick, prompt, "", response, "EMPTY_RESPONSE", None, reservation, launch_sequence, scheduled, provider_start)

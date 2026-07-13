@@ -87,12 +87,13 @@ class MockPipeline:
             if self.mode == "live" and (run_dir / "live_calls.json").exists():
                 self.client.restore_telemetry(read_json(run_dir / "live_calls.json"))
                 self._reconcile_invalid_memory_merge(source, run_dir, manifest)
+            self._prepare_writer_state(run_dir, manifest)
             self._prepare_revision_state(run_dir, manifest)
             if manifest["status"] in {"COMPLETE", "HOLD"}:
                 return {"no_op": True, "manifest": manifest}
         else:
             run_dir.mkdir(parents=True, exist_ok=True)
-            manifest = {"schema_version": 1, "mode": self.mode, "fixture_id": source["fixture_id"], "episode_id": source["current_episode"]["episode_id"], "scenario": scenario, "status": "RUNNING", "completed_stages": [], "source_hash": source_hash, "artifact_hashes": {}, "writer_call_count": 0, "revision_count": 0, "review_verdict": None, "last_error": None, **self._initial_revision_state()}
+            manifest = {"schema_version": 1, "mode": self.mode, "fixture_id": source["fixture_id"], "episode_id": source["current_episode"]["episode_id"], "scenario": scenario, "status": "RUNNING", "completed_stages": [], "source_hash": source_hash, "artifact_hashes": {}, "writer_call_count": 0, "revision_count": 0, "review_verdict": None, "last_error": None, **self._initial_writer_state(), **self._initial_revision_state()}
             if self.mode == "live":
                 manifest.update({"provider": "gemini_developer_api", "model": self.client.config.model, "sdk_version": self.client.sdk_version, "key_pool_size": 11, "max_live": self.client.config.max_live, "live_call_count": 0, "routing_schema_version": 2, "routing_mode": "dynamic_key_pool"})
             write_json(manifest_path, manifest)
@@ -107,6 +108,7 @@ class MockPipeline:
         return {"no_op": False, "manifest": manifest}
 
     def _advance(self, source: dict, run_dir: Path, manifest: dict) -> None:
+        self._prepare_writer_state(run_dir, manifest)
         self._prepare_revision_state(run_dir, manifest)
         if "CONTEXT_ASSEMBLED" not in manifest["completed_stages"]:
             context = {"fixture_id": source["fixture_id"], "episode_id": source["current_episode"]["episode_id"], "current_episode": source["current_episode"], "series_compass": source["series_compass"], "world_rules": source["world_rules"], "characters": source["characters"], "confirmed_facts": source["confirmed_facts"], "relationship_state": source["relationship_state"], "open_conflicts": source["open_conflicts"], "promises": source["promises"], "recent_summaries": source["episode_summaries"], "important_excerpts": source["important_excerpts"], "rolling_plan": source["rolling_plan"], "required_next_episode_continuity": source["required_next_episode_continuity"], "source_hash": manifest["source_hash"]}
@@ -131,8 +133,14 @@ class MockPipeline:
             self._commit(run_dir, manifest, "episode_plan.json", value, "PLAN_MERGED")
         plan = read_json(run_dir / "episode_plan.json")
         if "DRAFT_COMPLETED" not in manifest["completed_stages"]:
-            text, draft_contract = self._draft_prose({"context": context, "plan": plan})
-            manifest["writer_call_count"] += 1
+            if manifest["writer_attempt_state"] == "REJECTED":
+                manifest["status"] = "HOLD"
+                self._save_manifest(run_dir, manifest)
+                return
+            result = self._draft_prose(run_dir, manifest, {"context": context, "plan": plan})
+            if result is None:
+                return
+            text, draft_contract = result
             self._commit_draft(run_dir, manifest, text, draft_contract)
         draft = (run_dir / "draft.md").read_text(encoding="utf-8")
         draft_contract = self._draft_contract(run_dir, manifest, draft)
@@ -260,6 +268,62 @@ class MockPipeline:
         return text
 
     @staticmethod
+    def _initial_writer_state() -> dict:
+        return {"writer_attempt_state": "NOT_STARTED", "writer_exhausted": False, "writer_response_sha256": None, "writer_character_count": None, "writer_contract_code": None, "writer_response_received_at": None, "writer_call_id": None, "writer_lease_sequence": None}
+
+    def _prepare_writer_state(self, run_dir: Path, manifest: dict) -> None:
+        keys = set(self._initial_writer_state())
+        present = keys & set(manifest)
+        if not present:
+            error = manifest.get("last_error") if isinstance(manifest.get("last_error"), dict) else {}
+            if manifest.get("writer_call_count") or "DRAFT_COMPLETED" in manifest.get("completed_stages", []) or error.get("stage") == "writer":
+                raise PipelineError("WRITER_RECONCILIATION_REQUIRED")
+            manifest.update(self._initial_writer_state())
+            self._save_manifest(run_dir, manifest)
+        elif present != keys:
+            raise PipelineError("invalid writer evidence")
+        self._validate_writer_state(run_dir, manifest)
+        if manifest["writer_attempt_state"] == "RESPONSE_RECEIVED":
+            self._reject_consumed_writer(run_dir, manifest, "WRITER_RESPONSE_ALREADY_CONSUMED")
+
+    def _validate_writer_state(self, run_dir: Path, manifest: dict) -> None:
+        count = manifest.get("writer_call_count")
+        state = manifest.get("writer_attempt_state")
+        exhausted = manifest.get("writer_exhausted")
+        if type(count) is not int or count not in {0, 1} or state not in {"NOT_STARTED", "RESPONSE_RECEIVED", "COMPLETED", "REJECTED"}:
+            raise PipelineError("invalid writer evidence")
+        if (state == "NOT_STARTED") != (count == 0) or exhausted is not (count == 1):
+            raise PipelineError("invalid writer evidence")
+        evidence = (manifest.get("writer_response_sha256"), manifest.get("writer_character_count"), manifest.get("writer_response_received_at"), manifest.get("writer_call_id"), manifest.get("writer_lease_sequence"))
+        completed = "DRAFT_COMPLETED" in manifest.get("completed_stages", [])
+        draft = run_dir / "draft.md"
+        draft_contract = run_dir / "draft_contract.json"
+        if state == "NOT_STARTED":
+            if any(item is not None for item in evidence) or manifest.get("writer_contract_code") is not None or completed or draft.exists() or draft_contract.exists():
+                raise PipelineError("invalid writer evidence")
+            return
+        digest, characters, received_at, call_id, lease = evidence
+        if not isinstance(digest, str) or len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest) or type(characters) is not int or characters < 0 or not isinstance(received_at, str) or not isinstance(call_id, str) or type(lease) is not int:
+            raise PipelineError("invalid writer evidence")
+        if state == "COMPLETED":
+            if not completed or not draft.exists() or not draft_contract.exists() or sha256_file(draft) != digest:
+                raise PipelineError("invalid writer evidence")
+            contract = read_json(draft_contract)
+            if manifest.get("writer_contract_code") != contract.get("contract_code"):
+                raise PipelineError("invalid writer evidence")
+        elif completed or draft.exists() or draft_contract.exists():
+            raise PipelineError("invalid writer evidence")
+        if state == "REJECTED" and not manifest.get("writer_contract_code"):
+            raise PipelineError("invalid writer evidence")
+        if state == "RESPONSE_RECEIVED" and manifest.get("writer_contract_code") is not None:
+            raise PipelineError("invalid writer evidence")
+        telemetry_path = run_dir / "live_calls.json"
+        if self.mode == "live" and telemetry_path.exists():
+            calls = [call for call in read_json(telemetry_path).get("calls", []) if call.get("call_id") == call_id and call.get("stage") == "writer" and call.get("role") == "canonical"]
+            if len(calls) != 1 or calls[0].get("status") != "PASS" or calls[0].get("response_sha256") != digest or calls[0].get("output_characters") != characters or calls[0].get("lease_sequence") != lease:
+                raise PipelineError("invalid writer telemetry evidence")
+
+    @staticmethod
     def _initial_revision_state() -> dict:
         return {"revision_attempt_state": "NOT_STARTED", "revision_exhausted": False, "revision_response_sha256": None, "revision_character_count": None, "revision_contract_code": None, "revision_response_received_at": None, "revision_call_id": None, "revision_lease_sequence": None}
 
@@ -341,19 +405,40 @@ class MockPipeline:
         self._save_live_calls(run_dir, manifest)
         self._save_manifest(run_dir, manifest)
 
-    def _draft_prose(self, payload: dict) -> tuple[str, dict]:
+    def _draft_prose(self, run_dir: Path, manifest: dict, payload: dict) -> tuple[str, dict] | None:
         raw = self._request("writer", "canonical", payload)
         text = raw if self.mode == "live" else parse_object(raw).get("text")
         if self.mode != "live":
             if not isinstance(text, str) or not text.strip() or text.lstrip().startswith(("{", "[")):
                 raise ContractError("invalid canonical prose")
+            manifest.update({"writer_call_count": 1, "writer_attempt_state": "RESPONSE_RECEIVED", "writer_exhausted": True, "writer_response_sha256": hashlib.sha256(text.encode()).hexdigest(), "writer_character_count": len(text), "writer_contract_code": None, "writer_response_received_at": datetime.now(timezone.utc).isoformat(), "writer_call_id": "MOCK", "writer_lease_sequence": 0})
+            self._save_manifest(run_dir, manifest)
             return text, self._draft_contract_value(len(text), "PASS", None)
+        if not isinstance(text, str):
+            raise ContractError("invalid canonical prose")
+        digest = hashlib.sha256(text.encode()).hexdigest()
+        telemetry = self.client.telemetry() if hasattr(self.client, "telemetry") else {"calls": []}
+        calls = [call for call in telemetry.get("calls", []) if call.get("stage") == "writer" and call.get("role") == "canonical" and call.get("status") == "PASS" and call.get("response_sha256") == digest and call.get("output_characters") == len(text)]
+        call = calls[-1] if calls else {}
+        manifest.update({"writer_call_count": 1, "writer_attempt_state": "RESPONSE_RECEIVED", "writer_exhausted": True, "writer_response_sha256": digest, "writer_character_count": len(text), "writer_contract_code": None, "writer_response_received_at": call.get("finished_at") or datetime.now(timezone.utc).isoformat(), "writer_call_id": call.get("call_id") or "UNAVAILABLE", "writer_lease_sequence": call.get("lease_sequence", 0)})
+        self._save_live_calls(run_dir, manifest)
+        self._save_manifest(run_dir, manifest)
         try:
             text, contract = validate_draft_prose(text)
             return text, self._draft_contract_value(contract["character_count"], contract["verdict"], contract["contract_code"])
         except ContractError as error:
             self.client.record_contract_failure("writer", "canonical", contract_code=error.contract_code, character_count=getattr(error, "character_count", None))
-            raise
+            self._reject_consumed_writer(run_dir, manifest, error.contract_code or "WRITER_CONTRACT_REJECTED", error)
+            return None
+
+    def _reject_consumed_writer(self, run_dir: Path, manifest: dict, code: str, error: Exception | None = None) -> None:
+        manifest["writer_attempt_state"] = "REJECTED"
+        manifest["writer_exhausted"] = True
+        manifest["writer_contract_code"] = code
+        manifest["status"] = "HOLD"
+        manifest["last_error"] = self._error_record(error) if error else {"error_class": "CONTRACT_ERROR", "stage": "writer", "role": "canonical", "contract_code": code, "call_id": manifest.get("writer_call_id"), "character_count": manifest.get("writer_character_count"), "message": "writer response already consumed"}
+        self._save_live_calls(run_dir, manifest)
+        self._save_manifest(run_dir, manifest)
 
     def _draft_contract_value(self, character_count: int, verdict: str, contract_code: str | None) -> dict:
         return {"schema_version": 1, "episode_id": None, "verdict": verdict, "contract_code": contract_code, "character_count": character_count, "minimum_final_characters": PROSE_MIN_CHARACTERS, "maximum_final_characters": PROSE_MAX_CHARACTERS, "evidence_ref": "draft.md"}
@@ -363,6 +448,8 @@ class MockPipeline:
         draft_contract["episode_id"] = manifest["episode_id"]
         self._commit_artifact(run_dir, manifest, "draft_contract.json", draft_contract)
         manifest["completed_stages"].append("DRAFT_COMPLETED")
+        manifest["writer_attempt_state"] = "COMPLETED"
+        manifest["writer_contract_code"] = draft_contract["contract_code"]
         manifest["status"] = "RUNNING"
         manifest["last_error"] = None
         self._save_manifest(run_dir, manifest)

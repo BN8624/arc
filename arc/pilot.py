@@ -38,14 +38,21 @@ class PilotPipeline:
             verify_pilot_artifacts(run_dir, manifest)
             if self.mode == "live":
                 inspection = inspect_pilot_checkpoint(run_dir, manifest)
+                if _reconcile_legacy_writer_attempt(run_dir, manifest, inspection, fixture):
+                    return {"no_op": False, "manifest": manifest}
                 if _reconcile_legacy_revision_attempt(run_dir, manifest, inspection):
                     return {"no_op": False, "manifest": manifest}
                 active_episode = manifest.get("active_episode_id")
                 active_manifest = run_dir / "episodes" / str(active_episode) / "manifest.json"
                 if active_episode in manifest["episode_ids"] and active_manifest.exists() and "revision_attempt_state" in read_json(active_manifest):
                     index = manifest["episode_ids"].index(active_episode)
-                    MockPipeline(self._episode_client(active_episode, index), mode="live")._validate_revision_state(active_manifest.parent, read_json(active_manifest))
-                response_received = active_manifest.exists() and read_json(active_manifest).get("revision_attempt_state") == "RESPONSE_RECEIVED"
+                    child = MockPipeline(self._episode_client(active_episode, index), mode="live")
+                    child_manifest = read_json(active_manifest)
+                    if "writer_attempt_state" in child_manifest:
+                        child._validate_writer_state(active_manifest.parent, child_manifest)
+                    child._validate_revision_state(active_manifest.parent, child_manifest)
+                active_value = read_json(active_manifest) if active_manifest.exists() else {}
+                response_received = active_value.get("revision_attempt_state") == "RESPONSE_RECEIVED" or active_value.get("writer_attempt_state") == "RESPONSE_RECEIVED"
                 if inspection["checkpoint_integrity"] == "RECONCILABLE" and not response_received:
                     raise PilotError("pilot checkpoint reconciliation required")
             if manifest["status"] in {"COMPLETE", "HOLD"}:
@@ -423,6 +430,79 @@ def _reconcile_legacy_revision_attempt(run_dir: Path, manifest: dict, inspection
     manifest["status"] = "HOLD"
     manifest["active_episode_id"] = "episode_004"
     manifest["last_error"] = {"error_class": "CONTRACT_ERROR", "active_episode_id": "episode_004", "stage": "revision", "role": "canonical", "contract_code": "PROSE_TOO_SHORT", "message": "revision exhausted after rejected response"}
+    write_json(run_dir / "pilot_manifest.json", manifest)
+    return True
+
+
+def _reconcile_legacy_writer_attempt(run_dir: Path, manifest: dict, inspection: dict, fixture: dict) -> bool:
+    episode_id = manifest.get("active_episode_id")
+    episode_dir = run_dir / "episodes" / str(episode_id)
+    episode_manifest_path = episode_dir / "manifest.json"
+    if not episode_manifest_path.exists():
+        return False
+    episode = read_json(episode_manifest_path)
+    writer_keys = set(MockPipeline._initial_writer_state())
+    present = writer_keys & set(episode)
+    error = episode.get("last_error") if isinstance(episode.get("last_error"), dict) else {}
+    suspicious = episode.get("writer_call_count") == 0 and error.get("stage") == "writer"
+    if not suspicious:
+        return False
+    if present:
+        if present == writer_keys and all(episode.get(key) == value for key, value in MockPipeline._initial_writer_state().items()):
+            return False
+        raise PilotError("WRITER_RECONCILIATION_BLOCKED")
+    telemetry = read_json(run_dir / "pilot_live_calls.json")
+    writer_calls = [call for call in telemetry.get("calls", []) if call.get("scope_id") == "episode:episode_001" and call.get("stage") == "writer" and call.get("role") == "canonical"]
+    responses = [call for call in writer_calls if call.get("status") == "PASS"]
+    failures = [item for item in telemetry.get("contract_failures", []) if item.get("scope_id") == "episode:episode_001" and item.get("stage") == "writer" and item.get("role") == "canonical"]
+    response = responses[0] if len(responses) == 1 else None
+    failure = failures[0] if len(failures) == 1 else None
+    expected_stages = ["CONTEXT_ASSEMBLED", "PLANNING_WAVE_COMPLETED", "PLAN_MERGED"]
+    forbidden_episode_files = ("draft.md", "draft_contract.json", "review_workers.json", "review_workers.partial.json", "review_decision.json", "revised.md")
+    exact = all((
+        manifest.get("mode") == "live",
+        manifest.get("status") == "ERROR",
+        episode_id == "episode_001",
+        manifest.get("completed_episodes") == [],
+        manifest.get("completed_transitions") == [],
+        manifest.get("acceptance_verdict") is None,
+        not (run_dir / "pilot_acceptance.json").exists(),
+        not (run_dir / "pilot_review_workers.json").exists(),
+        not (run_dir / "episode_sources" / "episode_002.json").exists(),
+        not (run_dir / "transitions").exists() or not any((run_dir / "transitions").iterdir()),
+        episode.get("status") == "ERROR",
+        episode.get("completed_stages") == expected_stages,
+        episode.get("writer_call_count") == 0,
+        episode.get("review_verdict") is None,
+        episode.get("revision_count") == 0,
+        episode.get("revision_attempt_state") == "NOT_STARTED",
+        not any((episode_dir / name).exists() for name in forbidden_episode_files),
+        read_json(run_dir / "episode_sources" / "episode_001.json") == fixture["initial_source"],
+        error.get("contract_code") == "PROSE_TOO_SHORT",
+        error.get("character_count") == 2858,
+        inspection.get("checkpoint_integrity") == "VALID",
+        inspection.get("reconciliation_required") is False,
+        response is not None and response.get("call_id") == "L008-A001",
+        response is not None and response.get("key_slot") == "K04",
+        response is not None and response.get("lease_sequence") == 15,
+        response is not None and response.get("output_characters") == 2858,
+        response is not None and isinstance(response.get("response_sha256"), str) and len(response.get("response_sha256")) == 64,
+        response is not None and response.get("http_status") is None,
+        response is not None and response.get("error_class") is None,
+        failure is not None and failure.get("contract_code") == "PROSE_TOO_SHORT",
+        failure is not None and failure.get("character_count") == 2858,
+        failure is not None and response is not None and failure.get("call_id") == response.get("call_id"),
+        len({call.get("call_id") for call in telemetry.get("calls", [])}) == len(telemetry.get("calls", [])),
+        len({call.get("lease_sequence") for call in telemetry.get("calls", [])}) == len(telemetry.get("calls", [])),
+        not any(call.get("scope_id") == "pilot:acceptance" for call in telemetry.get("calls", [])),
+    ))
+    if not exact:
+        raise PilotError("WRITER_RECONCILIATION_BLOCKED")
+    episode.update({"writer_call_count": 1, "writer_attempt_state": "REJECTED", "writer_exhausted": True, "writer_response_sha256": response["response_sha256"], "writer_character_count": 2858, "writer_contract_code": "PROSE_TOO_SHORT", "writer_response_received_at": response["finished_at"], "writer_call_id": response["call_id"], "writer_lease_sequence": response["lease_sequence"], "status": "HOLD", "last_error": {"error_class": "CONTRACT_ERROR", "stage": "writer", "role": "canonical", "contract_code": "PROSE_TOO_SHORT", "call_id": response["call_id"], "character_count": 2858, "message": "writer exhausted after rejected response"}})
+    write_json(episode_manifest_path, episode)
+    manifest["status"] = "HOLD"
+    manifest["active_episode_id"] = "episode_001"
+    manifest["last_error"] = {"error_class": "CONTRACT_ERROR", "active_episode_id": "episode_001", "stage": "writer", "role": "canonical", "contract_code": "PROSE_TOO_SHORT", "message": "writer exhausted after rejected response"}
     write_json(run_dir / "pilot_manifest.json", manifest)
     return True
 
