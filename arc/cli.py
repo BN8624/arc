@@ -12,7 +12,7 @@ from .mock_model import MockModelClient
 from .pipeline import MockPipeline, status
 from .pilot import PilotPipeline, pilot_status, reconcile_pilot_checkpoint
 from .storage import write_json
-from .usage import UsageLedger, usage_db_path
+from .usage import UsageLedger, backup_usage_db, repair_preflight_collision, usage_db_path
 
 
 def classify_preflight(results: list[dict]) -> dict:
@@ -74,7 +74,7 @@ def _preflight(output: Path) -> dict:
         results.sort(key=lambda item: item["slot"])
         admission = classify_preflight(results)
         categories = admission.pop("categories")
-        document = {"schema_version": 3, "model": client.config.model, "sdk_version": client.sdk_version, "configured_max_live": client.config.max_live, "max_live": client.config.max_live, "launch_interval_seconds": client.config.launch_interval, "max_active_calls": client.max_active_by_stage.get("preflight", 0), "slots": results, "pass_slots": len(categories["PASS"]), "transient_slots": len(categories["TRANSIENT"]), "disabled_slots": len(categories["DISABLED"]), "global_blocker_slots": len(categories["GLOBAL_BLOCKER"]), "unknown_slots": len(categories["UNKNOWN"]), "total_slots": len(results), **admission}
+        document = {"schema_version": 4, "model": client.config.model, "sdk_version": client.sdk_version, "usage_run_id": getattr(getattr(client, "usage_gate", None), "usage_run_id", None), "configured_max_live": client.config.max_live, "max_live": client.config.max_live, "launch_interval_seconds": client.config.launch_interval, "max_active_calls": client.max_active_by_stage.get("preflight", 0), "slots": results, "pass_slots": len(categories["PASS"]), "transient_slots": len(categories["TRANSIENT"]), "disabled_slots": len(categories["DISABLED"]), "global_blocker_slots": len(categories["GLOBAL_BLOCKER"]), "unknown_slots": len(categories["UNKNOWN"]), "total_slots": len(results), **admission}
         write_json(output / "preflight.json", document)
         return document
     finally:
@@ -121,6 +121,11 @@ def main() -> None:
     usage_import = usage_commands.add_parser("import-pilot")
     usage_import.add_argument("--output", type=Path, required=True)
     usage_check = usage_commands.add_parser("db-check")
+    usage_backup = usage_commands.add_parser("backup")
+    usage_backup.add_argument("--output", type=Path)
+    usage_repair = usage_commands.add_parser("repair-preflight-collision")
+    usage_repair.add_argument("--apply", action="store_true")
+    usage_repair.add_argument("--backup", type=Path)
     args = parser.parse_args()
     if args.command == "mock-run":
         result = MockPipeline(MockModelClient(args.scenario)).run(args.fixture, args.output, args.scenario)
@@ -174,5 +179,9 @@ def main() -> None:
             print(json.dumps(ledger.import_pilot(args.output), ensure_ascii=False))
         elif args.usage_command == "db-check":
             print(json.dumps({"path": str(ledger.path), "schema_version": ledger.schema_version(), "status": "OK"}, ensure_ascii=False))
+        elif args.usage_command == "backup":
+            print(json.dumps(backup_usage_db(ledger.path, args.output), ensure_ascii=False))
+        elif args.usage_command == "repair-preflight-collision":
+            print(json.dumps(repair_preflight_collision(ledger, apply=args.apply, backup_path=args.backup), ensure_ascii=False))
     else:
         print(json.dumps(status(args.output), ensure_ascii=False))

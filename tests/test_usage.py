@@ -20,6 +20,7 @@ from arc.usage import (
     UsageNumbers,
     decide_admission,
     pacific_fields,
+    repair_preflight_collision,
 )
 
 
@@ -62,6 +63,14 @@ class _Models:
 class _Client:
     def __init__(self, tokens: int | Exception):
         self.models = _Models(tokens)
+
+
+class _NoCountClient:
+    class _ModelsWithoutCounter:
+        generate_calls = 0
+
+    def __init__(self):
+        self.models = self._ModelsWithoutCounter()
 
 
 def _call() -> dict:
@@ -136,6 +145,97 @@ def test_preflight_slots_with_same_call_id_get_distinct_usage_events(tmp_path: P
         event_ids = [row[0] for row in conn.execute("SELECT event_id FROM usage_events ORDER BY event_id")]
     assert len(event_ids) == 4
     assert len(event_ids) == len(set(event_ids))
+
+
+def test_preflight_same_slot_across_runs_gets_distinct_usage_events(tmp_path: Path) -> None:
+    ledger = UsageLedger(tmp_path / "usage.sqlite3")
+    first = TokenGate(ledger, usage_run_id="run-a", id_factory=lambda: "attempt-1")
+    second = TokenGate(ledger, usage_run_id="run-b", id_factory=lambda: "attempt-1")
+
+    first_event, _ = first.admit(client=_Client(15), model="gemma-4-31b-it", prompt="safe prompt", config={}, key_slot_id="K01", call=_preflight_call("K01"), max_output_tokens=JSON_OUTPUT_LIMIT)
+    second_event, _ = second.admit(client=_Client(15), model="gemma-4-31b-it", prompt="safe prompt", config={}, key_slot_id="K01", call=_preflight_call("K01"), max_output_tokens=JSON_OUTPUT_LIMIT)
+
+    assert first_event != second_event
+    with sqlite3.connect(tmp_path / "usage.sqlite3") as conn:
+        rows = conn.execute("SELECT usage_run_id, usage_attempt_id, request_group_id, request_kind FROM usage_events ORDER BY event_id").fetchall()
+    assert {row[0] for row in rows} == {"run-a", "run-b"}
+    assert {row[1] for row in rows} == {"attempt-1"}
+    assert len(rows) == 4
+
+
+def test_collision_does_not_update_existing_terminal_row_or_dispatch(tmp_path: Path) -> None:
+    ledger = UsageLedger(tmp_path / "usage.sqlite3", now=lambda: datetime(2026, 7, 13, 12, 0, tzinfo=timezone.utc))
+    gate = TokenGate(ledger, usage_run_id="run-a", id_factory=lambda: "same-attempt")
+    first_event, _ = gate.admit(client=_Client(15), model="gemma-4-31b-it", prompt="safe prompt", config={}, key_slot_id="K01", call=_preflight_call("K01"), max_output_tokens=JSON_OUTPUT_LIMIT)
+    gate.mark_dispatched(first_event)
+    gate.finish(event_id=first_event, response=_Response(_Usage(prompt=15, candidates=1, thoughts=1, total=17)), succeeded=True)
+    with sqlite3.connect(tmp_path / "usage.sqlite3") as conn:
+        before = conn.execute("SELECT event_id, status, actual_input_tokens, provider_dispatched, updated_at FROM usage_events ORDER BY event_id").fetchall()
+
+    collision_client = _Client(99)
+    with pytest.raises(TokenAdmissionError, match="USAGE_EVENT_ID_COLLISION"):
+        gate.admit(client=collision_client, model="gemma-4-31b-it", prompt="safe prompt", config={}, key_slot_id="K01", call=_preflight_call("K01"), max_output_tokens=JSON_OUTPUT_LIMIT)
+
+    assert collision_client.models.count_calls == 0
+    assert collision_client.models.generate_calls == 0
+    with sqlite3.connect(tmp_path / "usage.sqlite3") as conn:
+        after = conn.execute("SELECT event_id, status, actual_input_tokens, provider_dispatched, updated_at FROM usage_events ORDER BY event_id").fetchall()
+    assert after == before
+
+
+def test_count_token_dispatch_is_marked_only_for_actual_endpoint(tmp_path: Path) -> None:
+    ledger = UsageLedger(tmp_path / "usage.sqlite3")
+    gate = TokenGate(ledger, counter=lambda *_: 15)
+    gate.admit(client=_NoCountClient(), model="gemma-4-31b-it", prompt="safe prompt", config={}, key_slot_id="K01", call=_call(), max_output_tokens=JSON_OUTPUT_LIMIT)
+
+    status = ledger.status()
+    assert status["totals"]["provider_requests"] == 0
+    assert status["totals"]["count_token_requests"] == 0
+
+
+def test_missing_count_token_endpoint_blocks_without_provider_dispatch(tmp_path: Path) -> None:
+    ledger = UsageLedger(tmp_path / "usage.sqlite3")
+    gate = TokenGate(ledger)
+
+    with pytest.raises(TokenAdmissionError, match="TOKEN_COUNT_UNAVAILABLE"):
+        gate.admit(client=_NoCountClient(), model="gemma-4-31b-it", prompt="safe prompt", config={}, key_slot_id="K01", call=_call(), max_output_tokens=JSON_OUTPUT_LIMIT)
+
+    status = ledger.status()
+    assert status["totals"]["provider_requests"] == 0
+    assert status["totals"]["failed_count"] == 1
+
+
+def test_terminal_usage_row_rejects_general_update(tmp_path: Path) -> None:
+    ledger = UsageLedger(tmp_path / "usage.sqlite3")
+    call = _call()
+    ledger.insert_generation(event_id="event-1", key_slot_id="K01", model="model", call=call, input_tokens=1, max_output_tokens=1, admission=decide_admission(1, 1))
+    ledger.mark_dispatched("event-1")
+    ledger.finish_generation(event_id="event-1", usage=UsageNumbers(prompt_tokens=1), status="SUCCEEDED")
+
+    with pytest.raises(UsageLedgerError, match="USAGE_EVENT_TERMINAL"):
+        ledger.update_event("event-1", status="FAILED")
+
+
+def test_preflight_collision_repair_uses_companion_generation(tmp_path: Path) -> None:
+    ledger = UsageLedger(tmp_path / "usage.sqlite3")
+    call = _preflight_call("K01")
+    ledger.insert_event(event_id="count", request_kind="count_tokens", key_slot_id="K01", model="gemma-4-31b-it", call=call, provider_dispatched=True, status="FAILED", usage_metadata_status="MISSING", error_code="TOKEN_COUNT_UNAVAILABLE", token_provenance="measured")
+    ledger.insert_event(event_id="generation", request_kind="generate_content", key_slot_id="K01", model="gemma-4-31b-it", call=call, gate_input_tokens=15, provider_dispatched=True, status="SUCCEEDED", usage_metadata_status="KNOWN", token_provenance="provider")
+
+    dry_run = repair_preflight_collision(ledger)
+    assert dry_run["repairable"] == 1
+    assert dry_run["applied"] == 0
+    backup = tmp_path / "backup.sqlite3"
+    with sqlite3.connect(tmp_path / "usage.sqlite3") as src, sqlite3.connect(backup) as dst:
+        src.backup(dst)
+    applied = repair_preflight_collision(ledger, apply=True, backup_path=backup)
+    assert applied["applied"] == 1
+    second = repair_preflight_collision(ledger, apply=True, backup_path=backup)
+    assert second["applied"] == 0
+    with sqlite3.connect(tmp_path / "usage.sqlite3") as conn:
+        row = conn.execute("SELECT status, actual_input_tokens, usage_metadata_status, error_code, repair_provenance FROM usage_events WHERE event_id='count'").fetchone()
+    assert row[:4] == ("SUCCEEDED", 15, "KNOWN", None)
+    assert "issue40_preflight_collision" in row[4]
 
 
 def test_thoughts_zero_is_distinct_from_missing(tmp_path: Path) -> None:
@@ -298,6 +398,6 @@ def test_usage_cli_db_check_and_json_status(tmp_path: Path, monkeypatch: pytest.
     db = tmp_path / "usage.sqlite3"
     monkeypatch.setenv("ARC_USAGE_DB", str(db))
     check = subprocess.run([sys.executable, "-m", "arc", "usage", "db-check"], check=True, capture_output=True, text=True)
-    assert json.loads(check.stdout)["schema_version"] == 1
+    assert json.loads(check.stdout)["schema_version"] == 2
     status = subprocess.run([sys.executable, "-m", "arc", "usage", "status", "--json"], check=True, capture_output=True, text=True)
-    assert json.loads(status.stdout)["schema_version"] == 1
+    assert json.loads(status.stdout)["schema_version"] == 2
