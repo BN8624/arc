@@ -114,7 +114,7 @@ class MockPipeline:
             (run_dir / "planning_workers.partial.json").unlink(missing_ok=True)
         planning = read_json(run_dir / "planning_workers.json")
         if "PLAN_MERGED" not in manifest["completed_stages"]:
-            value = validate_plan(parse_object(self._request("planning_merge", "merge", {"context": context, "workers": planning})), manifest["episode_id"])
+            value = validate_plan(parse_object(self._request("planning_merge", "merge", {"episode_id": manifest["episode_id"], "context": context, "workers": planning})), manifest["episode_id"], {worker["worker_id"] for worker in planning})
             self._commit(run_dir, manifest, "episode_plan.json", value, "PLAN_MERGED")
         plan = read_json(run_dir / "episode_plan.json")
         if "DRAFT_COMPLETED" not in manifest["completed_stages"]:

@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from arc.contracts import ContractError
+from arc.contracts import ContractError, validate_plan
 from arc.mock_model import MockModelClient
 from arc.pipeline import MockPipeline, status
 
@@ -70,3 +70,54 @@ def test_writer_and_revision_do_not_receive_raw_worker_outputs(tmp_path: Path) -
     prompts = {stage: prompt for stage, _, prompt in client.calls if stage in {"writer", "revision"}}
     assert "planning_workers" not in prompts["writer"]
     assert "review_workers" not in prompts["revision"]
+
+
+def _valid_plan() -> dict:
+    return {"episode_id": "episode_004", "immediate_objective": "objective", "obstacle": "obstacle", "protagonist_action": "action", "meaningful_change": "change", "episode_ending": "ending", "selected_worker_ids": ["planning-event"], "continuity_constraints": ["constraint"]}
+
+
+def _contract_code(value: dict, allowed_worker_ids: set[str] | None = None) -> str | None:
+    with pytest.raises(ContractError) as error:
+        validate_plan(value, "episode_004", allowed_worker_ids)
+    return error.value.contract_code
+
+
+def test_validate_plan_accepts_exact_contract() -> None:
+    plan = _valid_plan()
+    assert validate_plan(plan, "episode_004", {"planning-event"}) == plan
+
+
+def test_validate_plan_rejects_field_mismatch_with_code() -> None:
+    plan = _valid_plan()
+    plan["extra"] = "bad"
+    assert _contract_code(plan) == "PLAN_FIELDS_MISMATCH"
+
+
+def test_validate_plan_rejects_episode_id_mismatch_with_code() -> None:
+    plan = _valid_plan()
+    plan["episode_id"] = "episode_999"
+    assert _contract_code(plan) == "PLAN_EPISODE_ID_MISMATCH"
+
+
+def test_validate_plan_rejects_invalid_text_field_with_code() -> None:
+    plan = _valid_plan()
+    plan["obstacle"] = ""
+    assert _contract_code(plan) == "PLAN_TEXT_FIELD_INVALID"
+
+
+def test_validate_plan_rejects_invalid_selected_worker_ids_with_code() -> None:
+    plan = _valid_plan()
+    plan["selected_worker_ids"] = ["planning-event", "planning-event"]
+    assert _contract_code(plan) == "PLAN_SELECTED_WORKER_IDS_INVALID"
+
+
+def test_validate_plan_rejects_unknown_selected_worker_id_with_code() -> None:
+    plan = _valid_plan()
+    plan["selected_worker_ids"] = ["planning-unknown"]
+    assert _contract_code(plan, {"planning-event"}) == "PLAN_SELECTED_WORKER_IDS_INVALID"
+
+
+def test_validate_plan_rejects_invalid_continuity_constraints_with_code() -> None:
+    plan = _valid_plan()
+    plan["continuity_constraints"] = ["constraint", "constraint"]
+    assert _contract_code(plan) == "PLAN_CONTINUITY_CONSTRAINTS_INVALID"

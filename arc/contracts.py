@@ -9,6 +9,9 @@ from typing import Protocol
 
 class ContractError(ValueError):
     """A mock Phase 1 contract was violated."""
+    def __init__(self, message: str, contract_code: str | None = None):
+        super().__init__(message)
+        self.contract_code = contract_code
 
 
 class ModelClient(Protocol):
@@ -60,12 +63,25 @@ def validate_worker(value: dict, worker_id: str, role: str) -> dict:
     return value
 
 
-def validate_plan(value: dict, episode_id: str) -> dict:
+def validate_plan(value: dict, episode_id: str, allowed_worker_ids: set[str] | None = None) -> dict:
     required = {"episode_id", "immediate_objective", "obstacle", "protagonist_action", "meaningful_change", "episode_ending", "selected_worker_ids", "continuity_constraints"}
-    if set(value) != required or value["episode_id"] != episode_id:
-        raise ContractError("invalid episode plan")
-    if any(not value[key] for key in required - {"episode_id", "selected_worker_ids", "continuity_constraints"}):
-        raise ContractError("episode plan has empty required value")
+    if not isinstance(value, dict):
+        raise ContractError("planning merge response must be object", "PLAN_RESPONSE_NOT_OBJECT")
+    if set(value) != required:
+        raise ContractError("planning merge fields do not match contract", "PLAN_FIELDS_MISMATCH")
+    if not isinstance(value["episode_id"], str) or value["episode_id"] != episode_id:
+        raise ContractError("planning merge episode id mismatch", "PLAN_EPISODE_ID_MISMATCH")
+    text_fields = ("immediate_objective", "obstacle", "protagonist_action", "meaningful_change", "episode_ending")
+    if any(not isinstance(value[key], str) or not value[key] for key in text_fields):
+        raise ContractError("planning merge text field is invalid", "PLAN_TEXT_FIELD_INVALID")
+    selected = value["selected_worker_ids"]
+    if not isinstance(selected, list) or any(not isinstance(item, str) or not item for item in selected) or len(selected) != len(set(selected)):
+        raise ContractError("planning merge selected worker ids are invalid", "PLAN_SELECTED_WORKER_IDS_INVALID")
+    if allowed_worker_ids is not None and set(selected) - allowed_worker_ids:
+        raise ContractError("planning merge selected worker id is unknown", "PLAN_SELECTED_WORKER_IDS_INVALID")
+    continuity = value["continuity_constraints"]
+    if not isinstance(continuity, list) or any(not isinstance(item, str) or not item for item in continuity) or len(continuity) != len(set(continuity)):
+        raise ContractError("planning merge continuity constraints are invalid", "PLAN_CONTINUITY_CONSTRAINTS_INVALID")
     return value
 
 

@@ -25,6 +25,33 @@ def test_memory_merge_prompt_uses_empty_conflict_options() -> None:
     assert "CURRENT_OPEN_CONFLICT_OPTIONS\n[]" in prompt
 
 
+def _planning_payload() -> dict:
+    return {"episode_id": "episode_004", "context": {"episode_id": "episode_004"}, "workers": [{"worker_id": "planning-event"}, {"worker_id": "planning-continuity"}]}
+
+
+def test_planning_merge_prompt_binds_exact_episode_id() -> None:
+    prompt = build_prompt("planning_merge", "merge", _planning_payload())
+    assert 'episode_id must be exactly "episode_004"' in prompt
+
+
+def test_planning_merge_prompt_declares_all_field_types() -> None:
+    prompt = build_prompt("planning_merge", "merge", _planning_payload())
+    for field in ("immediate_objective", "obstacle", "protagonist_action", "meaningful_change", "episode_ending"):
+        assert field in prompt
+    assert "non-empty strings" in prompt
+    assert "unique string array" in prompt
+
+
+def test_planning_merge_prompt_lists_allowed_worker_ids() -> None:
+    prompt = build_prompt("planning_merge", "merge", _planning_payload())
+    assert "planning-event" in prompt
+    assert "planning-continuity" in prompt
+
+
+def test_planning_merge_prompt_is_deterministic() -> None:
+    assert build_prompt("planning_merge", "merge", _planning_payload()) == build_prompt("planning_merge", "merge", _planning_payload())
+
+
 def _provider_update(ids: list[str]) -> dict:
     return {"episode_id": "LIVE001", "confirmed_facts_added": [], "relationship_changes": [], "conflict_ids_resolved": ids, "conflicts_opened": [], "promises_added": [], "important_excerpts_added": [], "episode_summary": "summary", "required_next_episode_continuity": [], "evidence_refs": ["final.md"]}
 
