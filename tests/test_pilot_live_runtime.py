@@ -14,7 +14,7 @@ from arc.mock_model import transition_adapter_response
 from arc.live_model import AtomicTelemetryStore, GemmaPoolClient, LiveCallError, LiveConfig, MODEL_NAME, RoutingStateStore
 from arc.pipeline import PLANNING_ROLES, MockPipeline, WaveCheckpoint, status
 from arc.pilot_contracts import PILOT_REVIEW_ROLES
-from arc.pilot import PilotPipeline, classify_episode_projection, episode_projection_document, inspect_pilot_checkpoint, live_telemetry_checkpoint, reconcile_live_telemetry_projections, reconcile_pilot_checkpoint
+from arc.pilot import PilotError, PilotPipeline, classify_episode_projection, episode_projection_document, inspect_pilot_checkpoint, live_telemetry_checkpoint, reconcile_live_telemetry_projections, reconcile_pilot_checkpoint
 from arc.storage import StorageError, read_json, write_json
 
 
@@ -82,7 +82,8 @@ class _PilotProvider:
 
 
 class _PilotProviderRoot:
-    def __init__(self, fail_once_at: str | None = None, hold_episode: str | None = None, fail_status_code: int = 500, hold_dimension: str | None = None, wrong_plan_once: bool = False, wrong_plan_episode: str | None = None, short_writer_once_episode: str | None = None, writer_text_once_episode: str | None = None, writer_text: str | None = None, repairable_writer_once_episode: str | None = None, review_pass_on_repairable: bool = False, short_revision_once_episode: str | None = None, revision_text: str | None = None):
+    def __init__(self, fail_once_at: str | None = None, hold_episode: str | None = None, fail_status_code: int = 500, hold_dimension: str | None = None, wrong_plan_once: bool = False, wrong_plan_episode: str | None = None, short_writer_once_episode: str | None = None, writer_text_once_episode: str | None = None, writer_text: str | None = None, repairable_writer_once_episode: str | None = None, review_pass_on_repairable: bool = False, short_revision_once_episode: str | None = None, revision_text: str | None = None, transition_malformed_episode: str | None = None):
+        self.transition_malformed_episode = transition_malformed_episode
         self.fail_once_at = fail_once_at
         self.hold_episode = hold_episode
         self.fail_status_code = fail_status_code
@@ -151,6 +152,8 @@ class _PilotProviderRoot:
         if stage == "memory_merge":
             return json.dumps({"episode_id": episode_id, "confirmed_facts_added": [f"synthetic fact {episode_id}"], "relationship_changes": [f"synthetic relationship {episode_id}"], "conflict_ids_resolved": [], "conflicts_opened": [f"synthetic opened conflict {episode_id}"], "promises_added": [f"synthetic promise {episode_id}"], "important_excerpts_added": [f"synthetic excerpt {episode_id}"], "episode_summary": f"synthetic episode summary {episode_id}", "required_next_episode_continuity": [f"synthetic continuity {episode_id}"], "evidence_refs": ["final.md"]})
         if stage == "transition":
+            if self.transition_malformed_episode == payload["completed_episode_id"]:
+                return "{malformed transition"
             return json.dumps(transition_adapter_response(payload), ensure_ascii=False)
         raise RuntimeError(f"unknown live stage: {stage}:{role}")
 
@@ -2488,6 +2491,254 @@ def test_live_transition_adapter_calls_once_per_boundary(tmp_path):
     assert not any(call["stage"] == "transition" for call in read_json(output / "episodes" / "episode_005" / "live_calls.json")["calls"])
     episode2_planning = [prompt for _, marker, prompt in root.provider_calls if marker.startswith("planning:") and _episode_from_prompt(prompt) == "episode_002"]
     assert episode2_planning and all("adapted direction after episode_001" in prompt for prompt in episode2_planning)
+
+
+TRANSITION_RECEIPT_PATH = "transitions/episode_001_to_episode_002.response.json"
+TRANSITION_ARTIFACT_PATH = "transitions/episode_001_to_episode_002.json"
+
+
+def _interrupt_pilot_on_write(monkeypatch, fragment: str, skip: int = 0):
+    import arc.pilot as pilot_module
+
+    original = pilot_module.write_json
+    state = {"remaining": skip}
+
+    def wrapper(path, value):
+        if fragment in Path(path).as_posix():
+            if state["remaining"] == 0:
+                monkeypatch.setattr(pilot_module, "write_json", original)
+                raise KeyboardInterrupt()
+            state["remaining"] -= 1
+        return original(path, value)
+
+    monkeypatch.setattr(pilot_module, "write_json", wrapper)
+
+
+def _resume_pilot(output: Path):
+    inspection = inspect_pilot_checkpoint(output)
+    assert inspection["checkpoint_integrity"] != "CORRUPT", inspection["reason_codes"]
+    if inspection["checkpoint_integrity"] == "RECONCILABLE":
+        reconcile_pilot_checkpoint(PILOT_FIXTURE, output)
+    client, root = _pilot_client(output)
+    return PilotPipeline(client, scenario=None, mode="live"), root
+
+
+def _transition_call_episodes(provider_root: _PilotProviderRoot) -> list[str]:
+    return [json.loads(prompt)["completed_episode_id"] for _, marker, prompt in provider_root.provider_calls if marker == "transition:adapter"]
+
+
+def test_transition_pass_without_receipt_fails_closed_without_recall(tmp_path, monkeypatch):
+    output = tmp_path / "pilot-live"
+    client, _ = _pilot_client(output)
+    _interrupt_pilot_on_write(monkeypatch, TRANSITION_RECEIPT_PATH)
+    with pytest.raises(KeyboardInterrupt):
+        PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+
+    assert not (output / TRANSITION_RECEIPT_PATH).exists()
+    telemetry_before = read_json(output / "pilot_live_calls.json")
+    pipeline, resumed_root = _resume_pilot(output)
+    with pytest.raises(PilotError, match="TRANSITION_RECONCILIATION_REQUIRED"):
+        pipeline.run(PILOT_FIXTURE, output)
+
+    assert resumed_root.provider_calls == []
+    assert read_json(output / "pilot_live_calls.json") == telemetry_before
+    assert not (output / TRANSITION_RECEIPT_PATH).exists()
+    assert not (output / TRANSITION_ARTIFACT_PATH).exists()
+
+
+def test_transition_receipt_resume_completes_without_recall(tmp_path, monkeypatch):
+    output = tmp_path / "pilot-live"
+    client, _ = _pilot_client(output)
+    _interrupt_pilot_on_write(monkeypatch, TRANSITION_ARTIFACT_PATH)
+    with pytest.raises(KeyboardInterrupt):
+        PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+
+    receipt_before = read_json(output / TRANSITION_RECEIPT_PATH)
+    assert receipt_before["state"] == "RESPONSE_RECEIVED"
+    pipeline, resumed_root = _resume_pilot(output)
+    result = pipeline.run(PILOT_FIXTURE, output)
+
+    assert result["manifest"]["status"] == "COMPLETE"
+    assert _transition_call_episodes(resumed_root) == ["episode_002", "episode_003", "episode_004"]
+    telemetry = read_json(output / "pilot_live_calls.json")
+    episode1_calls = [call for call in telemetry["calls"] if call["stage"] == "transition" and call["scope_id"] == "episode:episode_001"]
+    assert len(episode1_calls) == 1
+    receipt_after = read_json(output / TRANSITION_RECEIPT_PATH)
+    assert receipt_after["state"] == "COMPLETED"
+    assert receipt_after["response_sha256"] == receipt_before["response_sha256"] == episode1_calls[0]["response_sha256"]
+
+
+def test_transition_artifact_without_source_regenerates_deterministically(tmp_path, monkeypatch):
+    output = tmp_path / "pilot-live"
+    client, _ = _pilot_client(output)
+    _interrupt_pilot_on_write(monkeypatch, "episode_sources/episode_002.json")
+    with pytest.raises(KeyboardInterrupt):
+        PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+
+    assert (output / TRANSITION_ARTIFACT_PATH).exists()
+    assert not (output / "episode_sources" / "episode_002.json").exists()
+    resumed_client, resumed_root = _pilot_client(output)
+    result = PilotPipeline(resumed_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+
+    assert result["manifest"]["status"] == "COMPLETE"
+    assert "episode_001" not in _transition_call_episodes(resumed_root)
+    transition = read_json(output / TRANSITION_ARTIFACT_PATH)
+    from arc.storage import sha256_file
+    assert sha256_file(output / "episode_sources" / "episode_002.json") == transition["next_source_hash"]
+    assert read_json(output / TRANSITION_RECEIPT_PATH)["state"] == "COMPLETED"
+
+
+def test_transition_receipt_completion_interruption_resumes_to_noop(tmp_path, monkeypatch):
+    output = tmp_path / "pilot-live"
+    client, _ = _pilot_client(output)
+    _interrupt_pilot_on_write(monkeypatch, TRANSITION_RECEIPT_PATH, skip=1)
+    with pytest.raises(KeyboardInterrupt):
+        PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+
+    assert read_json(output / TRANSITION_RECEIPT_PATH)["state"] == "RESPONSE_RECEIVED"
+    assert (output / "episode_sources" / "episode_002.json").exists()
+    pipeline, resumed_root = _resume_pilot(output)
+    result = pipeline.run(PILOT_FIXTURE, output)
+
+    assert result["manifest"]["status"] == "COMPLETE"
+    assert "episode_001" not in _transition_call_episodes(resumed_root)
+    assert read_json(output / TRANSITION_RECEIPT_PATH)["state"] == "COMPLETED"
+    after_first = _file_bytes(output)
+    noop_client, noop_root = _pilot_client(output)
+    assert PilotPipeline(noop_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)["no_op"] is True
+    assert noop_root.provider_calls == []
+    assert _file_bytes(output) == after_first
+
+
+def test_rejected_transition_receipt_fails_closed_without_recall(tmp_path):
+    output = tmp_path / "pilot-live"
+    client, _ = _pilot_client(output, _PilotProviderRoot(transition_malformed_episode="episode_001"))
+    with pytest.raises(ContractError):
+        PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+
+    receipt = read_json(output / TRANSITION_RECEIPT_PATH)
+    assert receipt["state"] == "REJECTED"
+    assert receipt["contract_code"] == "TRANSITION_RESPONSE_NOT_OBJECT"
+    telemetry = read_json(output / "pilot_live_calls.json")
+    failures = [item for item in telemetry["contract_failures"] if item["stage"] == "transition"]
+    assert len(failures) == 1 and failures[0]["scope_id"] == "episode:episode_001" and failures[0]["role"] == "adapter"
+    assert not (output / TRANSITION_ARTIFACT_PATH).exists()
+    assert not (output / "episode_sources" / "episode_002.json").exists()
+
+    receipt_bytes = (output / TRANSITION_RECEIPT_PATH).read_bytes()
+    pipeline, resumed_root = _resume_pilot(output)
+    with pytest.raises(PilotError, match="TRANSITION_RESPONSE_ALREADY_CONSUMED"):
+        pipeline.run(PILOT_FIXTURE, output)
+    assert resumed_root.provider_calls == []
+    assert (output / TRANSITION_RECEIPT_PATH).read_bytes() == receipt_bytes
+    assert not (output / TRANSITION_ARTIFACT_PATH).exists()
+
+
+def _pending_receipt_state(tmp_path, monkeypatch) -> Path:
+    output = tmp_path / "pilot-live"
+    client, _ = _pilot_client(output)
+    _interrupt_pilot_on_write(monkeypatch, TRANSITION_ARTIFACT_PATH)
+    with pytest.raises(KeyboardInterrupt):
+        PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    return output
+
+
+def test_tampered_receipt_input_hash_fails_closed_before_provider_call(tmp_path, monkeypatch):
+    output = _pending_receipt_state(tmp_path, monkeypatch)
+    receipt = read_json(output / TRANSITION_RECEIPT_PATH)
+    receipt["transition_input_hash"] = "0" * 64
+    write_json(output / TRANSITION_RECEIPT_PATH, receipt)
+
+    pipeline, resumed_root = _resume_pilot(output)
+    with pytest.raises(PilotError, match="transition receipt input hash mismatch"):
+        pipeline.run(PILOT_FIXTURE, output)
+    assert resumed_root.provider_calls == []
+    assert not (output / TRANSITION_ARTIFACT_PATH).exists()
+
+
+@pytest.mark.parametrize("tamper", [
+    lambda receipt: receipt.update(raw_response=receipt["raw_response"].replace("adapted direction", "tampered direction")),
+    lambda receipt: receipt.update(response_sha256="0" * 64),
+])
+def test_tampered_receipt_response_fails_closed_before_provider_call(tmp_path, monkeypatch, tamper):
+    output = _pending_receipt_state(tmp_path, monkeypatch)
+    receipt = read_json(output / TRANSITION_RECEIPT_PATH)
+    tamper(receipt)
+    write_json(output / TRANSITION_RECEIPT_PATH, receipt)
+
+    resumed_client, resumed_root = _pilot_client(output)
+    with pytest.raises(PilotError, match="transition receipt response hash mismatch"):
+        PilotPipeline(resumed_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    assert resumed_root.provider_calls == []
+
+
+def test_completed_receipt_without_artifact_fails_closed(tmp_path, monkeypatch):
+    output = _pending_receipt_state(tmp_path, monkeypatch)
+    receipt = read_json(output / TRANSITION_RECEIPT_PATH)
+    receipt["state"] = "COMPLETED"
+    write_json(output / TRANSITION_RECEIPT_PATH, receipt)
+
+    resumed_client, resumed_root = _pilot_client(output)
+    with pytest.raises(PilotError, match="completed transition receipt without canonical transition"):
+        PilotPipeline(resumed_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    assert resumed_root.provider_calls == []
+
+
+@pytest.mark.parametrize("tamper_transition", [
+    lambda transition: transition["adaptation_decisions"][0].update(reason="tampered reason variant"),
+    lambda transition: transition["adaptation_decisions"][0]["evidence"][0].update(excerpt="tampered excerpt that is long enough"),
+    lambda transition: transition["rolling_plan_after"]["near_horizon"].append("tampered unexplained item"),
+])
+def test_tampered_pending_transition_artifact_fails_closed(tmp_path, monkeypatch, tamper_transition):
+    output = tmp_path / "pilot-live"
+    client, _ = _pilot_client(output)
+    _interrupt_pilot_on_write(monkeypatch, "episode_sources/episode_002.json")
+    with pytest.raises(KeyboardInterrupt):
+        PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    transition = read_json(output / TRANSITION_ARTIFACT_PATH)
+    tamper_transition(transition)
+    write_json(output / TRANSITION_ARTIFACT_PATH, transition)
+
+    resumed_client, resumed_root = _pilot_client(output)
+    with pytest.raises((ContractError, PilotError, StorageError)):
+        PilotPipeline(resumed_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    assert "episode_001" not in _transition_call_episodes(resumed_root)
+    assert not (output / "episode_sources" / "episode_002.json").exists()
+
+
+def test_completed_pilot_receipt_transition_mismatch_fails_closed(tmp_path):
+    output = tmp_path / "pilot-live"
+    client, _ = _pilot_client(output)
+    PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    receipt = read_json(output / TRANSITION_RECEIPT_PATH)
+    response = json.loads(receipt["raw_response"])
+    response["adaptation_summary"] = "Tampered summary that no longer matches the canonical transition."
+    receipt["raw_response"] = json.dumps(response, ensure_ascii=False)
+    receipt["response_sha256"] = hashlib.sha256(receipt["raw_response"].encode("utf-8")).hexdigest()
+    write_json(output / TRANSITION_RECEIPT_PATH, receipt)
+
+    resumed_client, resumed_root = _pilot_client(output)
+    with pytest.raises(PilotError, match="transition receipt response does not match canonical transition"):
+        PilotPipeline(resumed_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    assert resumed_root.provider_calls == []
+
+
+def test_transition_receipts_match_provider_output(tmp_path):
+    output = tmp_path / "pilot-live"
+    client, _ = _pilot_client(output)
+    PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+
+    telemetry = read_json(output / "pilot_live_calls.json")
+    ids = read_json(output / "pilot_manifest.json")["episode_ids"]
+    for episode_id, next_id in zip(ids, ids[1:]):
+        receipt = read_json(output / "transitions" / f"{episode_id}_to_{next_id}.response.json")
+        assert receipt["state"] == "COMPLETED" and receipt["contract_code"] is None
+        calls = [call for call in telemetry["calls"] if call["stage"] == "transition" and call["scope_id"] == f"episode:{episode_id}"]
+        assert len(calls) == 1
+        assert receipt["response_sha256"] == calls[0]["response_sha256"]
+        transition = read_json(output / "transitions" / f"{episode_id}_to_{next_id}.json")
+        response = json.loads(receipt["raw_response"])
+        assert all(response[field] == transition[field] for field in ("next_episode", "rolling_plan_after", "adaptation_decisions", "continuity_satisfied", "continuity_deferred", "adaptation_summary", "evidence_refs"))
 
 
 def _projection_root_doc() -> dict:

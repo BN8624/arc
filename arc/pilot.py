@@ -7,7 +7,7 @@ from pathlib import Path
 from .contracts import ContractError, parse_object, validate_worker
 from .live_model import scope_projection
 from .pipeline import MockPipeline, WaveCheckpoint, status
-from .pilot_contracts import PILOT_REVIEW_ROLES, ROLLING_PLAN_HORIZON_LIMITS, STABLE_MEMORY_FIELDS, TRANSITION_CONTRACT_VERSION, TRANSITION_EVIDENCE_FILES, TRANSITION_SCHEMA_VERSION, canonical_bytes, rolling_plan_hash, validate_pilot_acceptance, validate_pilot_fixture, validate_transition, validate_transition_response
+from .pilot_contracts import PILOT_REVIEW_ROLES, ROLLING_PLAN_HORIZON_LIMITS, STABLE_MEMORY_FIELDS, TRANSITION_CONTRACT_VERSION, TRANSITION_EVIDENCE_FILES, TRANSITION_RESPONSE_FIELDS, TRANSITION_SCHEMA_VERSION, canonical_bytes, rolling_plan_hash, validate_pilot_acceptance, validate_pilot_fixture, validate_transition, validate_transition_response
 from .storage import StorageError, read_json, sha256_bytes, sha256_file, write_json
 
 PROJECTION_CURRENT = "CURRENT"
@@ -15,6 +15,8 @@ PROJECTION_MISSING = "MISSING"
 PROJECTION_STALE_PREFIX = "STALE_PREFIX"
 PROJECTION_CONFLICT = "CONFLICT"
 PROJECTION_STALE_REASON = "EPISODE_PROJECTION_STALE"
+TRANSITION_RECEIPT_FIELDS = {"schema_version", "transition_id", "completed_episode_id", "next_episode_id", "transition_input_hash", "state", "response_sha256", "raw_response", "contract_code"}
+TRANSITION_RECEIPT_STATES = {"RESPONSE_RECEIVED", "COMPLETED", "REJECTED"}
 
 
 class PilotError(RuntimeError):
@@ -177,6 +179,8 @@ class PilotPipeline:
             validate_transition(transition, source, next_id, run_dir)
             if transition["transition_input_hash"] != input_hash:
                 raise PilotError("transition input hash mismatch")
+            if self.mode == "live":
+                self._reconcile_transition_receipt(run_dir, transition_id, episode_id, next_id, input_hash, transition)
             if source_path.exists():
                 if transition["next_source_hash"] != sha256_file(source_path):
                     raise PilotError("transition next source hash mismatch")
@@ -192,7 +196,11 @@ class PilotPipeline:
         else:
             transition, next_source = self._transition(run_dir, manifest, transition_id, episode_id, next_id, source, input_hash, index)
             self._write_artifact(run_dir, manifest, f"transitions/{transition_id}.json", transition)
+            self._save_checkpoint(run_dir, manifest)
             self._write_artifact(run_dir, manifest, f"episode_sources/{next_id}.json", next_source)
+            self._save_checkpoint(run_dir, manifest)
+            if self.mode == "live":
+                self._reconcile_transition_receipt(run_dir, transition_id, episode_id, next_id, input_hash, transition)
 
     def _transition_payload(self, run_dir: Path, manifest: dict, episode_id: str, next_id: str, source: dict, index: int) -> dict:
         episode_dir = run_dir / "episodes" / episode_id
@@ -220,23 +228,54 @@ class PilotPipeline:
     def _transition(self, run_dir: Path, manifest: dict, transition_id: str, episode_id: str, next_id: str, source: dict, input_hash: str, index: int) -> tuple[dict, dict]:
         payload = self._transition_payload(run_dir, manifest, episode_id, next_id, source, index)
         prompt = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        client = self._episode_client(episode_id, index) if self.mode == "live" else self.client
-        raw = client.generate(stage="transition", role="adapter", prompt=prompt)
-        return self._transition_from_response(run_dir, manifest, client, episode_id, next_id, source, input_hash, raw)
-
-    def _transition_from_response(self, run_dir: Path, manifest: dict, client, episode_id: str, next_id: str, source: dict, input_hash: str, raw: str) -> tuple[dict, dict]:
+        if self.mode != "live":
+            raw = self.client.generate(stage="transition", role="adapter", prompt=prompt)
+            return self._transition_from_response(run_dir, episode_id, next_id, source, input_hash, raw)
+        client = self._episode_client(episode_id, index)
+        receipt_path = run_dir / "transitions" / f"{transition_id}.response.json"
+        receipt = _read_transition_receipt(receipt_path, transition_id, episode_id, next_id, input_hash)
+        if receipt is not None and receipt["state"] == "REJECTED":
+            raise PilotError(f"TRANSITION_RESPONSE_ALREADY_CONSUMED: {receipt['contract_code']}")
+        if receipt is not None and receipt["state"] == "COMPLETED":
+            raise PilotError("completed transition receipt without canonical transition")
+        if receipt is None:
+            if self._consumed_transition_response(episode_id):
+                raise PilotError("TRANSITION_RECONCILIATION_REQUIRED")
+            raw = client.generate(stage="transition", role="adapter", prompt=prompt)
+            receipt = {"schema_version": 1, "transition_id": transition_id, "completed_episode_id": episode_id, "next_episode_id": next_id, "transition_input_hash": input_hash, "state": "RESPONSE_RECEIVED", "response_sha256": sha256_bytes(raw.encode("utf-8")), "raw_response": raw, "contract_code": None}
+            write_json(receipt_path, receipt)
+            self._save_checkpoint(run_dir, manifest)
         try:
-            response = validate_transition_response(parse_object(raw))
-            transition = {"schema_version": TRANSITION_SCHEMA_VERSION, "completed_episode_id": episode_id, "next_episode_id": next_id, "transition_input_hash": input_hash, "next_source_hash": "pending", "rolling_plan_before_hash": rolling_plan_hash(source["rolling_plan"]), **response}
-            validate_transition(transition, source, next_id, run_dir)
+            return self._transition_from_response(run_dir, episode_id, next_id, source, input_hash, receipt["raw_response"])
         except ContractError as error:
-            if self.mode == "live":
-                client.record_contract_failure("transition", "adapter", contract_code=error.contract_code or "TRANSITION_RESPONSE_NOT_OBJECT")
-                self._save_checkpoint(run_dir, manifest)
+            code = error.contract_code or "TRANSITION_RESPONSE_NOT_OBJECT"
+            client.record_contract_failure("transition", "adapter", contract_code=code)
+            receipt.update({"state": "REJECTED", "contract_code": code})
+            write_json(receipt_path, receipt)
+            self._save_checkpoint(run_dir, manifest)
             raise
+
+    def _transition_from_response(self, run_dir: Path, episode_id: str, next_id: str, source: dict, input_hash: str, raw: str) -> tuple[dict, dict]:
+        response = validate_transition_response(parse_object(raw))
+        transition = {"schema_version": TRANSITION_SCHEMA_VERSION, "completed_episode_id": episode_id, "next_episode_id": next_id, "transition_input_hash": input_hash, "next_source_hash": "pending", "rolling_plan_before_hash": rolling_plan_hash(source["rolling_plan"]), **response}
+        validate_transition(transition, source, next_id, run_dir)
         next_source = self._next_source_from_transition(run_dir, episode_id, transition)
         transition["next_source_hash"] = _json_file_hash(next_source)
         return transition, next_source
+
+    def _consumed_transition_response(self, episode_id: str) -> bool:
+        telemetry = self.client.telemetry() if hasattr(self.client, "telemetry") else {"calls": []}
+        return any(call.get("scope_id") == f"episode:{episode_id}" and call.get("stage") == "transition" and call.get("role") == "adapter" and call.get("status") == "PASS" for call in telemetry.get("calls", []))
+
+    def _reconcile_transition_receipt(self, run_dir: Path, transition_id: str, episode_id: str, next_id: str, input_hash: str, transition: dict) -> None:
+        receipt_path = run_dir / "transitions" / f"{transition_id}.response.json"
+        receipt = _read_transition_receipt(receipt_path, transition_id, episode_id, next_id, input_hash)
+        if receipt is None:
+            return
+        _verify_receipt_matches_transition(receipt, transition)
+        if receipt["state"] != "COMPLETED":
+            receipt.update({"state": "COMPLETED", "contract_code": None})
+            write_json(receipt_path, receipt)
 
     def _verify_completed_transition(self, run_dir: Path, manifest: dict, transition_id: str, episode_id: str, next_id: str, source: dict, index: int) -> None:
         transition_path = run_dir / "transitions" / f"{transition_id}.json"
@@ -245,8 +284,11 @@ class PilotPipeline:
             raise PilotError("completed transition artifact is missing")
         transition = read_json(transition_path)
         validate_transition(transition, source, next_id, run_dir)
-        if transition["transition_input_hash"] != self._transition_input_hash(run_dir, manifest, episode_id, next_id, source, index) or transition["next_source_hash"] != sha256_file(source_path):
+        input_hash = self._transition_input_hash(run_dir, manifest, episode_id, next_id, source, index)
+        if transition["transition_input_hash"] != input_hash or transition["next_source_hash"] != sha256_file(source_path):
             raise PilotError("completed transition hash mismatch")
+        if self.mode == "live":
+            self._reconcile_transition_receipt(run_dir, transition_id, episode_id, next_id, input_hash, transition)
 
     def _next_source_from_transition(self, run_dir: Path, episode_id: str, transition: dict) -> dict:
         episode_dir = run_dir / "episodes" / episode_id
@@ -412,6 +454,50 @@ def verify_live_telemetry_checkpoint(telemetry: dict, checkpoint: dict | None) -
             raise StorageError("pilot live telemetry checkpoint lease mismatch")
 
 
+def _pilot_transition_ids(manifest: dict) -> list[tuple[str, str, str]]:
+    ids = manifest["episode_ids"]
+    return [(f"{episode_id}_to_{next_id}", episode_id, next_id) for episode_id, next_id in zip(ids, ids[1:])]
+
+
+def _read_transition_receipt(receipt_path: Path, transition_id: str, episode_id: str, next_id: str, input_hash: str | None) -> dict | None:
+    if not receipt_path.exists():
+        return None
+    receipt = read_json(receipt_path)
+    if not isinstance(receipt, dict) or set(receipt) != TRANSITION_RECEIPT_FIELDS or receipt["schema_version"] != 1 or receipt["transition_id"] != transition_id or receipt["completed_episode_id"] != episode_id or receipt["next_episode_id"] != next_id or receipt["state"] not in TRANSITION_RECEIPT_STATES:
+        raise PilotError("invalid transition response receipt")
+    if not isinstance(receipt["raw_response"], str) or receipt["response_sha256"] != sha256_bytes(receipt["raw_response"].encode("utf-8")):
+        raise PilotError("transition receipt response hash mismatch")
+    if input_hash is not None and receipt["transition_input_hash"] != input_hash:
+        raise PilotError("transition receipt input hash mismatch")
+    return receipt
+
+
+def _verify_receipt_matches_transition(receipt: dict, transition: dict) -> None:
+    if receipt["state"] == "REJECTED":
+        raise PilotError("rejected transition receipt conflicts with canonical transition")
+    try:
+        response = validate_transition_response(parse_object(receipt["raw_response"]))
+    except ContractError:
+        raise PilotError("transition receipt response does not match canonical transition") from None
+    if any(response[field] != transition.get(field) for field in TRANSITION_RESPONSE_FIELDS):
+        raise PilotError("transition receipt response does not match canonical transition")
+
+
+def _verify_transition_receipts(run_dir: Path, manifest: dict) -> None:
+    for transition_id, episode_id, next_id in _pilot_transition_ids(manifest):
+        receipt = _read_transition_receipt(run_dir / "transitions" / f"{transition_id}.response.json", transition_id, episode_id, next_id, None)
+        if receipt is None:
+            continue
+        transition_path = run_dir / "transitions" / f"{transition_id}.json"
+        if receipt["state"] == "COMPLETED" and not transition_path.exists():
+            raise PilotError("completed transition receipt without canonical transition")
+        if transition_path.exists():
+            transition = read_json(transition_path)
+            if receipt["transition_input_hash"] != transition.get("transition_input_hash"):
+                raise PilotError("transition receipt input hash mismatch")
+            _verify_receipt_matches_transition(receipt, transition)
+
+
 def verify_pilot_artifacts(run_dir: Path, manifest: dict) -> None:
     for name, digest in manifest["artifact_hashes"].items():
         if manifest.get("mode") == "live" and name == "pilot_live_calls.json":
@@ -421,10 +507,17 @@ def verify_pilot_artifacts(run_dir: Path, manifest: dict) -> None:
             raise StorageError(f"pilot artifact hash mismatch: {name}")
     immutable = set(manifest["artifact_hashes"]) - ({"pilot_live_calls.json"} if manifest.get("mode") == "live" else set())
     expected = {"pilot_manifest.json", *immutable, "pilot_review_workers.partial.json"}
+    pending = {f"episode_sources/{episode_id}.json" for episode_id in manifest["episode_ids"]}
+    for transition_id, _, _ in _pilot_transition_ids(manifest):
+        pending.add(f"transitions/{transition_id}.json")
+        if manifest.get("mode") == "live":
+            pending.add(f"transitions/{transition_id}.response.json")
     operational = {"routing_state.json", "pilot_live_calls.json"} if manifest.get("mode") == "live" else set()
     actual = {path.relative_to(run_dir).as_posix() for path in run_dir.rglob("*") if path.is_file()}
-    if actual - expected - operational - {f"episodes/{episode_id}/{name}" for episode_id in manifest["episode_ids"] for name in _episode_files(run_dir / "episodes" / episode_id)}:
+    if actual - expected - operational - pending - {f"episodes/{episode_id}/{name}" for episode_id in manifest["episode_ids"] for name in _episode_files(run_dir / "episodes" / episode_id)}:
         raise StorageError("unknown pilot artifact")
+    if manifest.get("mode") == "live":
+        _verify_transition_receipts(run_dir, manifest)
     if manifest.get("mode") == "live" and (run_dir / "pilot_live_calls.json").exists():
         _verify_live_telemetry_projections(run_dir, manifest)
     for episode_id in manifest["completed_episodes"]:
