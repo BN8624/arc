@@ -37,7 +37,7 @@ def revision_expansion_guidance(character_count: int) -> tuple[int, int]:
 
 def _prose_structural_guidance() -> str:
     return (
-        "Silently plan roughly 14 to 18 natural prose paragraphs, usually with multiple sentences, without printing "
+        "Silently plan roughly 20 to 24 natural prose paragraphs, with at least three complete sentences in most paragraphs, without printing "
         "headings or paragraph numbers. Develop, in scene order, the opening state and immediate objective; the obstacle "
         "appearing as concrete interference; the protagonist's active choice and action; specific reactions from people, "
         "the environment, or the conflict; the meaningful consequence and changed relationship or situation; the immediate "
@@ -61,7 +61,11 @@ def _writer_plan_guidance() -> str:
         "the plan field. Expand the two or three thinnest beats through multiple connected prose paragraphs using dialogue, "
         "action, counteraction, cost, and result already supported by the plan. Do not advance to the ending until consequence, "
         "meaningful change, aftermath, and payoff have each been dramatized. This expansion happens inside the one canonical "
-        "response and never authorizes a second call. Do not invent a new central conflict or unsupported setting."
+        "response and never authorizes a second call. Do not invent a new central conflict or unsupported setting. "
+        "최종 출력은 제목이나 번호 없이 20~24개의 자연스러운 소설 문단으로 구성하라. 짧은 대화 한 줄 문단을 제외하면 "
+        "대부분의 문단을 완결된 세 문장 이상으로 전개하라. 목표, 장애물, 행동, 반작용, 결과, 실제 변화, 여파, 보상, "
+        "다음 행동의 압력이라는 아홉 전개 단위가 각각 독립적인 행동과 반응을 갖게 하고, 가장 짧은 단위는 서로 다른 "
+        "두 문단 이상의 장면 교환으로 확장하라. 이 조건을 충족하기 전에 결말 문장으로 이동하지 마라."
     )
 
 

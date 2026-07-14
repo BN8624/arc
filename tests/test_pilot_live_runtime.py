@@ -926,7 +926,7 @@ def test_writer_prompt_requires_structured_plan_development_without_changing_tar
 
     payload = {"context": {"episode_id": "episode_002"}, "plan": {"immediate_objective": "protect evidence", "obstacle": "active scan", "protagonist_action": "camouflage evidence", "meaningful_change": "become a trusted insider", "episode_ending": "prepare the next move", "continuity_constraints": ["preserve the hidden variable"]}}
     prompt = build_prompt("writer", "canonical", payload)
-    for meaning in ("14 to 18", "plan.immediate_objective", "plan.obstacle", "plan.protagonist_action", "counteraction", "plan.meaningful_change", "consequence", "aftermath", "episode payoff", "plan.episode_ending", "plan.continuity_constraints", "6000 to 6800 characters", "internal expansion pass", "nine beats", "two or three thinnest beats", "Do not advance to the ending", "one canonical response"):
+    for meaning in ("20 to 24", "at least three complete sentences", "plan.immediate_objective", "plan.obstacle", "plan.protagonist_action", "counteraction", "plan.meaningful_change", "consequence", "aftermath", "episode payoff", "plan.episode_ending", "plan.continuity_constraints", "6000 to 6800 characters", "internal expansion pass", "nine beats", "two or three thinnest beats", "Do not advance to the ending", "one canonical response", "20~24개의 자연스러운 소설 문단", "완결된 세 문장 이상", "아홉 전개 단위"):
         assert meaning in prompt
     for forbidden in ("headings or paragraph numbers", "Do not compress multiple actions", "Do not invent a new central conflict"):
         assert forbidden in prompt
@@ -955,7 +955,7 @@ def test_non_prose_prompt_is_not_given_prose_structure_guidance():
     from arc.prompts import build_prompt
 
     prompt = build_prompt("planning", "event", {})
-    assert "14 to 18 natural prose paragraphs" not in prompt
+    assert "20 to 24 natural prose paragraphs" not in prompt
     assert "current draft is" not in prompt
 
 
