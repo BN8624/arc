@@ -907,8 +907,8 @@ def test_writer_prompt_reinforces_safe_character_band():
 
     prompt = build_prompt("writer", "canonical", {"context": {}, "plan": {}})
 
-    assert prose_target_band() == (5200, 6400)
-    assert "5200 to 6400 characters" in prompt
+    assert prose_target_band() == (6000, 6800)
+    assert "6000 to 6800 characters" in prompt
     assert "barely clearing the validation floor" in prompt
     assert "Expand causes, actions, dialogue" in prompt
     assert "never mention the character count" in prompt
@@ -917,8 +917,8 @@ def test_writer_prompt_reinforces_safe_character_band():
 def test_prose_target_band_uses_contract_minimum_and_hard_maximum():
     from arc.prompts import prose_target_band
 
-    assert prose_target_band(5000, None) == (6500, 8000)
-    assert prose_target_band(4000, 6000) == (5200, 6000)
+    assert prose_target_band(5000, None) == (7500, 8500)
+    assert prose_target_band(4000, 6000) == (6000, 6000)
 
 
 def test_writer_prompt_requires_structured_plan_development_without_changing_target_band():
@@ -926,7 +926,7 @@ def test_writer_prompt_requires_structured_plan_development_without_changing_tar
 
     payload = {"context": {"episode_id": "episode_002"}, "plan": {"immediate_objective": "protect evidence", "obstacle": "active scan", "protagonist_action": "camouflage evidence", "meaningful_change": "become a trusted insider", "episode_ending": "prepare the next move", "continuity_constraints": ["preserve the hidden variable"]}}
     prompt = build_prompt("writer", "canonical", payload)
-    for meaning in ("14 to 18", "plan.immediate_objective", "plan.obstacle", "plan.protagonist_action", "counteraction", "plan.meaningful_change", "consequence", "aftermath", "episode payoff", "plan.episode_ending", "plan.continuity_constraints", "5200 to 6400 characters", "internal expansion pass", "nine beats", "two or three thinnest beats", "Do not advance to the ending", "one canonical response"):
+    for meaning in ("14 to 18", "plan.immediate_objective", "plan.obstacle", "plan.protagonist_action", "counteraction", "plan.meaningful_change", "consequence", "aftermath", "episode payoff", "plan.episode_ending", "plan.continuity_constraints", "6000 to 6800 characters", "internal expansion pass", "nine beats", "two or three thinnest beats", "Do not advance to the ending", "one canonical response"):
         assert meaning in prompt
     for forbidden in ("headings or paragraph numbers", "Do not compress multiple actions", "Do not invent a new central conflict"):
         assert forbidden in prompt
@@ -964,7 +964,7 @@ def test_underlength_revision_prompt_requires_full_replacement():
 
     prompt = build_prompt("revision", "canonical", {"draft_contract": {"verdict": "REVISE_REQUIRED"}, "draft": "A" * 3500})
 
-    assert "5200 to 6400 characters" in prompt
+    assert "6000 to 6800 characters" in prompt
     assert "one full replacement from beginning to end" in prompt
     assert "do not append fragments" in prompt
     assert "Do not change canon outside review requirements" in prompt

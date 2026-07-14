@@ -13,8 +13,8 @@ REVISION_EXPANSION_MARGIN = 1000
 
 
 def prose_target_band(hard_min: int = PROSE_MIN_CHARACTERS, hard_max: int | None = PROSE_MAX_CHARACTERS) -> tuple[int, int]:
-    target_min = ceil(hard_min * 1.30)
-    target_max = ceil(hard_min * 1.60)
+    target_min = ceil(hard_min * 1.50)
+    target_max = ceil(hard_min * 1.70)
     if hard_max is not None:
         if target_min > hard_max:
             raise ContractError("prose target band is incompatible with hard maximum", "PROSE_TARGET_BAND_INCOMPATIBLE")
