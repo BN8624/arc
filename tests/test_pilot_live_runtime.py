@@ -213,6 +213,7 @@ def _make_interrupted_episode_output(tmp_path: Path) -> Path:
     write_json(transitions / "episode_001_to_episode_002.json", transition_001_002)
     for name in ["pilot_evidence_packet.json", "pilot_review_workers.json", "pilot_acceptance.json", "pilot_review_workers.partial.json"]:
         (output / name).unlink(missing_ok=True)
+    shutil.rmtree(output / "pilot_review_receipts", ignore_errors=True)
 
     episode_manifest = read_json(episode2 / "manifest.json")
     keep = {"manifest.json", "context_packet.json", "planning_workers.partial.json", "live_calls.json"}
@@ -337,30 +338,35 @@ def _make_legacy_writer_output(tmp_path: Path, *, ambiguous: str | None = None) 
     return output
 
 
-def _make_acceptance_partial_output(tmp_path: Path) -> Path:
+def _make_acceptance_state(tmp_path: Path, completed_roles: list[str], *, receipt_roles: list[str] | None = None, telemetry_roles: list[str] | None = None, stale_manifest_checkpoint: bool = False) -> Path:
     output = tmp_path / "pilot-live"
     client, _ = _pilot_client(output)
     PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
 
     manifest = read_json(output / "pilot_manifest.json")
-    completed_roles = ["readability", "character_consistency", "continuity"]
+    receipt_roles = completed_roles if receipt_roles is None else receipt_roles
+    telemetry_roles = completed_roles if telemetry_roles is None else telemetry_roles
     workers = {worker["role"]: worker for worker in read_json(output / "pilot_review_workers.json")}
     (output / "pilot_review_workers.json").unlink(missing_ok=True)
     (output / "pilot_acceptance.json").unlink(missing_ok=True)
+    for role in PILOT_REVIEW_ROLES:
+        if role not in receipt_roles:
+            (output / "pilot_review_receipts" / f"{role}.response.json").unlink(missing_ok=True)
 
-    checkpoint = WaveCheckpoint(
-        output / "pilot_review_workers.partial.json",
-        "pilot_review",
-        {"pilot_id": manifest["pilot_id"], "mode": manifest["mode"], "scenario": manifest["scenario"], "episode_ids": manifest["episode_ids"], "evidence_packet_hash": manifest["artifact_hashes"]["pilot_evidence_packet.json"], "acceptance_rubric_version": 1},
-        PILOT_REVIEW_ROLES,
-    )
-    for role in completed_roles:
-        checkpoint.save(role, workers[role])
+    if completed_roles:
+        checkpoint = WaveCheckpoint(
+            output / "pilot_review_workers.partial.json",
+            "pilot_review",
+            {"pilot_id": manifest["pilot_id"], "mode": manifest["mode"], "scenario": manifest["scenario"], "episode_ids": manifest["episode_ids"], "evidence_packet_hash": manifest["artifact_hashes"]["pilot_evidence_packet.json"], "acceptance_rubric_version": 1},
+            PILOT_REVIEW_ROLES,
+        )
+        for role in completed_roles:
+            checkpoint.save(role, workers[role])
 
     telemetry = read_json(output / "pilot_live_calls.json")
-    kept_calls = [call for call in telemetry["calls"] if call["scope_id"] != "pilot:acceptance" or call["role"] in completed_roles]
+    kept_calls = [call for call in telemetry["calls"] if call["scope_id"] != "pilot:acceptance" or call["role"] in telemetry_roles]
     telemetry["calls"] = kept_calls
-    root_hash = write_json(output / "pilot_live_calls.json", telemetry)
+    write_json(output / "pilot_live_calls.json", telemetry)
     routing_state = read_json(output / "routing_state.json")
     routing_state["next_lease_sequence"] = max(call["lease_sequence"] for call in kept_calls) + 1
     write_json(output / "routing_state.json", routing_state)
@@ -368,9 +374,18 @@ def _make_acceptance_partial_output(tmp_path: Path) -> Path:
     manifest.update({"status": "RUNNING", "active_episode_id": None, "acceptance_verdict": None, "last_error": None, "pilot_live_call_count": len(kept_calls)})
     manifest["artifact_hashes"].pop("pilot_review_workers.json", None)
     manifest["artifact_hashes"].pop("pilot_acceptance.json", None)
-    manifest["live_telemetry_checkpoint"] = live_telemetry_checkpoint(telemetry)
+    if stale_manifest_checkpoint:
+        pre_acceptance = {**telemetry, "calls": [call for call in kept_calls if call["scope_id"] != "pilot:acceptance"]}
+        manifest["pilot_live_call_count"] = len(pre_acceptance["calls"])
+        manifest["live_telemetry_checkpoint"] = live_telemetry_checkpoint(pre_acceptance)
+    else:
+        manifest["live_telemetry_checkpoint"] = live_telemetry_checkpoint(telemetry)
     write_json(output / "pilot_manifest.json", manifest)
     return output
+
+
+def _make_acceptance_partial_output(tmp_path: Path) -> Path:
+    return _make_acceptance_state(tmp_path, ["readability", "character_consistency", "continuity"])
 
 
 def _run_planning_merge_contract_failure(tmp_path: Path):
@@ -2153,6 +2168,168 @@ def test_live_acceptance_terminal_error_preserves_other_successes(tmp_path):
     assert read_json(output / "pilot_live_calls.json")["contract_failures"]
 
 
+@pytest.mark.parametrize("completed_count", [0, 1, 6, 7])
+def test_live_acceptance_interruption_resume_calls_only_missing(tmp_path, completed_count):
+    completed = PILOT_REVIEW_ROLES[:completed_count]
+    output = _make_acceptance_state(tmp_path, list(completed))
+    fresh_client, fresh_root = _pilot_client(output)
+
+    result = PilotPipeline(fresh_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+
+    markers = {marker for _, marker, _ in fresh_root.provider_calls if marker.startswith("pilot_review:")}
+    assert markers == {f"pilot_review:{role}" for role in PILOT_REVIEW_ROLES if role not in completed}
+    assert not any(_episode_from_prompt(prompt) for _, _, prompt in fresh_root.provider_calls)
+    assert result["manifest"]["status"] == "COMPLETE"
+    assert (output / "pilot_acceptance.json").exists()
+    assert not (output / "pilot_review_workers.partial.json").exists()
+    for role in PILOT_REVIEW_ROLES:
+        assert read_json(output / "pilot_review_receipts" / f"{role}.response.json")["state"] == "COMPLETED"
+
+
+def test_live_acceptance_receipt_reuses_stored_response_without_call(tmp_path):
+    completed = [role for role in PILOT_REVIEW_ROLES if role != "episode_to_episode_interest"]
+    output = _make_acceptance_state(tmp_path, completed, receipt_roles=list(PILOT_REVIEW_ROLES), telemetry_roles=list(PILOT_REVIEW_ROLES))
+    receipt_path = output / "pilot_review_receipts" / "episode_to_episode_interest.response.json"
+    receipt = read_json(receipt_path)
+    receipt.update({"state": "RESPONSE_RECEIVED", "contract_code": None})
+    write_json(receipt_path, receipt)
+
+    fresh_client, fresh_root = _pilot_client(output)
+    result = PilotPipeline(fresh_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+
+    assert fresh_root.provider_calls == []
+    assert result["manifest"]["status"] == "COMPLETE"
+    assert read_json(receipt_path)["state"] == "COMPLETED"
+
+
+def test_live_acceptance_pass_without_receipt_fails_closed(tmp_path):
+    completed = [role for role in PILOT_REVIEW_ROLES if role != "memory_correctness"]
+    output = _make_acceptance_state(tmp_path, completed, receipt_roles=completed, telemetry_roles=list(PILOT_REVIEW_ROLES))
+
+    fresh_client, fresh_root = _pilot_client(output)
+    with pytest.raises(PilotError, match="PILOT_REVIEW_RECONCILIATION_REQUIRED"):
+        PilotPipeline(fresh_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    assert fresh_root.provider_calls == []
+
+
+def test_live_acceptance_rejected_receipt_fails_closed(tmp_path):
+    completed = [role for role in PILOT_REVIEW_ROLES if role != "narrative_weight"]
+    output = _make_acceptance_state(tmp_path, completed, receipt_roles=list(PILOT_REVIEW_ROLES), telemetry_roles=list(PILOT_REVIEW_ROLES))
+    receipt_path = output / "pilot_review_receipts" / "narrative_weight.response.json"
+    receipt = read_json(receipt_path)
+    receipt.update({"state": "REJECTED", "contract_code": "PILOT_REVIEW_EVIDENCE_INVALID"})
+    write_json(receipt_path, receipt)
+
+    fresh_client, fresh_root = _pilot_client(output)
+    with pytest.raises(PilotError, match="PILOT_REVIEW_RESPONSE_ALREADY_CONSUMED"):
+        PilotPipeline(fresh_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    assert fresh_root.provider_calls == []
+
+
+def test_live_acceptance_completed_receipt_without_worker_fails_closed(tmp_path):
+    completed = [role for role in PILOT_REVIEW_ROLES if role != "narrative_weight"]
+    output = _make_acceptance_state(tmp_path, completed, receipt_roles=list(PILOT_REVIEW_ROLES), telemetry_roles=list(PILOT_REVIEW_ROLES))
+
+    fresh_client, fresh_root = _pilot_client(output)
+    with pytest.raises(PilotError, match="completed acceptance receipt without checkpointed worker"):
+        PilotPipeline(fresh_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    assert fresh_root.provider_calls == []
+
+
+@pytest.mark.parametrize("field", ["raw_response", "response_sha256", "evidence_packet_hash"])
+def test_live_tampered_acceptance_receipt_fails_closed(tmp_path, field):
+    output = _make_acceptance_partial_output(tmp_path)
+    receipt_path = output / "pilot_review_receipts" / "readability.response.json"
+    receipt = read_json(receipt_path)
+    receipt[field] = receipt[field] + " " if field == "raw_response" else "0" * 64
+    write_json(receipt_path, receipt)
+
+    fresh_client, fresh_root = _pilot_client(output)
+    with pytest.raises(Exception):
+        PilotPipeline(fresh_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    assert fresh_root.provider_calls == []
+
+
+def test_live_acceptance_malformed_response_records_code_and_is_not_recalled(tmp_path):
+    output = tmp_path / "pilot-live"
+    provider_root = _PilotProviderRoot()
+    provider_root.malformed_once_at = "pilot_review:continuity"
+    client, _ = _pilot_client(output, provider_root)
+
+    with pytest.raises(Exception):
+        PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+
+    receipt = read_json(output / "pilot_review_receipts" / "continuity.response.json")
+    assert receipt["state"] == "REJECTED"
+    assert receipt["contract_code"] == "PILOT_REVIEW_RESPONSE_NOT_OBJECT"
+    failures = read_json(output / "pilot_live_calls.json")["contract_failures"]
+    assert any(item["contract_code"] == "PILOT_REVIEW_RESPONSE_NOT_OBJECT" and item["role"] == "continuity" for item in failures)
+
+    inspection = inspect_pilot_checkpoint(output)
+    assert inspection["checkpoint_integrity"] != "CORRUPT", inspection["reason_codes"]
+    if inspection["checkpoint_integrity"] == "RECONCILABLE":
+        reconcile_pilot_checkpoint(PILOT_FIXTURE, output)
+
+    fresh_client, fresh_root = _pilot_client(output)
+    with pytest.raises(PilotError, match="PILOT_REVIEW_RESPONSE_ALREADY_CONSUMED"):
+        PilotPipeline(fresh_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    assert not [marker for _, marker, _ in fresh_root.provider_calls if marker == "pilot_review:continuity"]
+
+
+def test_live_acceptance_mid_wave_manifest_stale_requires_reconcile_then_resumes(tmp_path):
+    output = _make_acceptance_state(tmp_path, ["readability", "character_consistency", "continuity"], stale_manifest_checkpoint=True)
+
+    fresh_client, fresh_root = _pilot_client(output)
+    with pytest.raises(PilotError, match="pilot checkpoint reconciliation required"):
+        PilotPipeline(fresh_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    assert fresh_root.provider_calls == []
+
+    result = reconcile_pilot_checkpoint(PILOT_FIXTURE, output)
+    assert result["checkpoint_integrity"] == "VALID"
+
+    resume_client, resume_root = _pilot_client(output)
+    PilotPipeline(resume_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    markers = {marker for _, marker, _ in resume_root.provider_calls if marker.startswith("pilot_review:")}
+    assert markers == {"pilot_review:rolling_plan_adaptation", "pilot_review:memory_correctness", "pilot_review:narrative_weight", "pilot_review:episode_to_episode_interest"}
+    assert read_json(output / "pilot_manifest.json")["status"] == "COMPLETE"
+
+
+def test_live_status_reports_grounded_acceptance(tmp_path):
+    output = tmp_path / "pilot-live"
+    client, _ = _pilot_client(output)
+    PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+
+    from arc.pilot import pilot_status
+
+    current = pilot_status(output)
+    assert current["acceptance_grounded"] is True
+    assert current["acceptance_schema_version"] == 2
+    assert current["acceptance_rubric_version"] == 1
+    assert current["acceptance_dimension_count"] == 7
+    assert current["acceptance_criterion_count"] == 21
+    assert current["acceptance_hold_criterion_count"] == 0
+    assert current["acceptance_strength_count"] == 7
+    assert current["acceptance_grounding_reason"] is None
+    assert current["acceptance_call_count"] == 7
+
+
+def test_live_hold_dimension_produces_grounded_hold(tmp_path):
+    output = tmp_path / "pilot-live"
+    client, _ = _pilot_client(output, _PilotProviderRoot(hold_dimension="continuity"))
+    PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+
+    from arc.pilot import pilot_status
+
+    acceptance = read_json(output / "pilot_acceptance.json")
+    assert acceptance["verdict"] == "HOLD"
+    assert acceptance["dimension_results"]["continuity"] == "HOLD"
+    assert acceptance["critical_findings"][0]["criterion_id"] == "continuity.required_obligations"
+    current = pilot_status(output)
+    assert current["status"] == "HOLD"
+    assert current["acceptance_grounded"] is True
+    assert current["acceptance_hold_criterion_count"] == 1
+
+
 def test_acceptance_calls_exist_only_in_pilot_root_telemetry(tmp_path):
     output = tmp_path / "pilot-live"
     client, _ = _pilot_client(output)
@@ -2303,7 +2480,6 @@ INTERRUPTION_POINTS = [
     ("episode:episode_004", "memory", 4),
     ("episode:episode_004", "memory_merge", 1),
     ("episode:episode_005", "memory_merge", 1),
-    ("pilot:acceptance", "pilot_review", 2),
 ]
 
 
@@ -2346,6 +2522,29 @@ def test_arbitrary_stage_interruption_recovers_without_duplicate_calls(tmp_path,
         assert projection["calls"] == [call for call in after["calls"] if call["scope_id"] == scope]
         assert all(item["scope_id"] == scope for item in projection["contract_failures"])
         assert all(call["scope_id"] != "pilot:acceptance" for call in projection["calls"])
+
+
+def test_interrupt_after_acceptance_content_response_fails_closed_without_second_call(tmp_path):
+    output = tmp_path / "pilot-live"
+    client, _ = _interrupting_pilot_client(output, stop_scope="pilot:acceptance", stop_stage="pilot_review", stop_count=2)
+    with pytest.raises(KeyboardInterrupt):
+        PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+
+    telemetry = read_json(output / "pilot_live_calls.json")
+    passed_roles = [call["role"] for call in telemetry["calls"] if call["scope_id"] == "pilot:acceptance" and call["status"] == "PASS"]
+    missing_receipt_roles = [role for role in passed_roles if not (output / "pilot_review_receipts" / f"{role}.response.json").exists()]
+    assert missing_receipt_roles
+
+    inspection = inspect_pilot_checkpoint(output)
+    assert inspection["checkpoint_integrity"] != "CORRUPT", inspection["reason_codes"]
+    if inspection["checkpoint_integrity"] == "RECONCILABLE":
+        reconcile_pilot_checkpoint(PILOT_FIXTURE, output)
+
+    resumed_client, resumed_root = _pilot_client(output)
+    with pytest.raises(PilotError, match="PILOT_REVIEW_RECONCILIATION_REQUIRED"):
+        PilotPipeline(resumed_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    resumed_markers = [marker for _, marker, _ in resumed_root.provider_calls if marker.startswith("pilot_review:")]
+    assert all(f"pilot_review:{role}" not in resumed_markers for role in missing_receipt_roles)
 
 
 def test_interrupt_after_writer_content_response_fails_closed_without_second_call(tmp_path):

@@ -7,7 +7,7 @@ from pathlib import Path
 from .contracts import ContractError, parse_object, validate_worker
 from .live_model import scope_projection
 from .pipeline import MockPipeline, WaveCheckpoint, status
-from .pilot_contracts import ACCEPTANCE_EXCERPT_MAX_CHARACTERS, ACCEPTANCE_EXCERPT_MIN_CHARACTERS, ACCEPTANCE_RUBRIC, ACCEPTANCE_RUBRIC_VERSION, PILOT_REVIEW_ROLES, ROLLING_PLAN_HORIZON_LIMITS, STABLE_MEMORY_FIELDS, TRANSITION_ACTIONS, TRANSITION_CONTRACT_VERSION, TRANSITION_EVIDENCE_FILES, TRANSITION_RESPONSE_FIELDS, TRANSITION_SCHEMA_VERSION, acceptance_catalog_plan, aggregate_pilot_acceptance, canonical_bytes, rolling_plan_hash, transition_action_counts, validate_acceptance_worker, validate_grounded_pilot_acceptance, validate_pilot_fixture, validate_transition, validate_transition_response
+from .pilot_contracts import ACCEPTANCE_EXCERPT_MAX_CHARACTERS, ACCEPTANCE_EXCERPT_MIN_CHARACTERS, ACCEPTANCE_RUBRIC, ACCEPTANCE_RUBRIC_VERSION, ACCEPTANCE_SCHEMA_VERSION, PILOT_REVIEW_ROLES, ROLLING_PLAN_HORIZON_LIMITS, STABLE_MEMORY_FIELDS, TRANSITION_ACTIONS, TRANSITION_CONTRACT_VERSION, TRANSITION_EVIDENCE_FILES, TRANSITION_RESPONSE_FIELDS, TRANSITION_SCHEMA_VERSION, acceptance_catalog_plan, aggregate_pilot_acceptance, canonical_bytes, rolling_plan_hash, transition_action_counts, validate_acceptance_worker, validate_grounded_pilot_acceptance, validate_pilot_fixture, validate_transition, validate_transition_response
 from .storage import StorageError, read_json, sha256_bytes, sha256_file, write_json
 
 PROJECTION_CURRENT = "CURRENT"
@@ -17,6 +17,7 @@ PROJECTION_CONFLICT = "CONFLICT"
 PROJECTION_STALE_REASON = "EPISODE_PROJECTION_STALE"
 TRANSITION_RECEIPT_FIELDS = {"schema_version", "transition_id", "completed_episode_id", "next_episode_id", "transition_input_hash", "state", "response_sha256", "raw_response", "contract_code"}
 TRANSITION_RECEIPT_STATES = {"RESPONSE_RECEIVED", "COMPLETED", "REJECTED"}
+ACCEPTANCE_RECEIPT_FIELDS = {"schema_version", "role", "evidence_packet_hash", "state", "response_sha256", "raw_response", "contract_code"}
 
 
 class PilotError(RuntimeError):
@@ -150,6 +151,7 @@ class PilotPipeline:
                     raise PilotError("invalid canonical pilot review workers")
                 for worker in workers:
                     self._review_worker_contract(worker, worker["role"], catalog, manifest["episode_ids"])
+                    self._reconcile_acceptance_receipt(run_dir, worker["role"], manifest["artifact_hashes"]["pilot_evidence_packet.json"], worker)
             else:
                 workers = self._review_workers(run_dir, manifest, catalog)
                 self._save_checkpoint(run_dir, manifest)
@@ -159,6 +161,9 @@ class PilotPipeline:
             manifest["acceptance_verdict"] = acceptance["verdict"]
         else:
             catalog = build_acceptance_evidence_catalog(run_dir, manifest)
+            packet = read_json(run_dir / "pilot_evidence_packet.json")
+            if packet.get("acceptance_rubric_version") != ACCEPTANCE_RUBRIC_VERSION or packet.get("acceptance_evidence_catalog") != catalog:
+                raise PilotError("pilot evidence packet acceptance catalog mismatch")
             workers_path = run_dir / "pilot_review_workers.json"
             if manifest["artifact_hashes"].get("pilot_review_workers.json") != sha256_file(workers_path):
                 raise PilotError("pilot review worker hash mismatch")
@@ -167,6 +172,7 @@ class PilotPipeline:
                 raise PilotError("invalid canonical pilot review workers")
             for worker in workers:
                 self._review_worker_contract(worker, worker["role"], catalog, manifest["episode_ids"])
+                self._reconcile_acceptance_receipt(run_dir, worker["role"], manifest["artifact_hashes"]["pilot_evidence_packet.json"], worker)
             acceptance = read_json(run_dir / "pilot_acceptance.json")
             validate_grounded_pilot_acceptance(acceptance, workers)
             manifest["acceptance_verdict"] = acceptance["verdict"]
@@ -322,6 +328,9 @@ class PilotPipeline:
             evidence["rolling_plan_hashes"].append(sha256_bytes(canonical_bytes(source["rolling_plan"])))
         for episode_id, next_id in zip(manifest["episode_ids"], manifest["episode_ids"][1:]):
             evidence["transitions"].append(read_json(run_dir / f"transitions/{episode_id}_to_{next_id}.json"))
+        packet_path = run_dir / "pilot_evidence_packet.json"
+        if packet_path.exists() and read_json(packet_path) != evidence:
+            raise PilotError("pilot evidence packet mismatch; refusing overwrite")
         self._write_artifact(run_dir, manifest, "pilot_evidence_packet.json", evidence)
         return catalog
 
@@ -333,6 +342,7 @@ class PilotPipeline:
             completed = checkpoint.result(role)
             if completed:
                 workers.append(self._review_worker_contract(completed, role, catalog, manifest["episode_ids"]))
+                self._reconcile_acceptance_receipt(run_dir, role, evidence_hash, completed)
         first_error = None
         from concurrent.futures import ThreadPoolExecutor, as_completed
         with ThreadPoolExecutor(max_workers=len(PILOT_REVIEW_ROLES)) as executor:
@@ -342,6 +352,7 @@ class PilotPipeline:
                     worker = future.result()
                     workers.append(worker)
                     checkpoint.save(worker["role"], worker)
+                    self._reconcile_acceptance_receipt(run_dir, worker["role"], evidence_hash, worker)
                 except Exception as error:
                     first_error = first_error or error
         if first_error:
@@ -371,14 +382,47 @@ class PilotPipeline:
     def _review_worker(self, run_dir: Path, manifest: dict, role: str, evidence_hash: str, catalog: list[dict]) -> dict:
         payload = self._review_worker_payload(manifest, role, evidence_hash, catalog)
         prompt = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        client = self._acceptance_client() if self.mode == "live" else self.client
+        if self.mode != "live":
+            value = parse_object(self.client.generate(stage="pilot_review", role=role, prompt=prompt))
+            return self._review_worker_contract(value, role, catalog, manifest["episode_ids"])
+        client = self._acceptance_client()
+        receipt_path = run_dir / "pilot_review_receipts" / f"{role}.response.json"
+        receipt = _read_acceptance_receipt(receipt_path, role, evidence_hash)
+        if receipt is not None and receipt["state"] == "REJECTED":
+            raise PilotError(f"PILOT_REVIEW_RESPONSE_ALREADY_CONSUMED: {receipt['contract_code']}")
+        if receipt is not None and receipt["state"] == "COMPLETED":
+            raise PilotError("completed acceptance receipt without checkpointed worker")
+        if receipt is None:
+            if self._consumed_acceptance_response(role):
+                raise PilotError("PILOT_REVIEW_RECONCILIATION_REQUIRED")
+            raw = client.generate(stage="pilot_review", role=role, prompt=prompt)
+            receipt = {"schema_version": 1, "role": role, "evidence_packet_hash": evidence_hash, "state": "RESPONSE_RECEIVED", "response_sha256": sha256_bytes(raw.encode("utf-8")), "raw_response": raw, "contract_code": None}
+            write_json(receipt_path, receipt)
         try:
-            value = parse_object(client.generate(stage="pilot_review", role=role, prompt=prompt))
+            value = parse_object(receipt["raw_response"])
             return self._review_worker_contract(value, role, catalog, manifest["episode_ids"])
         except ContractError as error:
-            if self.mode == "live":
-                client.record_contract_failure("pilot_review", role, contract_code=error.contract_code or "PILOT_REVIEW_RESPONSE_NOT_OBJECT")
+            code = error.contract_code or "PILOT_REVIEW_RESPONSE_NOT_OBJECT"
+            client.record_contract_failure("pilot_review", role, contract_code=code)
+            receipt.update({"state": "REJECTED", "contract_code": code})
+            write_json(receipt_path, receipt)
             raise
+
+    def _consumed_acceptance_response(self, role: str) -> bool:
+        telemetry = self.client.telemetry() if hasattr(self.client, "telemetry") else {"calls": []}
+        return any(call.get("scope_id") == "pilot:acceptance" and call.get("stage") == "pilot_review" and call.get("role") == role and call.get("status") == "PASS" for call in telemetry.get("calls", []))
+
+    def _reconcile_acceptance_receipt(self, run_dir: Path, role: str, evidence_hash: str, worker: dict) -> None:
+        if self.mode != "live":
+            return
+        receipt_path = run_dir / "pilot_review_receipts" / f"{role}.response.json"
+        receipt = _read_acceptance_receipt(receipt_path, role, evidence_hash)
+        if receipt is None:
+            return
+        _verify_acceptance_receipt_matches(receipt, worker)
+        if receipt["state"] != "COMPLETED":
+            receipt.update({"state": "COMPLETED", "contract_code": None})
+            write_json(receipt_path, receipt)
 
     def _review_worker_contract(self, value: dict, role: str, catalog: list[dict], episode_ids: list[str]) -> dict:
         validate_worker(value, f"pilot_review-{role}", role)
@@ -496,6 +540,91 @@ def rolling_plan_adaptation_summary(run_dir: Path, manifest: dict) -> dict:
     }
 
 
+def _read_acceptance_receipt(receipt_path: Path, role: str, evidence_hash: str | None) -> dict | None:
+    if not receipt_path.exists():
+        return None
+    receipt = read_json(receipt_path)
+    if not isinstance(receipt, dict) or set(receipt) != ACCEPTANCE_RECEIPT_FIELDS or receipt["schema_version"] != 1 or receipt["role"] != role or receipt["state"] not in TRANSITION_RECEIPT_STATES:
+        raise PilotError("invalid acceptance response receipt")
+    if not isinstance(receipt["raw_response"], str) or receipt["response_sha256"] != sha256_bytes(receipt["raw_response"].encode("utf-8")):
+        raise PilotError("acceptance receipt response hash mismatch")
+    if evidence_hash is not None and receipt["evidence_packet_hash"] != evidence_hash:
+        raise PilotError("acceptance receipt evidence hash mismatch")
+    return receipt
+
+
+def _verify_acceptance_receipt_matches(receipt: dict, worker: dict) -> None:
+    if receipt["state"] == "REJECTED":
+        raise PilotError("rejected acceptance receipt conflicts with validated worker")
+    try:
+        response = parse_object(receipt["raw_response"])
+    except ContractError:
+        raise PilotError("acceptance receipt response does not match validated worker") from None
+    if response != worker:
+        raise PilotError("acceptance receipt response does not match validated worker")
+
+
+def _verify_acceptance_receipts(run_dir: Path, manifest: dict) -> None:
+    packet_hash = manifest.get("artifact_hashes", {}).get("pilot_evidence_packet.json")
+    workers_path = run_dir / "pilot_review_workers.json"
+    workers = {worker.get("role"): worker for worker in read_json(workers_path)} if workers_path.exists() else None
+    for role in PILOT_REVIEW_ROLES:
+        receipt = _read_acceptance_receipt(run_dir / "pilot_review_receipts" / f"{role}.response.json", role, None)
+        if receipt is None:
+            continue
+        if receipt["evidence_packet_hash"] != packet_hash:
+            raise PilotError("acceptance receipt evidence hash mismatch")
+        if workers is not None:
+            worker = workers.get(role)
+            if worker is None:
+                raise PilotError("acceptance receipt without canonical worker")
+            _verify_acceptance_receipt_matches(receipt, worker)
+
+
+def acceptance_grounding_summary(run_dir: Path, manifest: dict) -> dict:
+    """Diagnose acceptance grounding without mutating canonical artifacts."""
+    result = {"acceptance_schema_version": None, "acceptance_rubric_version": None, "acceptance_grounded": False, "acceptance_grounding_reason": None, "acceptance_dimension_count": None, "acceptance_criterion_count": None, "acceptance_hold_criterion_count": None, "acceptance_strength_count": None, "acceptance_evidence_ref_count": None}
+    path = run_dir / "pilot_acceptance.json"
+    if not path.exists():
+        return result
+    acceptance = read_json(path)
+    if not isinstance(acceptance, dict):
+        result["acceptance_grounding_reason"] = "ACCEPTANCE_VALIDATION_FAILED"
+        return result
+    result["acceptance_schema_version"] = acceptance.get("schema_version")
+    result["acceptance_rubric_version"] = acceptance.get("rubric_version")
+    if acceptance.get("schema_version") != ACCEPTANCE_SCHEMA_VERSION:
+        result["acceptance_grounding_reason"] = "LEGACY_GENERIC_ACCEPTANCE"
+        return result
+    workers_path = run_dir / "pilot_review_workers.json"
+    try:
+        if manifest["artifact_hashes"].get("pilot_review_workers.json") != sha256_file(workers_path):
+            raise PilotError("pilot review worker hash mismatch")
+        workers = read_json(workers_path)
+        if not isinstance(workers, list) or [worker.get("role") for worker in workers] != PILOT_REVIEW_ROLES:
+            raise PilotError("invalid canonical pilot review workers")
+        catalog = build_acceptance_evidence_catalog(run_dir, manifest)
+        packet = read_json(run_dir / "pilot_evidence_packet.json")
+        if packet.get("acceptance_rubric_version") != ACCEPTANCE_RUBRIC_VERSION or packet.get("acceptance_evidence_catalog") != catalog:
+            raise PilotError("pilot evidence packet acceptance catalog mismatch")
+        for worker in workers:
+            validate_acceptance_worker(worker, worker["role"], catalog, manifest["episode_ids"])
+        validate_grounded_pilot_acceptance(acceptance, workers)
+    except Exception:
+        result["acceptance_grounding_reason"] = "ACCEPTANCE_VALIDATION_FAILED"
+        return result
+    criterion_results = [item for worker in workers for item in worker["proposal"]["criterion_results"]]
+    result.update({
+        "acceptance_grounded": True,
+        "acceptance_dimension_count": len(workers),
+        "acceptance_criterion_count": len(criterion_results),
+        "acceptance_hold_criterion_count": sum(item["result"] == "HOLD" for item in criterion_results),
+        "acceptance_strength_count": len(acceptance["strengths_to_preserve"]),
+        "acceptance_evidence_ref_count": len(acceptance["evidence_refs"]),
+    })
+    return result
+
+
 def build_acceptance_evidence_catalog(run_dir: Path, manifest: dict) -> list[dict]:
     """Build the granular acceptance evidence catalog from actual pilot artifacts."""
     catalog = []
@@ -571,12 +700,15 @@ def verify_pilot_artifacts(run_dir: Path, manifest: dict) -> None:
         pending.add(f"transitions/{transition_id}.json")
         if manifest.get("mode") == "live":
             pending.add(f"transitions/{transition_id}.response.json")
+    if manifest.get("mode") == "live":
+        pending.update(f"pilot_review_receipts/{role}.response.json" for role in PILOT_REVIEW_ROLES)
     operational = {"routing_state.json", "pilot_live_calls.json"} if manifest.get("mode") == "live" else set()
     actual = {path.relative_to(run_dir).as_posix() for path in run_dir.rglob("*") if path.is_file()}
     if actual - expected - operational - pending - {f"episodes/{episode_id}/{name}" for episode_id in manifest["episode_ids"] for name in _episode_files(run_dir / "episodes" / episode_id)}:
         raise StorageError("unknown pilot artifact")
     if manifest.get("mode") == "live":
         _verify_transition_receipts(run_dir, manifest)
+        _verify_acceptance_receipts(run_dir, manifest)
     if manifest.get("mode") == "live" and (run_dir / "pilot_live_calls.json").exists():
         _verify_live_telemetry_projections(run_dir, manifest)
     for episode_id in manifest["completed_episodes"]:
@@ -957,7 +1089,8 @@ def pilot_status(run_dir: Path) -> dict:
     episodes = {episode_id: status(run_dir / "episodes" / episode_id)["status"] for episode_id in manifest["completed_episodes"]}
     finals = all((run_dir / "episodes" / episode_id / "final.md").exists() for episode_id in manifest["completed_episodes"])
     adaptation = rolling_plan_adaptation_summary(run_dir, manifest)
-    result = {"mode": manifest.get("mode", "mock"), "pilot_id": manifest["pilot_id"], "status": manifest["status"], "episode_count": len(manifest["episode_ids"]), "completed_episode_count": len(manifest["completed_episodes"]), "completed_transition_count": len(manifest["completed_transitions"]), "active_episode_id": manifest["active_episode_id"], "episode_statuses": episodes, "writer_call_count": sum(item["writer_call_count"] for item in manifest["episode_records"]), "revision_count": sum(item["revision_count"] for item in manifest["episode_records"]), "acceptance_verdict": manifest["acceptance_verdict"], "finals_exist": finals, "memory_chain_valid": _memory_chain_valid(run_dir, manifest), "rolling_plan_adapted": adaptation["adaptation_proven"], "rolling_plan_adaptation_action_counts": adaptation["action_counts"], "legacy_transition_count": adaptation["legacy_transition_count"], "checkpoint_integrity": inspection["checkpoint_integrity"], "reconciliation_required": inspection["reconciliation_required"], "reason_codes": inspection["reason_codes"], "current": inspection["current"], "derived": inspection["derived"]}
+    grounding = acceptance_grounding_summary(run_dir, manifest)
+    result = {"mode": manifest.get("mode", "mock"), "pilot_id": manifest["pilot_id"], "status": manifest["status"], "episode_count": len(manifest["episode_ids"]), "completed_episode_count": len(manifest["completed_episodes"]), "completed_transition_count": len(manifest["completed_transitions"]), "active_episode_id": manifest["active_episode_id"], "episode_statuses": episodes, "writer_call_count": sum(item["writer_call_count"] for item in manifest["episode_records"]), "revision_count": sum(item["revision_count"] for item in manifest["episode_records"]), "acceptance_verdict": manifest["acceptance_verdict"], "finals_exist": finals, "memory_chain_valid": _memory_chain_valid(run_dir, manifest), "rolling_plan_adapted": adaptation["adaptation_proven"], "rolling_plan_adaptation_action_counts": adaptation["action_counts"], "legacy_transition_count": adaptation["legacy_transition_count"], **grounding, "checkpoint_integrity": inspection["checkpoint_integrity"], "reconciliation_required": inspection["reconciliation_required"], "reason_codes": inspection["reason_codes"], "current": inspection["current"], "derived": inspection["derived"]}
     if result["mode"] == "live":
         telemetry = read_json(run_dir / "pilot_live_calls.json")
         checkpoint = manifest.get("live_telemetry_checkpoint")

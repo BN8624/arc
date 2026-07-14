@@ -227,6 +227,154 @@ def test_mock_hold_acceptance_is_grounded(tmp_path: Path) -> None:
     assert all(strength["evidence"] for strength in acceptance["strengths_to_preserve"])
 
 
+def test_status_reports_grounded_acceptance_counts(tmp_path: Path) -> None:
+    _, output = run(tmp_path)
+    current = pilot_status(output)
+    assert current["acceptance_grounded"] is True
+    assert current["acceptance_schema_version"] == 2
+    assert current["acceptance_rubric_version"] == 1
+    assert current["acceptance_dimension_count"] == 7
+    assert current["acceptance_criterion_count"] == 21
+    assert current["acceptance_hold_criterion_count"] == 0
+    assert current["acceptance_strength_count"] == 7
+    assert current["acceptance_evidence_ref_count"] >= 1
+    assert current["acceptance_grounding_reason"] is None
+
+
+def test_status_reports_grounded_hold_acceptance(tmp_path: Path) -> None:
+    _, output = run(tmp_path, "pilot_hold")
+    current = pilot_status(output)
+    assert current["status"] == "HOLD"
+    assert current["acceptance_grounded"] is True
+    assert current["acceptance_hold_criterion_count"] == 1
+
+
+def test_status_query_does_not_mutate_artifacts(tmp_path: Path) -> None:
+    _, output = run(tmp_path)
+    before = {path.relative_to(output).as_posix(): path.read_bytes() for path in output.rglob("*") if path.is_file()}
+    pilot_status(output)
+    after = {path.relative_to(output).as_posix(): path.read_bytes() for path in output.rglob("*") if path.is_file()}
+    assert before == after
+
+
+def _legacy_acceptance() -> dict:
+    return {"verdict": "PASS", "dimension_results": {role: "PASS" for role in PILOT_REVIEW_ROLES}, "critical_findings": [], "strengths_to_preserve": ["legacy strength"], "evidence_refs": ["pilot_evidence_packet.json"]}
+
+
+def test_legacy_generic_acceptance_is_diagnosed_not_upgraded(tmp_path: Path) -> None:
+    from arc.storage import write_json
+
+    _, output = run(tmp_path)
+    manifest_path = output / "pilot_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["artifact_hashes"]["pilot_acceptance.json"] = write_json(output / "pilot_acceptance.json", _legacy_acceptance())
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    current = pilot_status(output)
+    assert current["checkpoint_integrity"] != "CORRUPT"
+    assert current["acceptance_grounded"] is False
+    assert current["acceptance_grounding_reason"] == "LEGACY_GENERIC_ACCEPTANCE"
+    assert current["acceptance_schema_version"] is None
+
+    manifest["status"] = "RUNNING"
+    manifest["acceptance_verdict"] = None
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    before = (output / "pilot_acceptance.json").read_bytes()
+    with pytest.raises(Exception, match="legacy generic acceptance"):
+        PilotPipeline(MockModelClient("pass"), "pass").run(FIXTURE, output)
+    assert (output / "pilot_acceptance.json").read_bytes() == before
+
+
+def _tampered_running_resume(tmp_path: Path, scenario: str, name: str, mutate) -> Path:
+    from arc.storage import write_json
+
+    _, output = run(tmp_path, scenario)
+    manifest_path = output / "pilot_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    value = json.loads((output / name).read_text(encoding="utf-8"))
+    mutate(value)
+    manifest["artifact_hashes"][name] = write_json(output / name, value)
+    manifest["status"] = "RUNNING"
+    manifest["acceptance_verdict"] = None
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    return output
+
+
+def _flip_first_criterion(workers: list) -> None:
+    workers[0]["proposal"]["criterion_results"][0]["result"] = "HOLD"
+
+
+def _fabricate_excerpt(workers: list) -> None:
+    workers[0]["proposal"]["criterion_results"][0]["evidence"][0]["excerpt"] = "fabricated excerpt that never appears"
+
+
+def _drop_coverage_ref(workers: list) -> None:
+    workers[0]["proposal"]["coverage_refs"] = workers[0]["proposal"]["coverage_refs"][:-1]
+
+
+def _drop_criterion(workers: list) -> None:
+    workers[0]["proposal"]["criterion_results"].pop()
+
+
+def _swap_worker_role(workers: list) -> None:
+    workers[0]["role"], workers[1]["role"] = workers[1]["role"], workers[0]["role"]
+
+
+@pytest.mark.parametrize("mutate", [_flip_first_criterion, _fabricate_excerpt, _drop_coverage_ref, _drop_criterion, _swap_worker_role])
+def test_tampered_worker_artifacts_fail_closed(tmp_path: Path, mutate) -> None:
+    output = _tampered_running_resume(tmp_path, "pass", "pilot_review_workers.json", mutate)
+    with pytest.raises(Exception):
+        PilotPipeline(MockModelClient("pass"), "pass").run(FIXTURE, output)
+
+
+def _flip_dimension_result(acceptance: dict) -> None:
+    acceptance["dimension_results"]["readability"] = "HOLD"
+
+
+def _rewrite_strength(acceptance: dict) -> None:
+    acceptance["strengths_to_preserve"][0]["strength"] = "A rewritten strength statement."
+
+
+def _drop_evidence_ref(acceptance: dict) -> None:
+    acceptance["evidence_refs"] = acceptance["evidence_refs"][:-1]
+
+
+def _flip_schema_only(acceptance: dict) -> None:
+    legacy = _legacy_acceptance()
+    acceptance.clear()
+    acceptance.update(legacy, schema_version=2)
+
+
+@pytest.mark.parametrize("mutate", [_flip_dimension_result, _rewrite_strength, _drop_evidence_ref, _flip_schema_only])
+def test_tampered_acceptance_artifacts_fail_closed(tmp_path: Path, mutate) -> None:
+    output = _tampered_running_resume(tmp_path, "pass", "pilot_acceptance.json", mutate)
+    with pytest.raises(Exception):
+        PilotPipeline(MockModelClient("pass"), "pass").run(FIXTURE, output)
+
+
+def _drop_critical_finding(acceptance: dict) -> None:
+    acceptance["critical_findings"] = []
+
+
+def test_tampered_hold_acceptance_without_finding_fails_closed(tmp_path: Path) -> None:
+    output = _tampered_running_resume(tmp_path, "pilot_hold", "pilot_acceptance.json", _drop_critical_finding)
+    with pytest.raises(Exception):
+        PilotPipeline(MockModelClient("pass"), "pilot_hold").run(FIXTURE, output)
+
+
+def _bump_rubric_version(packet: dict) -> None:
+    packet["acceptance_rubric_version"] = 999
+
+
+def test_tampered_packet_rubric_version_fails_closed(tmp_path: Path) -> None:
+    output = _tampered_running_resume(tmp_path, "pass", "pilot_evidence_packet.json", _bump_rubric_version)
+    with pytest.raises(Exception, match="pilot evidence packet"):
+        PilotPipeline(MockModelClient("pass"), "pass").run(FIXTURE, output)
+    current = pilot_status(output)
+    assert current["acceptance_grounded"] is False
+    assert current["acceptance_grounding_reason"] == "ACCEPTANCE_VALIDATION_FAILED"
+
+
 def test_pilot_fixture_rejects_duplicate_episode_ids() -> None:
     fixture = json.loads(FIXTURE.read_text(encoding="utf-8"))
     fixture["episode_ids"][4] = fixture["episode_ids"][3]
