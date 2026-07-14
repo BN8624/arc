@@ -161,6 +161,39 @@ def _config(key_count: int = 11) -> LiveConfig:
     return LiveConfig(MODEL_NAME, {f"K{i:02d}": f"key-{i:02d}" for i in range(1, key_count + 1)}, launch_interval=0.0)
 
 
+def test_transition_payload_pins_evidence_contract(tmp_path):
+    episode_id = "episode_007"
+    next_id = "episode_008"
+    episode_dir = tmp_path / "episodes" / episode_id
+    episode_dir.mkdir(parents=True)
+    (episode_dir / "final.md").write_text("An exact final excerpt for the transition artifact.", encoding="utf-8")
+    write_json(episode_dir / "episode_plan.json", {"objective": "A safe JSON excerpt."})
+    write_json(episode_dir / "memory_update.json", {"summary": "A memory update excerpt."})
+    write_json(episode_dir / "memory_after.json", {"summary": "A memory after excerpt."})
+
+    payload = PilotPipeline(object(), scenario="pass", mode="mock")._transition_payload(
+        tmp_path,
+        {"pilot_id": "pilot-test", "episode_ids": [episode_id, next_id]},
+        episode_id,
+        next_id,
+        {"rolling_plan": {"immediate_horizon": ["next item"], "near_horizon": []}, "required_next_episode_continuity": []},
+        0,
+    )
+    contract = payload["evidence_contract"]
+
+    assert isinstance(contract, str) and contract
+    assert "exact contiguous character-for-character substring" in contract
+    assert "Copy-paste verbatim only; never paraphrase, summarize, or reconstruct from memory." in contract
+    assert 'contains no JSON escape sequences such as \\", \\\\, \\n, \\r, or \\t' in contract
+    assert f'the "final" field is episodes/{episode_id}/final.md' in contract
+    assert f'"episode_plan" is episodes/{episode_id}/episode_plan.json' in contract
+    assert f'"memory_update" is episodes/{episode_id}/memory_update.json' in contract
+    assert f'"memory_after" is episodes/{episode_id}/memory_after.json' in contract
+    assert "Select and copy the exact evidence excerpt before composing the reason." in contract
+    assert "Do not derive the excerpt from the reason or adaptation summary." in contract
+    assert "8 to 400 characters are accepted; roughly 20 to 120 characters are recommended" in contract
+
+
 def _client(tmp_path, key_count: int = 11) -> tuple[GemmaPoolClient, dict[str, _Provider]]:
     providers: dict[str, _Provider] = {}
 
