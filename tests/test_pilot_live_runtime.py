@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from arc.contracts import ContractError, PROSE_FORBIDDEN_MARKERS, PROSE_MAX_CHARACTERS, PROSE_MIN_CHARACTERS, PROSE_REPAIRABLE_MIN_CHARACTERS, validate_draft_prose, validate_prose
+from arc.mock_model import transition_adapter_response
 from arc.live_model import AtomicTelemetryStore, GemmaPoolClient, LiveCallError, LiveConfig, MODEL_NAME, RoutingStateStore
 from arc.pipeline import PLANNING_ROLES, MockPipeline, WaveCheckpoint, status
 from arc.pilot_contracts import PILOT_REVIEW_ROLES
@@ -57,8 +58,8 @@ class _PilotModels:
             payload = json.loads(contents.split("Input JSON:\n", 1)[1])
         else:
             payload = json.loads(contents)
-            stage = "pilot_review"
-            role = payload["dimension"]
+            stage = payload.get("stage", "pilot_review")
+            role = payload.get("role") or payload["dimension"]
         marker = f"{stage}:{role}"
         self.owner.root.provider_calls.append((self.owner.slot, marker, contents))
         if marker == self.owner.root.fail_once_at and marker not in self.owner.root.failed:
@@ -149,6 +150,8 @@ class _PilotProviderRoot:
             return ("A revised synthetic live episode sentence. " * 150)[:4800]
         if stage == "memory_merge":
             return json.dumps({"episode_id": episode_id, "confirmed_facts_added": [f"synthetic fact {episode_id}"], "relationship_changes": [f"synthetic relationship {episode_id}"], "conflict_ids_resolved": [], "conflicts_opened": [f"synthetic opened conflict {episode_id}"], "promises_added": [f"synthetic promise {episode_id}"], "important_excerpts_added": [f"synthetic excerpt {episode_id}"], "episode_summary": f"synthetic episode summary {episode_id}", "required_next_episode_continuity": [f"synthetic continuity {episode_id}"], "evidence_refs": ["final.md"]})
+        if stage == "transition":
+            return json.dumps(transition_adapter_response(payload), ensure_ascii=False)
         raise RuntimeError(f"unknown live stage: {stage}:{role}")
 
 
@@ -2462,6 +2465,29 @@ def test_episode_projection_contains_only_episode_scope_contract_failures(tmp_pa
     assert [item["scope_id"] for item in projection["contract_failures"]] == ["episode:episode_002"]
     for episode_id in ["episode_001", "episode_003", "episode_004", "episode_005"]:
         assert read_json(output / "episodes" / episode_id / "live_calls.json")["contract_failures"] == []
+
+
+def test_live_transition_adapter_calls_once_per_boundary(tmp_path):
+    output = tmp_path / "pilot-live"
+    client, root = _pilot_client(output)
+
+    PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+
+    telemetry = read_json(output / "pilot_live_calls.json")
+    transition_calls = [call for call in telemetry["calls"] if call["stage"] == "transition"]
+    assert len(transition_calls) == 4
+    assert all(call["role"] == "adapter" and call["status"] == "PASS" for call in transition_calls)
+    assert sorted(call["scope_id"] for call in transition_calls) == [f"episode:episode_00{index}" for index in range(1, 5)]
+    assert not any(call["stage"] == "transition" for call in telemetry["calls"] if call["scope_id"] == "pilot:acceptance")
+    call_ids = [call["call_id"] for call in telemetry["calls"]]
+    lease_sequences = [call["lease_sequence"] for call in telemetry["calls"]]
+    assert len(call_ids) == len(set(call_ids)) and len(lease_sequences) == len(set(lease_sequences))
+    for index in range(1, 5):
+        projection = read_json(output / "episodes" / f"episode_00{index}" / "live_calls.json")
+        assert sum(call["stage"] == "transition" for call in projection["calls"]) == 1
+    assert not any(call["stage"] == "transition" for call in read_json(output / "episodes" / "episode_005" / "live_calls.json")["calls"])
+    episode2_planning = [prompt for _, marker, prompt in root.provider_calls if marker.startswith("planning:") and _episode_from_prompt(prompt) == "episode_002"]
+    assert episode2_planning and all("adapted direction after episode_001" in prompt for prompt in episode2_planning)
 
 
 def _projection_root_doc() -> dict:

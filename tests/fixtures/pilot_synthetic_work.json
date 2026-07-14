@@ -12,8 +12,8 @@
     "promises": ["synthetic existing promise"],
     "episode_summaries": ["synthetic existing summary"],
     "important_excerpts": ["synthetic existing excerpt"],
-    "rolling_plan": {"near_horizon": [], "immediate_horizon": []},
+    "rolling_plan": {"near_horizon": ["synthetic stale direction", "synthetic near direction"], "immediate_horizon": ["synthetic opening objective"]},
     "required_next_episode_continuity": ["synthetic existing continuity"],
-    "current_episode": {"episode_id": "episode_001", "importance": "ordinary", "required_role": "synthetic pilot role"}
+    "current_episode": {"episode_id": "episode_001", "importance": "ordinary", "required_role": "synthetic opening objective"}
   }
 }

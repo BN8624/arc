@@ -7,7 +7,7 @@ from pathlib import Path
 from .contracts import ContractError, parse_object, validate_worker
 from .live_model import scope_projection
 from .pipeline import MockPipeline, WaveCheckpoint, status
-from .pilot_contracts import PILOT_REVIEW_ROLES, STABLE_MEMORY_FIELDS, canonical_bytes, validate_pilot_acceptance, validate_pilot_fixture, validate_transition
+from .pilot_contracts import PILOT_REVIEW_ROLES, ROLLING_PLAN_HORIZON_LIMITS, STABLE_MEMORY_FIELDS, TRANSITION_CONTRACT_VERSION, TRANSITION_EVIDENCE_FILES, TRANSITION_SCHEMA_VERSION, canonical_bytes, rolling_plan_hash, validate_pilot_acceptance, validate_pilot_fixture, validate_transition, validate_transition_response
 from .storage import StorageError, read_json, sha256_bytes, sha256_file, write_json
 
 PROJECTION_CURRENT = "CURRENT"
@@ -130,6 +130,8 @@ class PilotPipeline:
                 transition_id = f"{episode_id}_to_{ids[index + 1]}"
                 if transition_id not in manifest["completed_transitions"]:
                     self._reconcile_transition(run_dir, manifest, transition_id, episode_id, ids[index + 1], source, index)
+                    if self.mode == "live":
+                        write_json(run_dir / "episodes" / episode_id / "live_calls.json", episode_projection_document(self.client.telemetry(), episode_id))
                     manifest["completed_transitions"].append(transition_id)
                     self._save_checkpoint(run_dir, manifest)
                 else:
@@ -163,8 +165,7 @@ class PilotPipeline:
         (run_dir / "pilot_review_workers.partial.json").unlink(missing_ok=True)
 
     def _transition_input_hash(self, run_dir: Path, manifest: dict, episode_id: str, next_id: str, source: dict, index: int) -> str:
-        root = run_dir / "episodes" / episode_id
-        value = {"pilot_id": manifest["pilot_id"], "completed_episode_id": episode_id, "next_episode_id": next_id, "source_hash": sha256_bytes(canonical_bytes(source)), "episode_plan_hash": sha256_file(root / "episode_plan.json"), "final_hash": sha256_file(root / "final.md"), "memory_update_hash": sha256_file(root / "memory_update.json"), "memory_after_hash": sha256_file(root / "memory_after.json"), "rolling_plan": source["rolling_plan"], "required_continuity": source["required_next_episode_continuity"], "remaining_episode_count": len(manifest["episode_ids"]) - index - 1}
+        value = _transition_input_value(run_dir, manifest["pilot_id"], manifest["episode_ids"], episode_id, next_id, source, index)
         return sha256_bytes(canonical_bytes(value))
 
     def _reconcile_transition(self, run_dir: Path, manifest: dict, transition_id: str, episode_id: str, next_id: str, source: dict, index: int) -> None:
@@ -173,7 +174,7 @@ class PilotPipeline:
         input_hash = self._transition_input_hash(run_dir, manifest, episode_id, next_id, source, index)
         if transition_path.exists():
             transition = read_json(transition_path)
-            validate_transition(transition, source, next_id, str(run_dir))
+            validate_transition(transition, source, next_id, run_dir)
             if transition["transition_input_hash"] != input_hash:
                 raise PilotError("transition input hash mismatch")
             if source_path.exists():
@@ -189,20 +190,52 @@ class PilotPipeline:
         elif source_path.exists():
             raise PilotError("next episode source exists without transition")
         else:
-            transition, next_source = self._transition(run_dir, manifest, episode_id, next_id, source, input_hash)
+            transition, next_source = self._transition(run_dir, manifest, transition_id, episode_id, next_id, source, input_hash, index)
             self._write_artifact(run_dir, manifest, f"transitions/{transition_id}.json", transition)
             self._write_artifact(run_dir, manifest, f"episode_sources/{next_id}.json", next_source)
 
-    def _transition(self, run_dir: Path, manifest: dict, episode_id: str, next_id: str, source: dict, input_hash: str) -> tuple[dict, dict]:
+    def _transition_payload(self, run_dir: Path, manifest: dict, episode_id: str, next_id: str, source: dict, index: int) -> dict:
         episode_dir = run_dir / "episodes" / episode_id
-        memory_after = read_json(episode_dir / "memory_after.json")
-        update = read_json(episode_dir / "memory_update.json")
-        rolling_plan = dict(memory_after["rolling_plan"])
-        rolling_plan["near_horizon"] = list(rolling_plan.get("near_horizon", [])) + [f"synthetic transition toward {next_id}"]
-        transition = {"schema_version": 1, "completed_episode_id": episode_id, "next_episode_id": next_id, "transition_input_hash": input_hash, "next_source_hash": "pending", "next_episode": {"episode_id": next_id, "importance": "ordinary", "required_role": f"synthetic pilot role for {next_id}"}, "rolling_plan_after": rolling_plan, "continuity_satisfied": [], "continuity_deferred": list(source["required_next_episode_continuity"]), "adaptation_summary": f"Synthetic plan adapts after {episode_id} toward {next_id}.", "evidence_refs": [f"episodes/{episode_id}/final.md", f"episodes/{episode_id}/memory_update.json", f"episodes/{episode_id}/memory_after.json", f"episodes/{episode_id}/episode_plan.json"]}
+        return {
+            "stage": "transition",
+            "role": "adapter",
+            "transition_contract_version": TRANSITION_CONTRACT_VERSION,
+            "pilot_id": manifest["pilot_id"],
+            "completed_episode_id": episode_id,
+            "next_episode_id": next_id,
+            "remaining_episode_count": len(manifest["episode_ids"]) - index - 1,
+            "rolling_plan": source["rolling_plan"],
+            "required_next_episode_continuity": source["required_next_episode_continuity"],
+            "episode_plan": read_json(episode_dir / "episode_plan.json"),
+            "final": (episode_dir / "final.md").read_text(encoding="utf-8"),
+            "memory_update": read_json(episode_dir / "memory_update.json"),
+            "memory_after": read_json(episode_dir / "memory_after.json"),
+            "allowed_evidence_refs": [f"episodes/{episode_id}/{name}" for name in TRANSITION_EVIDENCE_FILES],
+            "plan_limits": dict(ROLLING_PLAN_HORIZON_LIMITS),
+            "action_contract": "KEEP: item_before exists exactly once in the source rolling plan and item_after equals item_before. CHANGE: item_before exists exactly once and item_after is a different non-blank string placed at horizon_after. DROP: horizon_after and item_after are null and the item appears nowhere in rolling_plan_after. ADD: horizon_before and item_before are null and item_after is a new item absent from the source plan. Every decision needs a non-blank reason and at least one evidence excerpt copied verbatim from an allowed artifact.",
+            "accounting_rules": "Consume every source plan item with exactly one KEEP, CHANGE, or DROP decision, in source plan order (immediate_horizon first, then near_horizon). Applying the decisions in order must rebuild rolling_plan_after exactly. rolling_plan_after.immediate_horizon needs at least one item, items are unique across both horizons, and next_episode.required_role must equal rolling_plan_after.immediate_horizon[0]. Do not generate identities or hashes; return only the fields in strict_output_schema.",
+            "strict_output_schema": {"next_episode": {"episode_id": next_id, "importance": "ordinary|major|pivot", "required_role": "string"}, "rolling_plan_after": {"immediate_horizon": ["string"], "near_horizon": ["string"]}, "adaptation_decisions": [{"action": "KEEP|CHANGE|DROP|ADD", "horizon_before": "immediate_horizon|near_horizon|null", "item_before": "string|null", "horizon_after": "immediate_horizon|near_horizon|null", "item_after": "string|null", "reason": "string", "evidence": [{"ref": f"episodes/{episode_id}/final.md", "excerpt": "string"}]}], "continuity_satisfied": ["string"], "continuity_deferred": ["string"], "adaptation_summary": "string", "evidence_refs": ["string"]},
+        }
+
+    def _transition(self, run_dir: Path, manifest: dict, transition_id: str, episode_id: str, next_id: str, source: dict, input_hash: str, index: int) -> tuple[dict, dict]:
+        payload = self._transition_payload(run_dir, manifest, episode_id, next_id, source, index)
+        prompt = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        client = self._episode_client(episode_id, index) if self.mode == "live" else self.client
+        raw = client.generate(stage="transition", role="adapter", prompt=prompt)
+        return self._transition_from_response(run_dir, manifest, client, episode_id, next_id, source, input_hash, raw)
+
+    def _transition_from_response(self, run_dir: Path, manifest: dict, client, episode_id: str, next_id: str, source: dict, input_hash: str, raw: str) -> tuple[dict, dict]:
+        try:
+            response = validate_transition_response(parse_object(raw))
+            transition = {"schema_version": TRANSITION_SCHEMA_VERSION, "completed_episode_id": episode_id, "next_episode_id": next_id, "transition_input_hash": input_hash, "next_source_hash": "pending", "rolling_plan_before_hash": rolling_plan_hash(source["rolling_plan"]), **response}
+            validate_transition(transition, source, next_id, run_dir)
+        except ContractError as error:
+            if self.mode == "live":
+                client.record_contract_failure("transition", "adapter", contract_code=error.contract_code or "TRANSITION_RESPONSE_NOT_OBJECT")
+                self._save_checkpoint(run_dir, manifest)
+            raise
         next_source = self._next_source_from_transition(run_dir, episode_id, transition)
         transition["next_source_hash"] = _json_file_hash(next_source)
-        validate_transition(transition, source, next_id, str(run_dir))
         return transition, next_source
 
     def _verify_completed_transition(self, run_dir: Path, manifest: dict, transition_id: str, episode_id: str, next_id: str, source: dict, index: int) -> None:
@@ -211,7 +244,7 @@ class PilotPipeline:
         if not transition_path.exists() or not source_path.exists():
             raise PilotError("completed transition artifact is missing")
         transition = read_json(transition_path)
-        validate_transition(transition, source, next_id, str(run_dir))
+        validate_transition(transition, source, next_id, run_dir)
         if transition["transition_input_hash"] != self._transition_input_hash(run_dir, manifest, episode_id, next_id, source, index) or transition["next_source_hash"] != sha256_file(source_path):
             raise PilotError("completed transition hash mismatch")
 
@@ -326,6 +359,11 @@ class PilotPipeline:
 
 def _unique(values: list[str]) -> list[str]:
     return list(dict.fromkeys(values))
+
+
+def _transition_input_value(run_dir: Path, pilot_id: str, episode_ids: list[str], episode_id: str, next_id: str, source: dict, index: int) -> dict:
+    root = run_dir / "episodes" / episode_id
+    return {"pilot_id": pilot_id, "completed_episode_id": episode_id, "next_episode_id": next_id, "source_hash": sha256_bytes(canonical_bytes(source)), "episode_plan_hash": sha256_file(root / "episode_plan.json"), "final_hash": sha256_file(root / "final.md"), "memory_update_hash": sha256_file(root / "memory_update.json"), "memory_after_hash": sha256_file(root / "memory_after.json"), "rolling_plan": source["rolling_plan"], "required_continuity": source["required_next_episode_continuity"], "remaining_episode_count": len(episode_ids) - index - 1, "transition_schema_version": TRANSITION_SCHEMA_VERSION, "transition_contract_version": TRANSITION_CONTRACT_VERSION}
 
 
 def _json_file_hash(value: object) -> str:
@@ -662,8 +700,8 @@ def _derive_pilot_progress(run_dir: Path, manifest: dict) -> dict:
             raise StorageError("non-contiguous transition prefix")
         source = read_json(run_dir / "episode_sources" / f"{episode_id}.json")
         transition = read_json(transition_path)
-        validate_transition(transition, source, next_id, str(run_dir))
-        value = {"pilot_id": manifest["pilot_id"], "completed_episode_id": episode_id, "next_episode_id": next_id, "source_hash": sha256_bytes(canonical_bytes(source)), "episode_plan_hash": sha256_file(run_dir / "episodes" / episode_id / "episode_plan.json"), "final_hash": sha256_file(run_dir / "episodes" / episode_id / "final.md"), "memory_update_hash": sha256_file(run_dir / "episodes" / episode_id / "memory_update.json"), "memory_after_hash": sha256_file(run_dir / "episodes" / episode_id / "memory_after.json"), "rolling_plan": source["rolling_plan"], "required_continuity": source["required_next_episode_continuity"], "remaining_episode_count": len(ids) - index - 1}
+        validate_transition(transition, source, next_id, run_dir)
+        value = _transition_input_value(run_dir, manifest["pilot_id"], ids, episode_id, next_id, source, index)
         if transition["transition_input_hash"] != sha256_bytes(canonical_bytes(value)) or transition["next_source_hash"] != sha256_file(source_path):
             raise StorageError("transition semantic contract failure")
         transitions.append(transition_id)

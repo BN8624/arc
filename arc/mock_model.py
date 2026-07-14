@@ -6,6 +6,35 @@ import threading
 import time
 
 
+def transition_adapter_response(payload: dict) -> dict:
+    """Deterministic evidence-grounded transition adaptation for fake providers."""
+    completed_episode_id = payload["completed_episode_id"]
+    plan = payload["rolling_plan"]
+    evidence = [{"ref": f"episodes/{completed_episode_id}/final.md", "excerpt": payload["final"][:64]}]
+    decisions = []
+    for item in plan["immediate_horizon"]:
+        decisions.append({"action": "KEEP", "horizon_before": "immediate_horizon", "item_before": item, "horizon_after": "immediate_horizon", "item_after": item, "reason": f"The {completed_episode_id} outcome still requires this objective.", "evidence": list(evidence)})
+    near = plan["near_horizon"]
+    for index, item in enumerate(near):
+        if len(near) >= 2 and index == 0:
+            decisions.append({"action": "DROP", "horizon_before": "near_horizon", "item_before": item, "horizon_after": None, "item_after": None, "reason": f"The {completed_episode_id} outcome resolved this direction.", "evidence": list(evidence)})
+        elif index == len(near) - 1:
+            decisions.append({"action": "CHANGE", "horizon_before": "near_horizon", "item_before": item, "horizon_after": "near_horizon", "item_after": f"adapted direction after {completed_episode_id}", "reason": f"The {completed_episode_id} outcome redirects this item.", "evidence": list(evidence)})
+        else:
+            decisions.append({"action": "KEEP", "horizon_before": "near_horizon", "item_before": item, "horizon_after": "near_horizon", "item_after": item, "reason": f"The {completed_episode_id} outcome leaves this direction open.", "evidence": list(evidence)})
+    decisions.append({"action": "ADD", "horizon_before": None, "item_before": None, "horizon_after": "near_horizon", "item_after": f"deferred hook from {completed_episode_id}", "reason": f"The {completed_episode_id} ending opened a new deferred hook.", "evidence": list(evidence)})
+    plan_after = {"immediate_horizon": [decision["item_after"] for decision in decisions if decision["horizon_after"] == "immediate_horizon"], "near_horizon": [decision["item_after"] for decision in decisions if decision["horizon_after"] == "near_horizon"]}
+    return {
+        "next_episode": {"episode_id": payload["next_episode_id"], "importance": "ordinary", "required_role": plan_after["immediate_horizon"][0]},
+        "rolling_plan_after": plan_after,
+        "adaptation_decisions": decisions,
+        "continuity_satisfied": [],
+        "continuity_deferred": list(payload["required_next_episode_continuity"]),
+        "adaptation_summary": f"Adapted the rolling plan from {completed_episode_id} results toward {payload['next_episode_id']}.",
+        "evidence_refs": sorted({item["ref"] for decision in decisions for item in decision["evidence"]}),
+    }
+
+
 class MockModelClient:
     def __init__(self, scenario: str, delays: dict[str, float] | None = None, fail_at: str | None = None, malformed_at: str | None = None):
         self.scenario, self.delays, self.fail_at, self.malformed_at = scenario, delays or {}, fail_at, malformed_at
@@ -54,6 +83,8 @@ class MockModelClient:
             return {"verdict": verdict, "strengths_to_preserve": ["synthetic agency"], "required_changes": changes, "evidence_refs": ["draft.md"]}
         if stage == "revision":
             return {"text": "A synthetic character makes one revised synthetic choice.\n"}
+        if stage == "transition":
+            return transition_adapter_response(payload)
         if stage == "memory_merge":
             return {"episode_id": episode_id, "confirmed_facts_added": [f"synthetic fact {episode_id}"], "relationship_changes": [f"synthetic relationship change {episode_id}"], "conflicts_resolved": ["synthetic resolved conflict"] if "synthetic resolved conflict" in payload.get("open_conflicts", []) else [], "conflicts_opened": [f"synthetic opened conflict {episode_id}"], "promises_added": [f"synthetic promise {episode_id}"], "important_excerpts_added": [f"synthetic choice {episode_id}"], "episode_summary": f"synthetic episode summary {episode_id}", "required_next_episode_continuity": [f"synthetic next continuity {episode_id}"], "evidence_refs": ["final.md"]}
         raise RuntimeError(f"unknown mock stage: {stage}")

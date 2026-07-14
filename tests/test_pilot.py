@@ -99,6 +99,24 @@ def test_interrupted_third_episode_resumes_without_rerunning_completed_episodes(
     assert sum(stage == "writer" for stage, _, _ in client.calls) == completed_writer_calls + 3
 
 
+def test_mock_transitions_are_schema_v2_with_accounted_adaptation(tmp_path: Path) -> None:
+    client, output = run(tmp_path)
+    assert sum(stage == "transition" for stage, _, _ in client.calls) == 4
+    ids = json.loads(FIXTURE.read_text(encoding="utf-8"))["episode_ids"]
+    counts = {"KEEP": 0, "CHANGE": 0, "DROP": 0, "ADD": 0}
+    for episode_id, next_id in zip(ids, ids[1:]):
+        transition = json.loads((output / "transitions" / f"{episode_id}_to_{next_id}.json").read_text(encoding="utf-8"))
+        assert transition["schema_version"] == 2
+        for decision in transition["adaptation_decisions"]:
+            counts[decision["action"]] += 1
+        next_source = json.loads((output / "episode_sources" / f"{next_id}.json").read_text(encoding="utf-8"))
+        assert next_source["rolling_plan"] == transition["rolling_plan_after"]
+        assert next_source["current_episode"] == transition["next_episode"]
+        assert next_source["current_episode"]["required_role"] == transition["rolling_plan_after"]["immediate_horizon"][0]
+    assert counts["CHANGE"] + counts["DROP"] + counts["ADD"] >= 1
+    assert counts["CHANGE"] >= 1 and counts["DROP"] >= 1 and counts["ADD"] >= 1
+
+
 def test_pilot_fixture_rejects_duplicate_episode_ids() -> None:
     fixture = json.loads(FIXTURE.read_text(encoding="utf-8"))
     fixture["episode_ids"][4] = fixture["episode_ids"][3]
