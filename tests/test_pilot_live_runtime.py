@@ -2251,6 +2251,219 @@ def test_mock_and_live_outputs_cannot_be_reused(tmp_path):
         PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
 
 
+def _interrupting_pilot_client(run_dir: Path, provider_root: _PilotProviderRoot | None = None, *, stop_scope: str, stop_stage: str, stop_count: int) -> tuple[GemmaPoolClient, _PilotProviderRoot]:
+    root = provider_root or _PilotProviderRoot()
+    state_store = RoutingStateStore(run_dir / "routing_state.json", list(_config().keys))
+    store = AtomicTelemetryStore(run_dir / "pilot_live_calls.json")
+
+    def sink(telemetry: dict) -> None:
+        store.save(telemetry)
+        matched = [call for call in telemetry.get("calls", []) if call.get("scope_id") == stop_scope and call.get("stage") == stop_stage and call.get("status") == "PASS"]
+        if len(matched) >= stop_count:
+            raise KeyboardInterrupt
+
+    return GemmaPoolClient(_config(), client_factory=root.factory, state_store=state_store, telemetry_sink=sink), root
+
+
+def _checkpointed_desks(output: Path) -> set[tuple[str | None, str]]:
+    desks: set[tuple[str | None, str]] = set()
+    for partial in output.glob("episodes/*/*_workers.partial.json"):
+        for desk in read_json(partial).get("completed_desks", {}):
+            desks.add((partial.parent.name, desk))
+    root_partial = output / "pilot_review_workers.partial.json"
+    if root_partial.exists():
+        for desk in read_json(root_partial).get("completed_desks", {}):
+            desks.add((None, desk))
+    return desks
+
+
+INTERRUPTION_POINTS = [
+    ("episode:episode_001", "planning", 1),
+    ("episode:episode_001", "planning", 4),
+    ("episode:episode_001", "planning", 6),
+    ("episode:episode_001", "planning_merge", 1),
+    ("episode:episode_002", "planning_merge", 1),
+    ("episode:episode_002", "review", 3),
+    ("episode:episode_002", "review", 7),
+    ("episode:episode_003", "review_merge", 1),
+    ("episode:episode_003", "memory", 2),
+    ("episode:episode_004", "memory", 4),
+    ("episode:episode_004", "memory_merge", 1),
+    ("episode:episode_005", "memory_merge", 1),
+    ("pilot:acceptance", "pilot_review", 2),
+]
+
+
+@pytest.mark.parametrize("stop_scope,stop_stage,stop_count", INTERRUPTION_POINTS)
+def test_arbitrary_stage_interruption_recovers_without_duplicate_calls(tmp_path, stop_scope, stop_stage, stop_count):
+    output = tmp_path / "pilot-live"
+    client, _ = _interrupting_pilot_client(output, stop_scope=stop_scope, stop_stage=stop_stage, stop_count=stop_count)
+    with pytest.raises(KeyboardInterrupt):
+        PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+
+    before = read_json(output / "pilot_live_calls.json")
+    completed_before = set(read_json(output / "pilot_manifest.json")["completed_episodes"])
+    checkpointed = _checkpointed_desks(output)
+
+    inspection = inspect_pilot_checkpoint(output)
+    assert inspection["checkpoint_integrity"] != "CORRUPT", inspection["reason_codes"]
+    if inspection["checkpoint_integrity"] == "RECONCILABLE":
+        reconcile_pilot_checkpoint(PILOT_FIXTURE, output)
+
+    resumed_client, resumed_root = _pilot_client(output)
+    result = PilotPipeline(resumed_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+
+    assert result["manifest"]["status"] == "COMPLETE"
+    after = read_json(output / "pilot_live_calls.json")
+    after_by_id = {call["call_id"]: call for call in after["calls"]}
+    for call in before["calls"]:
+        assert after_by_id[call["call_id"]] == call
+    call_ids = [call["call_id"] for call in after["calls"]]
+    lease_sequences = [call["lease_sequence"] for call in after["calls"]]
+    assert len(call_ids) == len(set(call_ids))
+    assert len(lease_sequences) == len(set(lease_sequences))
+    resumed_markers = {(_episode_from_prompt(prompt), marker) for _, marker, prompt in resumed_root.provider_calls}
+    for episode_id, desk in checkpointed:
+        short_episode = episode_id.replace("episode:", "") if episode_id else None
+        assert (short_episode, desk) not in resumed_markers
+    assert not any(episode in {f"episode_{index:03d}" for index in range(1, 6)} and episode in completed_before for episode, _ in resumed_markers)
+    for episode_id in result["manifest"]["episode_ids"]:
+        projection = read_json(output / "episodes" / episode_id / "live_calls.json")
+        scope = f"episode:{episode_id}"
+        assert projection["calls"] == [call for call in after["calls"] if call["scope_id"] == scope]
+        assert all(item["scope_id"] == scope for item in projection["contract_failures"])
+        assert all(call["scope_id"] != "pilot:acceptance" for call in projection["calls"])
+
+
+def test_interrupt_after_writer_content_response_fails_closed_without_second_call(tmp_path):
+    output = tmp_path / "pilot-live"
+    client, _ = _interrupting_pilot_client(output, stop_scope="episode:episode_001", stop_stage="writer", stop_count=1)
+    with pytest.raises(KeyboardInterrupt):
+        PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    episode = read_json(output / "episodes" / "episode_001" / "manifest.json")
+    assert episode["writer_attempt_state"] == "NOT_STARTED"
+
+    resumed_client, resumed_root = _pilot_client(output)
+    with pytest.raises(Exception, match="WRITER_RECONCILIATION_REQUIRED"):
+        PilotPipeline(resumed_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    assert resumed_root.provider_calls == []
+    projection = read_json(output / "episodes" / "episode_001" / "live_calls.json")
+    assert any(call["stage"] == "writer" and call["status"] == "PASS" for call in projection["calls"])
+    assert read_json(output / "episodes" / "episode_001" / "manifest.json")["writer_attempt_state"] == "NOT_STARTED"
+
+
+def test_interrupt_after_revision_content_response_fails_closed_without_second_call(tmp_path):
+    output = tmp_path / "pilot-live"
+    provider_root = _PilotProviderRoot(repairable_writer_once_episode="episode_004")
+    client, _ = _interrupting_pilot_client(output, provider_root, stop_scope="episode:episode_004", stop_stage="revision", stop_count=1)
+    with pytest.raises(KeyboardInterrupt):
+        PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    episode = read_json(output / "episodes" / "episode_004" / "manifest.json")
+    assert episode["revision_attempt_state"] == "NOT_STARTED"
+
+    resumed_client, resumed_root = _pilot_client(output)
+    with pytest.raises(Exception, match="REVISION_RECONCILIATION_REQUIRED"):
+        PilotPipeline(resumed_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    assert resumed_root.provider_calls == []
+    assert read_json(output / "episodes" / "episode_004" / "manifest.json")["revision_attempt_state"] == "NOT_STARTED"
+
+
+def test_writer_receipt_with_stale_projection_recovers_and_holds_consumed(tmp_path, monkeypatch):
+    output = tmp_path / "pilot-live"
+    client, _ = _pilot_client(output)
+    monkeypatch.setattr("arc.pipeline.validate_draft_prose", lambda value: (_ for _ in ()).throw(KeyboardInterrupt()))
+    with pytest.raises(KeyboardInterrupt):
+        PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    monkeypatch.undo()
+    episode_path = output / "episodes" / "episode_001" / "live_calls.json"
+    stale = read_json(episode_path)
+    stale["calls"] = stale["calls"][:2]
+    write_json(episode_path, stale)
+
+    resumed_client, resumed_root = _pilot_client(output)
+    result = PilotPipeline(resumed_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    episode = read_json(output / "episodes" / "episode_001" / "manifest.json")
+
+    assert result["manifest"]["status"] == "HOLD"
+    assert episode["writer_attempt_state"] == "REJECTED"
+    assert episode["writer_contract_code"] == "WRITER_RESPONSE_ALREADY_CONSUMED"
+    assert resumed_root.provider_calls == []
+    root_calls = read_json(output / "pilot_live_calls.json")["calls"]
+    assert read_json(episode_path)["calls"] == [call for call in root_calls if call["scope_id"] == "episode:episode_001"]
+
+
+def test_stale_projection_recovery_is_byte_identical_noop_on_second_run(tmp_path):
+    from arc.pilot import pilot_status
+
+    output = tmp_path / "pilot-live"
+    client, _ = _pilot_client(output)
+    PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    stale_path = output / "episodes" / "episode_002" / "live_calls.json"
+    stale = read_json(stale_path)
+    stale["calls"] = stale["calls"][:3]
+    write_json(stale_path, stale)
+    (output / "episodes" / "episode_004" / "live_calls.json").unlink()
+    before = _file_bytes(output)
+
+    current = pilot_status(output)
+    assert current["checkpoint_integrity"] == "RECONCILABLE"
+    assert "EPISODE_PROJECTION_STALE" in current["reason_codes"]
+    assert _file_bytes(output) == before
+
+    first_client, first_root = _pilot_client(output)
+    result = PilotPipeline(first_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    after_first = _file_bytes(output)
+    changed = {name for name in after_first if before.get(name) != after_first[name]}
+
+    assert result["no_op"] is True
+    assert first_root.provider_calls == []
+    assert changed == {"episodes/episode_002/live_calls.json", "episodes/episode_004/live_calls.json"}
+
+    second_client, second_root = _pilot_client(output)
+    second = PilotPipeline(second_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+
+    assert second["no_op"] is True
+    assert second_root.provider_calls == []
+    assert _file_bytes(output) == after_first
+    assert pilot_status(output)["checkpoint_integrity"] == "VALID"
+
+
+def test_unknown_scope_in_root_telemetry_is_corrupt(tmp_path):
+    from arc.pilot import pilot_status
+
+    output = tmp_path / "pilot-live"
+    client, _ = _pilot_client(output)
+    PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    telemetry = read_json(output / "pilot_live_calls.json")
+    extra = dict(telemetry["calls"][-1])
+    extra.update({"call_id": "L999-A999", "lease_sequence": max(call["lease_sequence"] for call in telemetry["calls"]) + 1, "scope_id": "episode:unknown_episode", "desk_id": "episode:unknown_episode:planning:event"})
+    telemetry["calls"].append(extra)
+    write_json(output / "pilot_live_calls.json", telemetry)
+    routing = read_json(output / "routing_state.json")
+    routing["next_lease_sequence"] = extra["lease_sequence"] + 1
+    write_json(output / "routing_state.json", routing)
+
+    with pytest.raises(StorageError, match="unknown pilot live telemetry scope"):
+        pilot_status(output)
+
+
+def test_episode_projection_contains_only_episode_scope_contract_failures(tmp_path):
+    output = tmp_path / "pilot-live"
+    client, _ = _pilot_client(output, _PilotProviderRoot(wrong_plan_once=True, wrong_plan_episode="episode_002"))
+    with pytest.raises(Exception):
+        PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    resumed_client, _ = _pilot_client(output)
+    result = PilotPipeline(resumed_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    assert result["manifest"]["status"] == "COMPLETE"
+
+    root = read_json(output / "pilot_live_calls.json")
+    assert any(item["scope_id"] == "episode:episode_002" for item in root["contract_failures"])
+    projection = read_json(output / "episodes" / "episode_002" / "live_calls.json")
+    assert [item["scope_id"] for item in projection["contract_failures"]] == ["episode:episode_002"]
+    for episode_id in ["episode_001", "episode_003", "episode_004", "episode_005"]:
+        assert read_json(output / "episodes" / episode_id / "live_calls.json")["contract_failures"] == []
+
+
 def _projection_root_doc() -> dict:
     def call(order: int, scope: str) -> dict:
         return {"call_id": f"L{order:03d}-A001", "scope_id": scope, "desk_id": f"{scope}:planning:event", "logical_order": order, "attempt": 1, "lease_sequence": order, "stage": "planning", "role": "event", "key_slot": f"K{order:02d}", "status": "PASS"}

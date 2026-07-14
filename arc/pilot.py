@@ -136,6 +136,7 @@ class PilotPipeline:
                     self._verify_completed_transition(run_dir, manifest, transition_id, episode_id, ids[index + 1], source, index)
         if "pilot_acceptance.json" not in manifest["artifact_hashes"]:
             evidence = self._write_evidence_packet(run_dir, manifest)
+            self._save_checkpoint(run_dir, manifest)
             workers_path = run_dir / "pilot_review_workers.json"
             if workers_path.exists():
                 if manifest["artifact_hashes"].get("pilot_review_workers.json") != sha256_file(workers_path):
