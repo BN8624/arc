@@ -924,11 +924,14 @@ def test_prose_target_band_uses_contract_minimum_and_hard_maximum():
 def test_writer_prompt_requires_structured_plan_development_without_changing_target_band():
     from arc.prompts import build_prompt
 
-    prompt = build_prompt("writer", "canonical", {"context": {}, "plan": {}})
-    for meaning in ("14 to 18", "plan.immediate_objective", "plan.obstacle", "plan.protagonist_action", "counteraction", "plan.meaningful_change", "consequence", "aftermath", "episode payoff", "plan.episode_ending", "plan.continuity_constraints", "5200 to 6400 characters"):
+    payload = {"context": {"episode_id": "episode_002"}, "plan": {"immediate_objective": "protect evidence", "obstacle": "active scan", "protagonist_action": "camouflage evidence", "meaningful_change": "become a trusted insider", "episode_ending": "prepare the next move", "continuity_constraints": ["preserve the hidden variable"]}}
+    prompt = build_prompt("writer", "canonical", payload)
+    for meaning in ("14 to 18", "plan.immediate_objective", "plan.obstacle", "plan.protagonist_action", "counteraction", "plan.meaningful_change", "consequence", "aftermath", "episode payoff", "plan.episode_ending", "plan.continuity_constraints", "5200 to 6400 characters", "internal expansion pass", "nine beats", "two or three thinnest beats", "Do not advance to the ending", "one canonical response"):
         assert meaning in prompt
     for forbidden in ("headings or paragraph numbers", "Do not compress multiple actions", "Do not invent a new central conflict"):
         assert forbidden in prompt
+    assert "If this is revision" not in prompt
+    assert "Do not perform revision work" in prompt
 
 
 @pytest.mark.parametrize("character_count,expected", [(3000, (1000, 2000)), (3474, (526, 1526)), (3834, (166, 1200)), (3999, (1, 1200)), (4000, (0, 1200)), (4514, (0, 1200))])

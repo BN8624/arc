@@ -55,7 +55,13 @@ def _writer_plan_guidance() -> str:
         "Use the supplied context and plan only. Fully realize plan.immediate_objective in the opening, plan.obstacle as a "
         "visible scene-level obstruction, plan.protagonist_action as an active choice followed by counteraction, "
         "plan.meaningful_change as an experienced result, and plan.episode_ending only after consequence and aftermath. "
-        "Honor every plan.continuity_constraints item. Do not invent a new central conflict or unsupported setting."
+        "Honor every plan.continuity_constraints item. Before returning the same single response, perform an internal expansion "
+        "pass over these nine beats: objective, obstacle, action, counteraction, consequence, meaningful change, aftermath, "
+        "payoff, and ending hook. Each beat must contain a concrete action, reaction, or state change rather than merely naming "
+        "the plan field. Expand the two or three thinnest beats through multiple connected prose paragraphs using dialogue, "
+        "action, counteraction, cost, and result already supported by the plan. Do not advance to the ending until consequence, "
+        "meaningful change, aftermath, and payoff have each been dramatized. This expansion happens inside the one canonical "
+        "response and never authorizes a second call. Do not invent a new central conflict or unsupported setting."
     )
 
 
@@ -148,6 +154,10 @@ Select resolved existing conflicts only by ID from CURRENT_OPEN_CONFLICT_OPTIONS
         role_rule = f"Return exactly these keys: verdict, strengths_to_preserve, required_changes, evidence_refs. verdict is PASS, REVISE_ONCE, or HOLD. PASS has no required_changes; REVISE_ONCE has one to three. If draft_contract.verdict is REVISE_REQUIRED and there is no HOLD-level defect, verdict must be REVISE_ONCE. Required changes must preserve the draft's strengths, events, and causality; forbid adding a new central conflict; forbid padding with repeated sentences; and require a coherent full rewrite targeting {target_band}."
     elif stage == "memory_merge":
         role_rule = memory_merge_rule + " Do not add an item already present in memory_before. Existing memory is not evidence; final.md is the only evidence for new memory."
+    elif stage == "writer":
+        role_rule = "Write the supplied episode plan as one coherent canonical prose passage. Do not perform revision work or discuss a draft."
+    elif stage == "revision":
+        role_rule = f"Rewrite the whole draft as one coherent {target_band} canonical prose passage. Do not append fragments to the original draft."
     else:
-        role_rule = f"Perform only the assigned task. If this is revision with draft_contract.verdict REVISE_REQUIRED, rewrite the whole draft as one coherent {target_band} novel prose passage. Do not append fragments to the original draft."
+        role_rule = "Perform only the assigned task."
     return f"{instruction}\n{role_rule}\nStage: {stage}\nRole: {role}\nInput JSON:\n{json.dumps(payload, ensure_ascii=False)}"
