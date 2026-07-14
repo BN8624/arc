@@ -8,6 +8,7 @@ import json
 import pytest
 
 from arc.contracts import ContractError
+from arc.evidence_candidates import make_candidate_id
 from arc.mock_model import acceptance_review_response
 from arc.pilot_contracts import (
     ACCEPTANCE_FORBIDDEN_MARKERS,
@@ -18,6 +19,7 @@ from arc.pilot_contracts import (
     PILOT_REVIEW_ROLES,
     acceptance_catalog_plan,
     aggregate_pilot_acceptance,
+    materialize_acceptance_worker_response,
     validate_acceptance_coverage,
     validate_acceptance_rubric,
     validate_acceptance_worker,
@@ -42,17 +44,22 @@ def _rubric_by_id() -> dict[str, dict]:
 
 def _payload(role: str, catalog: list[dict] | None = None) -> dict:
     dimension = _rubric_by_id()[role]
+    catalog = catalog if catalog is not None else _catalog()
+    candidates = [{"candidate_id": make_candidate_id(entry["ref"], entry["content"][:80]), "ref": entry["ref"], "kind": entry["kind"], "episode_id": entry["episode_id"], "ordinal": 0, "excerpt": entry["content"][:80]} for entry in catalog]
     return {
         "dimension": role,
         "episode_ids": list(EPISODE_IDS),
-        "evidence_catalog": catalog if catalog is not None else _catalog(),
+        "evidence_catalog": catalog,
+        "evidence_candidates": candidates,
         "criteria": json.loads(json.dumps(dimension["criteria"])),
         "coverage_rule": json.loads(json.dumps(dimension["coverage_rule"])),
     }
 
 
 def _worker(role: str, hold: bool = False, catalog: list[dict] | None = None) -> dict:
-    return acceptance_review_response(_payload(role, catalog), hold=hold)
+    payload = _payload(role, catalog)
+    candidates = payload["evidence_candidates"]
+    return materialize_acceptance_worker_response(acceptance_review_response(payload, hold=hold), role, candidates, EPISODE_IDS)
 
 
 def _mutable_rubric() -> list[dict]:

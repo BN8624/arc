@@ -231,6 +231,7 @@ def validate_transition(value: dict, source: dict, next_episode_id: str, run_dir
 
 ACCEPTANCE_SCHEMA_VERSION = 2
 ACCEPTANCE_RUBRIC_VERSION = 1
+ACCEPTANCE_PROVIDER_CONTRACT_VERSION = 2
 ACCEPTANCE_EXCERPT_MIN_CHARACTERS = 8
 ACCEPTANCE_EXCERPT_MAX_CHARACTERS = 400
 ACCEPTANCE_EVIDENCE_KINDS = ("episode_final", "episode_plan", "episode_review", "episode_memory_update", "episode_memory_after", "episode_source", "transition")
@@ -241,6 +242,8 @@ ACCEPTANCE_FORBIDDEN_STRENGTH_MARKERS = ("synthetic strength", "good continuity"
 ACCEPTANCE_COVERAGE_SELECTORS = ("all", "first", "last", "after_first")
 ACCEPTANCE_COVERAGE_RULE_FIELDS = ("required_kind_episodes", "required_transitions", "minimum_kind_episodes", "require_first_and_last_episode", "minimum_granular_refs")
 ACCEPTANCE_WORKER_PROPOSAL_FIELDS = ("dimension_result", "criterion_results", "critical_finding", "strengths", "coverage_refs")
+ACCEPTANCE_PROVIDER_WORKER_FIELDS = ("worker_id", "role", "verdict", "primary_finding", "primary_risk", "proposal")
+ACCEPTANCE_PROVIDER_PROPOSAL_FIELDS = ("dimension_result", "criterion_results", "critical_finding", "strengths")
 ACCEPTANCE_MAX_STRENGTHS_PER_DIMENSION = 2
 ACCEPTANCE_MAX_STRENGTHS = 14
 
@@ -548,6 +551,65 @@ def validate_acceptance_worker(value: object, role: str, catalog: list[dict], ep
     if set(evidence_refs) - set(proposal["coverage_refs"]):
         raise ContractError("coverage refs must include every cited evidence ref", "PILOT_REVIEW_COVERAGE_INCOMPLETE")
     return value
+
+
+def materialize_acceptance_worker_response(value: object, role: str, candidate_catalog: object, episode_ids: list[str]) -> dict:
+    """Convert an acceptance provider response into the unchanged canonical worker shape."""
+    fields = "PILOT_REVIEW_PROVIDER_FIELDS_MISMATCH"
+    if not isinstance(value, dict) or set(value) != set(ACCEPTANCE_PROVIDER_WORKER_FIELDS):
+        raise ContractError("pilot review provider fields mismatch", fields)
+    if value["worker_id"] != f"pilot_review-{role}" or value["role"] != role:
+        raise ContractError("pilot review provider identity mismatch", fields)
+    if any(not isinstance(value[key], str) or not value[key].strip() for key in ("verdict", "primary_finding", "primary_risk")):
+        raise ContractError("pilot review provider finding and risk are required", fields)
+    proposal = value["proposal"]
+    if not isinstance(proposal, dict) or set(proposal) != set(ACCEPTANCE_PROVIDER_PROPOSAL_FIELDS):
+        raise ContractError("pilot review provider proposal fields mismatch", fields)
+
+    def materialize_selection(selection: object) -> list[dict[str, str]]:
+        if not isinstance(selection, list) or not selection or any(not isinstance(item, str) or not item.strip() for item in selection):
+            raise ContractError("acceptance candidate IDs are required", "EVIDENCE_CANDIDATE_SELECTION_INVALID")
+        try:
+            return materialize_candidate_ids(selection, candidate_catalog)
+        except EvidenceCandidateCatalogError as error:
+            raise ContractError(str(error), getattr(error, "contract_code", "EVIDENCE_CANDIDATE_UNKNOWN")) from error
+        except TypeError as error:
+            raise ContractError("evidence candidate catalog is invalid", "EVIDENCE_CANDIDATE_CATALOG_INVALID") from error
+
+    criterion_results = proposal["criterion_results"]
+    if not isinstance(criterion_results, list):
+        raise ContractError("provider criterion results must be a list", fields)
+    materialized_criteria = []
+    for result in criterion_results:
+        if not isinstance(result, dict) or set(result) != {"criterion_id", "result", "finding", "evidence_candidate_ids"}:
+            raise ContractError("provider criterion result fields mismatch", fields)
+        materialized_criteria.append({key: result[key] for key in ("criterion_id", "result", "finding")} | {"evidence": materialize_selection(result["evidence_candidate_ids"])} )
+
+    strengths = proposal["strengths"]
+    if not isinstance(strengths, list):
+        raise ContractError("provider strengths must be a list", fields)
+    materialized_strengths = []
+    for strength in strengths:
+        if not isinstance(strength, dict) or set(strength) != {"criterion_id", "strength", "evidence_candidate_ids"}:
+            raise ContractError("provider strength fields mismatch", fields)
+        materialized_strengths.append({key: strength[key] for key in ("criterion_id", "strength")} | {"evidence": materialize_selection(strength["evidence_candidate_ids"])} )
+
+    evidence_refs = sorted({item["ref"] for result in materialized_criteria for item in result["evidence"]} | {item["ref"] for strength in materialized_strengths for item in strength["evidence"]})
+    return {
+        "worker_id": value["worker_id"],
+        "role": value["role"],
+        "verdict": value["verdict"],
+        "primary_finding": value["primary_finding"],
+        "primary_risk": value["primary_risk"],
+        "evidence_refs": evidence_refs,
+        "proposal": {
+            "dimension_result": proposal["dimension_result"],
+            "criterion_results": materialized_criteria,
+            "critical_finding": proposal["critical_finding"],
+            "strengths": materialized_strengths,
+            "coverage_refs": evidence_refs,
+        },
+    }
 
 
 def aggregate_pilot_acceptance(workers: list[dict]) -> dict:

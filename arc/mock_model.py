@@ -5,7 +5,6 @@ import json
 import threading
 import time
 
-
 def transition_adapter_response(payload: dict) -> dict:
     """Deterministic evidence-grounded transition adaptation for fake providers."""
     completed_episode_id = payload["completed_episode_id"]
@@ -38,12 +37,12 @@ def acceptance_review_response(payload: dict, hold: bool = False) -> dict:
     """Deterministic rubric-grounded acceptance worker response for fake providers."""
     role = payload["dimension"]
     episode_ids = payload["episode_ids"]
-    catalog = payload["evidence_catalog"]
+    catalog = payload["evidence_candidates"]
     by_kind: dict[str, list[dict]] = {}
     by_ref: dict[str, dict] = {}
     for entry in catalog:
         by_kind.setdefault(entry["kind"], []).append(entry)
-        by_ref[entry["ref"]] = entry
+        by_ref.setdefault(entry["ref"], entry)
     rule = payload["coverage_rule"]
     coverage: list[str] = []
 
@@ -77,7 +76,7 @@ def acceptance_review_response(payload: dict, hold: bool = False) -> dict:
     if rule["require_first_and_last_episode"]:
         for target in (episode_ids[0], episode_ids[-1]):
             if not any(by_ref[ref]["episode_id"] == target and by_ref[ref]["kind"] != "transition" for ref in coverage):
-                add(by_kind["episode_final"][episode_ids.index(target)])
+                add(next(entry for entry in by_kind["episode_final"] if entry["episode_id"] == target))
     for entry in by_kind["episode_final"]:
         if len(coverage) >= rule["minimum_granular_refs"]:
             break
@@ -87,12 +86,12 @@ def acceptance_review_response(payload: dict, hold: bool = False) -> dict:
     for criterion in payload["criteria"]:
         evidence = []
         for kind in criterion["required_evidence_kinds"]:
-            entry = next((by_ref[ref] for ref in coverage if by_ref[ref]["kind"] == kind), None)
-            if entry is None:
-                entry = by_kind[kind][0]
-                add(entry)
-            evidence.append({"ref": entry["ref"], "excerpt": entry["content"][:80]})
-        criterion_results.append({"criterion_id": criterion["criterion_id"], "result": "PASS", "finding": f"The cited artifacts keep {criterion['criterion_id']} consistent across the reviewed episodes.", "evidence": evidence})
+            entries = [by_ref[ref] for ref in coverage if by_ref[ref]["kind"] == kind]
+            if not entries:
+                entries = [by_kind[kind][0]]
+                add(entries[0])
+            evidence.extend(entry["candidate_id"] for entry in entries)
+        criterion_results.append({"criterion_id": criterion["criterion_id"], "result": "PASS", "finding": f"The cited artifacts keep {criterion['criterion_id']} consistent across the reviewed episodes.", "evidence_candidate_ids": evidence})
     critical = None
     if hold:
         held = criterion_results[0]
@@ -100,16 +99,14 @@ def acceptance_review_response(payload: dict, hold: bool = False) -> dict:
         held["finding"] = f"The obligation tracked by {held['criterion_id']} is not carried into the cited next episode source."
         critical = {"criterion_id": held["criterion_id"], "finding": held["finding"]}
     pass_results = [result for result in criterion_results if result["result"] == "PASS"]
-    strengths = [{"criterion_id": result["criterion_id"], "strength": f"Evidence for {result['criterion_id']} stays traceable to verbatim excerpts of the cited artifacts.", "evidence": [dict(item) for item in result["evidence"]]} for result in pass_results[:1]]
-    evidence_refs = sorted({item["ref"] for result in criterion_results for item in result["evidence"]} | {item["ref"] for strength in strengths for item in strength["evidence"]})
+    strengths = [{"criterion_id": result["criterion_id"], "strength": f"Evidence for {result['criterion_id']} stays traceable to the selected catalog candidates.", "evidence_candidate_ids": list(result["evidence_candidate_ids"])} for result in pass_results[:1]]
     return {
         "worker_id": f"pilot_review-{role}",
         "role": role,
         "verdict": "OK",
         "primary_finding": f"Dimension {role} was reviewed against {len(criterion_results)} rubric criteria with catalog evidence.",
         "primary_risk": f"A later episode could regress {payload['criteria'][0]['criterion_id']} without new evidence.",
-        "evidence_refs": evidence_refs,
-        "proposal": {"dimension_result": "HOLD" if hold else "PASS", "criterion_results": criterion_results, "critical_finding": critical, "strengths": strengths, "coverage_refs": sorted(set(coverage) | set(evidence_refs))},
+        "proposal": {"dimension_result": "HOLD" if hold else "PASS", "criterion_results": criterion_results, "critical_finding": critical, "strengths": strengths},
     }
 
 

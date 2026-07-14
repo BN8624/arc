@@ -13,7 +13,8 @@ from arc.contracts import ContractError, PROSE_FORBIDDEN_MARKERS, PROSE_MAX_CHAR
 from arc.mock_model import acceptance_review_response, transition_adapter_response
 from arc.live_model import AtomicTelemetryStore, GemmaPoolClient, LiveCallError, LiveConfig, MODEL_NAME, RoutingStateStore
 from arc.pipeline import PLANNING_ROLES, MockPipeline, WaveCheckpoint, status
-from arc.pilot_contracts import ACCEPTANCE_GENERIC_QUESTION_MARKER, PILOT_REVIEW_ROLES
+from arc.evidence_candidates import EVIDENCE_CANDIDATE_CATALOG_VERSION
+from arc.pilot_contracts import ACCEPTANCE_GENERIC_QUESTION_MARKER, ACCEPTANCE_PROVIDER_CONTRACT_VERSION, PILOT_REVIEW_ROLES
 from arc.pilot import PilotError, PilotPipeline, classify_episode_projection, episode_projection_document, inspect_pilot_checkpoint, live_telemetry_checkpoint, reconcile_live_telemetry_projections, reconcile_pilot_checkpoint
 from arc.storage import StorageError, read_json, write_json
 
@@ -428,7 +429,7 @@ def _make_acceptance_state(tmp_path: Path, completed_roles: list[str], *, receip
         checkpoint = WaveCheckpoint(
             output / "pilot_review_workers.partial.json",
             "pilot_review",
-            {"pilot_id": manifest["pilot_id"], "mode": manifest["mode"], "scenario": manifest["scenario"], "episode_ids": manifest["episode_ids"], "evidence_packet_hash": manifest["artifact_hashes"]["pilot_evidence_packet.json"], "acceptance_rubric_version": 1},
+            {"pilot_id": manifest["pilot_id"], "mode": manifest["mode"], "scenario": manifest["scenario"], "episode_ids": manifest["episode_ids"], "evidence_packet_hash": manifest["artifact_hashes"]["pilot_evidence_packet.json"], "acceptance_rubric_version": 1, "acceptance_provider_contract_version": ACCEPTANCE_PROVIDER_CONTRACT_VERSION, "evidence_candidate_catalog_version": EVIDENCE_CANDIDATE_CATALOG_VERSION},
             PILOT_REVIEW_ROLES,
         )
         for role in completed_roles:
@@ -2104,11 +2105,17 @@ def test_live_acceptance_prompt_contains_dimension_rubric_and_catalog(tmp_path):
     for payload in payloads:
         assert payload["pilot_id"] == manifest["pilot_id"]
         assert payload["acceptance_rubric_version"] == 1
+        assert payload["acceptance_provider_contract_version"] == ACCEPTANCE_PROVIDER_CONTRACT_VERSION
+        assert payload["evidence_candidate_catalog_version"] == EVIDENCE_CANDIDATE_CATALOG_VERSION
         assert all(criterion["criterion_id"].startswith(f"{payload['dimension']}.") for criterion in payload["criteria"])
         assert 2 <= len(payload["criteria"]) <= 4
-        assert len(payload["evidence_catalog"]) == 34
-        assert {entry["kind"] for entry in payload["evidence_catalog"]} == {"episode_final", "episode_plan", "episode_review", "episode_memory_update", "episode_memory_after", "episode_source", "transition"}
-        assert set(payload["strict_output_schema"]["proposal"]) == {"dimension_result", "criterion_results", "critical_finding", "strengths", "coverage_refs"}
+        assert len(payload["artifact_metadata"]) == 34
+        assert {entry["kind"] for entry in payload["artifact_metadata"]} == {"episode_final", "episode_plan", "episode_review", "episode_memory_update", "episode_memory_after", "episode_source", "transition"}
+        assert payload["evidence_candidates"] == sorted(payload["evidence_candidates"], key=lambda entry: (entry["ref"], entry["ordinal"]))
+        assert all("content" not in entry for entry in payload["evidence_candidates"])
+        assert set(payload["strict_output_schema"]["proposal"]) == {"dimension_result", "criterion_results", "critical_finding", "strengths"}
+        assert "evidence_refs" not in payload["strict_output_schema"]
+        assert "coverage_refs" not in payload["strict_output_schema"]["proposal"]
         assert "coverage_rule" in payload and "evidence_contract" in payload
 
 
@@ -2122,6 +2129,20 @@ def test_live_acceptance_prompt_is_deterministic(tmp_path):
     PilotPipeline(second_client, scenario=None, mode="live").run(PILOT_FIXTURE, second_output)
 
     assert sorted(_acceptance_prompts(first_root)) == sorted(_acceptance_prompts(second_root))
+
+
+def test_live_acceptance_receipts_preserve_candidate_only_provider_responses(tmp_path):
+    output = tmp_path / "pilot-live"
+    client, _ = _pilot_client(output)
+
+    PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+
+    for role in PILOT_REVIEW_ROLES:
+        response = json.loads(read_json(output / "pilot_review_receipts" / f"{role}.response.json")["raw_response"])
+        assert "evidence_refs" not in response
+        assert "coverage_refs" not in response["proposal"]
+        assert all("evidence" not in result and "evidence_candidate_ids" in result for result in response["proposal"]["criterion_results"])
+        assert all("evidence" not in strength and "evidence_candidate_ids" in strength for strength in response["proposal"]["strengths"])
 
 
 def test_live_acceptance_uses_shared_base_client(tmp_path):
@@ -2382,6 +2403,8 @@ def test_live_status_reports_grounded_acceptance(tmp_path):
     assert current["acceptance_strength_count"] == 7
     assert current["acceptance_grounding_reason"] is None
     assert current["acceptance_call_count"] == 7
+    assert set(current["acceptance_prompt_character_counts"]) == set(PILOT_REVIEW_ROLES)
+    assert all(count > 0 for count in current["acceptance_prompt_character_counts"].values())
 
 
 def test_live_hold_dimension_produces_grounded_hold(tmp_path):

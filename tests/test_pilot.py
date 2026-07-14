@@ -9,7 +9,8 @@ import pytest
 
 from arc.mock_model import MockModelClient
 from arc.pilot import PilotError, PilotPipeline, pilot_status
-from arc.pilot_contracts import validate_pilot_fixture
+from arc.evidence_candidates import EVIDENCE_CANDIDATE_CATALOG_VERSION
+from arc.pilot_contracts import ACCEPTANCE_PROVIDER_CONTRACT_VERSION, validate_pilot_fixture
 from arc.storage import StorageError
 from arc.pipeline import WaveCheckpoint
 from arc.pilot_contracts import PILOT_REVIEW_ROLES
@@ -204,6 +205,8 @@ def test_mock_pass_acceptance_is_grounded_schema_v2(tmp_path: Path) -> None:
     assert "pilot_evidence_packet.json" not in acceptance["evidence_refs"]
     packet = json.loads((output / "pilot_evidence_packet.json").read_text(encoding="utf-8"))
     assert packet["acceptance_rubric_version"] == 1
+    assert packet["acceptance_provider_contract_version"] == ACCEPTANCE_PROVIDER_CONTRACT_VERSION
+    assert packet["evidence_candidate_catalog_version"] == EVIDENCE_CANDIDATE_CATALOG_VERSION
     catalog_refs = {entry["ref"] for entry in packet["acceptance_evidence_catalog"]}
     assert len(catalog_refs) == 34
     assert set(acceptance["evidence_refs"]) <= catalog_refs
@@ -548,7 +551,7 @@ def _acceptance_restart(tmp_path: Path) -> tuple[Path, dict]:
 
 
 def _review_input(manifest: dict) -> dict:
-    return {"pilot_id": manifest["pilot_id"], "mode": manifest["mode"], "scenario": manifest["scenario"], "episode_ids": manifest["episode_ids"], "evidence_packet_hash": manifest["artifact_hashes"]["pilot_evidence_packet.json"], "acceptance_rubric_version": 1}
+    return {"pilot_id": manifest["pilot_id"], "mode": manifest["mode"], "scenario": manifest["scenario"], "episode_ids": manifest["episode_ids"], "evidence_packet_hash": manifest["artifact_hashes"]["pilot_evidence_packet.json"], "acceptance_rubric_version": 1, "acceptance_provider_contract_version": ACCEPTANCE_PROVIDER_CONTRACT_VERSION, "evidence_candidate_catalog_version": EVIDENCE_CANDIDATE_CATALOG_VERSION}
 
 
 def _review_worker(role: str) -> dict:
