@@ -13,7 +13,7 @@ from arc.contracts import ContractError, PROSE_FORBIDDEN_MARKERS, PROSE_MAX_CHAR
 from arc.live_model import AtomicTelemetryStore, GemmaPoolClient, LiveCallError, LiveConfig, MODEL_NAME, RoutingStateStore
 from arc.pipeline import PLANNING_ROLES, MockPipeline, WaveCheckpoint, status
 from arc.pilot_contracts import PILOT_REVIEW_ROLES
-from arc.pilot import PilotPipeline, inspect_pilot_checkpoint, live_telemetry_checkpoint, reconcile_pilot_checkpoint
+from arc.pilot import PilotPipeline, classify_episode_projection, episode_projection_document, inspect_pilot_checkpoint, live_telemetry_checkpoint, reconcile_live_telemetry_projections, reconcile_pilot_checkpoint
 from arc.storage import StorageError, read_json, write_json
 
 
@@ -1393,17 +1393,35 @@ def test_reconcile_rejects_telemetry_prefix_tamper(tmp_path):
     assert inspect_pilot_checkpoint(output)["checkpoint_integrity"] == "CORRUPT"
 
 
-def test_reconcile_rejects_projection_mismatch(tmp_path):
+def test_reconcile_rejects_projection_conflict(tmp_path):
     output = _make_reconcilable_pilot_output(tmp_path)
     episode_live = output / "episodes" / "episode_003" / "live_calls.json"
     value = read_json(episode_live)
-    value["calls"] = []
-    digest = write_json(episode_live, value)
-    manifest = read_json(output / "episodes" / "episode_003" / "manifest.json")
-    manifest["artifact_hashes"]["live_calls.json"] = digest
-    write_json(output / "episodes" / "episode_003" / "manifest.json", manifest)
+    value["calls"][0]["key_slot"] = "tampered"
+    write_json(episode_live, value)
 
     assert inspect_pilot_checkpoint(output)["checkpoint_integrity"] == "CORRUPT"
+    with pytest.raises(StorageError):
+        reconcile_pilot_checkpoint(PILOT_FIXTURE, output)
+
+
+def test_reconcile_repairs_stale_prefix_projection(tmp_path):
+    output = _make_reconcilable_pilot_output(tmp_path)
+    episode_live = output / "episodes" / "episode_003" / "live_calls.json"
+    value = read_json(episode_live)
+    value["calls"] = value["calls"][:2]
+    write_json(episode_live, value)
+
+    inspection = inspect_pilot_checkpoint(output)
+    assert inspection["checkpoint_integrity"] == "RECONCILABLE"
+    assert "EPISODE_PROJECTION_STALE" in inspection["reason_codes"]
+
+    result = reconcile_pilot_checkpoint(PILOT_FIXTURE, output)
+    assert result["checkpoint_integrity"] == "VALID"
+    assert "episodes/episode_003/live_calls.json" in result["changed_files"]
+    root_calls = read_json(output / "pilot_live_calls.json")["calls"]
+    projection = read_json(episode_live)
+    assert projection["calls"] == [call for call in root_calls if call["scope_id"] == "episode:episode_003"]
 
 
 def test_reconcile_rejects_routing_state_behind_telemetry(tmp_path):
@@ -1640,19 +1658,37 @@ def test_live_pilot_interrupted_episode_preserves_global_attempt_and_lease_seque
     assert sorted(call["lease_sequence"] for call in after) == list(range(1, len(after) + 1))
 
 
-def test_live_pilot_interrupted_episode_rejects_root_projection_mismatch(tmp_path):
+def test_live_pilot_interrupted_episode_rejects_root_projection_conflict(tmp_path):
+    output = _make_interrupted_episode_output(tmp_path)
+    episode_path = output / "episodes" / "episode_002" / "live_calls.json"
+    episode_calls = read_json(episode_path)
+    episode_calls["calls"][0]["key_slot"] = "tampered"
+    write_json(episode_path, episode_calls)
+    before = episode_path.read_bytes()
+
+    fresh_client, provider_root = _pilot_client(output)
+    with pytest.raises(StorageError, match="telemetry projection mismatch"):
+        PilotPipeline(fresh_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    assert provider_root.provider_calls == []
+    assert episode_path.read_bytes() == before
+
+
+def test_live_pilot_interrupted_episode_recovers_stale_prefix_projection(tmp_path):
     output = _make_interrupted_episode_output(tmp_path)
     episode_path = output / "episodes" / "episode_002" / "live_calls.json"
     episode_calls = read_json(episode_path)
     episode_calls["calls"] = []
-    digest = write_json(episode_path, episode_calls)
-    episode_manifest = read_json(output / "episodes" / "episode_002" / "manifest.json")
-    episode_manifest["artifact_hashes"]["live_calls.json"] = digest
-    write_json(output / "episodes" / "episode_002" / "manifest.json", episode_manifest)
+    write_json(episode_path, episode_calls)
 
     fresh_client, _ = _pilot_client(output)
-    with pytest.raises(StorageError, match="telemetry projection mismatch"):
-        PilotPipeline(fresh_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    result = PilotPipeline(fresh_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+
+    assert result["manifest"]["status"] == "COMPLETE"
+    root_calls = read_json(output / "pilot_live_calls.json")["calls"]
+    projection = read_json(episode_path)
+    assert projection["calls"] == [call for call in root_calls if call["scope_id"] == "episode:episode_002"]
+    assert len({call["call_id"] for call in root_calls}) == len(root_calls)
+    assert len({call["lease_sequence"] for call in root_calls}) == len(root_calls)
 
 
 def test_planning_merge_contract_failure_keeps_provider_call_pass(tmp_path):
@@ -1786,17 +1822,29 @@ def test_planning_merge_resume_rejects_tampered_planning_workers(tmp_path):
         _resume_episode_four_output(output)
 
 
-def test_planning_merge_resume_rejects_root_projection_mismatch(tmp_path):
+def test_planning_merge_resume_rejects_root_projection_conflict(tmp_path):
     output = _make_episode_four_plan_error_output(tmp_path)
     episode_live = output / "episodes" / "episode_004" / "live_calls.json"
     value = read_json(episode_live)
-    value["calls"] = []
-    digest = write_json(episode_live, value)
-    episode_manifest = read_json(output / "episodes" / "episode_004" / "manifest.json")
-    episode_manifest["artifact_hashes"]["live_calls.json"] = digest
-    write_json(output / "episodes" / "episode_004" / "manifest.json", episode_manifest)
+    value["calls"][0]["key_slot"] = "tampered"
+    write_json(episode_live, value)
     with pytest.raises(StorageError, match="telemetry projection mismatch"):
         _resume_episode_four_output(output)
+
+
+def test_planning_merge_resume_recovers_stale_prefix_projection(tmp_path):
+    output = _make_episode_four_plan_error_output(tmp_path)
+    episode_live = output / "episodes" / "episode_004" / "live_calls.json"
+    value = read_json(episode_live)
+    value["calls"] = value["calls"][:1]
+    write_json(episode_live, value)
+
+    result, _ = _resume_episode_four_output(output)
+
+    assert result["manifest"]["status"] == "COMPLETE"
+    root_calls = read_json(output / "pilot_live_calls.json")["calls"]
+    projection = read_json(episode_live)
+    assert projection["calls"] == [call for call in root_calls if call["scope_id"] == "episode:episode_004"]
 
 
 def test_planning_merge_resume_rejects_stale_planning_partial(tmp_path):
@@ -1834,18 +1882,37 @@ def test_planning_merge_resume_rejects_plan_merged_without_artifact(tmp_path):
         _resume_episode_four_output(output)
 
 
-def test_live_pilot_rejects_root_and_episode_telemetry_mismatch(tmp_path):
+def test_live_pilot_rejects_root_and_episode_telemetry_conflict(tmp_path):
     output = tmp_path / "pilot-live"
     client, _ = _pilot_client(output)
     PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
     episode_path = output / "episodes" / "episode_001" / "live_calls.json"
     episode_calls = read_json(episode_path)
-    episode_calls["calls"] = []
+    episode_calls["calls"][0]["key_slot"] = "tampered"
     write_json(episode_path, episode_calls)
 
-    fresh_client, _ = _pilot_client(output)
+    fresh_client, provider_root = _pilot_client(output)
     with pytest.raises(StorageError, match="telemetry projection mismatch"):
         PilotPipeline(fresh_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    assert provider_root.provider_calls == []
+
+
+def test_live_pilot_recovers_missing_completed_episode_projection(tmp_path):
+    output = tmp_path / "pilot-live"
+    client, _ = _pilot_client(output)
+    PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    episode_path = output / "episodes" / "episode_001" / "live_calls.json"
+    episode_path.unlink()
+
+    fresh_client, provider_root = _pilot_client(output)
+    result = PilotPipeline(fresh_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+
+    assert result["no_op"] is True
+    assert provider_root.provider_calls == []
+    root = read_json(output / "pilot_live_calls.json")
+    projection = read_json(episode_path)
+    assert projection["calls"] == [call for call in root["calls"] if call["scope_id"] == "episode:episode_001"]
+    assert all(item["scope_id"] == "episode:episode_001" for item in projection["contract_failures"])
 
 
 def test_live_pilot_transient_rotation_continues_same_desk(tmp_path):
@@ -2182,6 +2249,153 @@ def test_mock_and_live_outputs_cannot_be_reused(tmp_path):
 
     with pytest.raises(Exception, match="pilot input changed"):
         PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+
+
+def _projection_root_doc() -> dict:
+    def call(order: int, scope: str) -> dict:
+        return {"call_id": f"L{order:03d}-A001", "scope_id": scope, "desk_id": f"{scope}:planning:event", "logical_order": order, "attempt": 1, "lease_sequence": order, "stage": "planning", "role": "event", "key_slot": f"K{order:02d}", "status": "PASS"}
+
+    return {
+        "schema_version": 2,
+        "provider": "gemini_developer_api",
+        "model": MODEL_NAME,
+        "calls": [call(1, "episode:episode_001"), call(2, "episode:episode_001"), call(3, "episode:episode_002"), call(4, "pilot:acceptance")],
+        "contract_failures": [
+            {"event_id": "CF001", "scope_id": "episode:episode_001", "stage": "planning_merge", "role": "merge", "contract_code": "PLAN_FIELDS_MISMATCH"},
+            {"event_id": "CF002", "scope_id": "pilot:acceptance", "stage": "pilot_review", "role": "readability", "contract_code": "UNKNOWN"},
+            {"event_id": "CF003", "scope_id": None, "stage": "planning_merge", "role": "merge", "contract_code": "UNKNOWN"},
+        ],
+        "max_active_by_stage": {"planning": 2},
+    }
+
+
+def test_projection_document_is_deterministic_scope_filter():
+    root = _projection_root_doc()
+
+    projection = episode_projection_document(root, "episode_001")
+
+    assert [call["call_id"] for call in projection["calls"]] == ["L001-A001", "L002-A001"]
+    assert [item["event_id"] for item in projection["contract_failures"]] == ["CF001"]
+    assert "max_active_by_stage" not in projection
+    assert projection == episode_projection_document(root, "episode_001")
+
+
+def test_projection_document_excludes_acceptance_and_unscoped_failures():
+    root = _projection_root_doc()
+
+    projection = episode_projection_document(root, "episode_002")
+
+    assert [call["scope_id"] for call in projection["calls"]] == ["episode:episode_002"]
+    assert projection["contract_failures"] == []
+
+
+def test_classify_projection_missing_and_current():
+    root = _projection_root_doc()
+    canonical = episode_projection_document(root, "episode_001")
+
+    assert classify_episode_projection(root, "episode_001", None) == "MISSING"
+    assert classify_episode_projection(root, "episode_001", canonical) == "CURRENT"
+
+
+def test_classify_projection_stale_prefix():
+    root = _projection_root_doc()
+    canonical = episode_projection_document(root, "episode_001")
+
+    shorter = {**canonical, "calls": canonical["calls"][:1]}
+    assert classify_episode_projection(root, "episode_001", shorter) == "STALE_PREFIX"
+    empty = {**canonical, "calls": [], "contract_failures": []}
+    assert classify_episode_projection(root, "episode_001", empty) == "STALE_PREFIX"
+    legacy_unfiltered = {**canonical, "contract_failures": list(root["contract_failures"]), "max_active_by_stage": {"planning": 2}}
+    assert classify_episode_projection(root, "episode_001", legacy_unfiltered) == "STALE_PREFIX"
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda canonical, root: {**canonical, "calls": [dict(canonical["calls"][0], key_slot="tampered"), canonical["calls"][1]]},
+    lambda canonical, root: {**canonical, "calls": [canonical["calls"][1]]},
+    lambda canonical, root: {**canonical, "calls": list(reversed(canonical["calls"]))},
+    lambda canonical, root: {**canonical, "calls": canonical["calls"] + [root["calls"][2]]},
+    lambda canonical, root: {**canonical, "calls": canonical["calls"] + [root["calls"][3]]},
+    lambda canonical, root: {**canonical, "calls": canonical["calls"] + [dict(canonical["calls"][0], call_id="L999-A999", lease_sequence=99)]},
+    lambda canonical, root: {**canonical, "calls": canonical["calls"] + [canonical["calls"][0]]},
+    lambda canonical, root: {**canonical, "contract_failures": canonical["contract_failures"] + [{"event_id": "CF999", "scope_id": "episode:episode_001", "contract_code": "FABRICATED"}]},
+    lambda canonical, root: {**canonical, "calls": "tampered"},
+    lambda canonical, root: [],
+])
+def test_classify_projection_conflicts(mutate):
+    root = _projection_root_doc()
+    canonical = episode_projection_document(root, "episode_001")
+
+    assert classify_episode_projection(root, "episode_001", mutate(canonical, root)) == "CONFLICT"
+
+
+def test_classify_projection_ahead_of_shortened_root_is_conflict():
+    root = _projection_root_doc()
+    canonical = episode_projection_document(root, "episode_001")
+    shortened_root = {**root, "calls": root["calls"][:1]}
+
+    assert classify_episode_projection(shortened_root, "episode_001", canonical) == "CONFLICT"
+
+
+def test_reconcile_projections_regenerates_then_noops(tmp_path):
+    output = tmp_path / "pilot-live"
+    client, _ = _pilot_client(output)
+    PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    manifest = read_json(output / "pilot_manifest.json")
+    stale_path = output / "episodes" / "episode_002" / "live_calls.json"
+    stale = read_json(stale_path)
+    stale["calls"] = stale["calls"][:3]
+    write_json(stale_path, stale)
+    (output / "episodes" / "episode_004" / "live_calls.json").unlink()
+
+    states = reconcile_live_telemetry_projections(output, manifest)
+
+    assert states["episode_002"] == "STALE_PREFIX"
+    assert states["episode_004"] == "MISSING"
+    assert states["episode_001"] == "CURRENT"
+    after_first = _file_bytes(output)
+    assert reconcile_live_telemetry_projections(output, manifest) == {episode_id: "CURRENT" for episode_id in manifest["episode_ids"]}
+    assert _file_bytes(output) == after_first
+
+
+def test_reconcile_projections_fails_closed_on_conflict_without_overwrite(tmp_path):
+    output = tmp_path / "pilot-live"
+    client, _ = _pilot_client(output)
+    PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    manifest = read_json(output / "pilot_manifest.json")
+    conflict_path = output / "episodes" / "episode_003" / "live_calls.json"
+    conflict = read_json(conflict_path)
+    conflict["calls"][0]["status"] = "tampered"
+    write_json(conflict_path, conflict)
+    before = conflict_path.read_bytes()
+
+    with pytest.raises(StorageError, match="telemetry projection mismatch"):
+        reconcile_live_telemetry_projections(output, manifest)
+    assert conflict_path.read_bytes() == before
+
+
+def test_projection_regeneration_replace_failure_preserves_original(tmp_path, monkeypatch):
+    output = tmp_path / "pilot-live"
+    client, _ = _pilot_client(output)
+    PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    manifest = read_json(output / "pilot_manifest.json")
+    stale_path = output / "episodes" / "episode_002" / "live_calls.json"
+    stale = read_json(stale_path)
+    stale["calls"] = stale["calls"][:2]
+    write_json(stale_path, stale)
+    before = stale_path.read_bytes()
+
+    def broken_replace(source, target):
+        raise OSError("injected replace failure")
+
+    monkeypatch.setattr("arc.storage.os.replace", broken_replace)
+    with pytest.raises(OSError, match="injected replace failure"):
+        reconcile_live_telemetry_projections(output, manifest)
+    assert stale_path.read_bytes() == before
+    monkeypatch.undo()
+
+    reconcile_live_telemetry_projections(output, manifest)
+    root_calls = read_json(output / "pilot_live_calls.json")["calls"]
+    assert read_json(stale_path)["calls"] == [call for call in root_calls if call["scope_id"] == "episode:episode_002"]
 
 
 def test_pilot_live_complete_noop_preserves_all_hashes(tmp_path):

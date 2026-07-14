@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 
 from .mock_model import MockModelClient
 from .pipeline import MockPipeline, status
-from .pilot import PilotPipeline, pilot_status, reconcile_pilot_checkpoint
+from .pilot import PROJECTION_STALE_REASON, PilotPipeline, pilot_status, reconcile_pilot_checkpoint
 from .storage import write_json
 from .usage import UsageLedger, backup_usage_db, repair_preflight_collision, usage_db_path
 from .prose_probe import PROBE_TELEMETRY, prose_live_probe_status, run_prose_live_probe
@@ -156,7 +156,7 @@ def main() -> None:
         print(json.dumps(pilot_status(args.output), ensure_ascii=False))
     elif args.command == "pilot-live-run":
         current = pilot_status(args.output) if (args.output / "pilot_manifest.json").exists() else None
-        if current and current.get("checkpoint_integrity") == "RECONCILABLE":
+        if current and current.get("checkpoint_integrity") == "RECONCILABLE" and set(current.get("reason_codes", [])) - {PROJECTION_STALE_REASON}:
             raise RuntimeError("pilot checkpoint reconciliation required")
         client = _load_live_client(args.preflight, args.output, args.output / "pilot_live_calls.json")
         try:

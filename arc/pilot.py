@@ -5,9 +5,16 @@ import json
 from pathlib import Path
 
 from .contracts import ContractError, parse_object, validate_worker
+from .live_model import scope_projection
 from .pipeline import MockPipeline, WaveCheckpoint, status
 from .pilot_contracts import PILOT_REVIEW_ROLES, STABLE_MEMORY_FIELDS, canonical_bytes, validate_pilot_acceptance, validate_pilot_fixture, validate_transition
 from .storage import StorageError, read_json, sha256_bytes, sha256_file, write_json
+
+PROJECTION_CURRENT = "CURRENT"
+PROJECTION_MISSING = "MISSING"
+PROJECTION_STALE_PREFIX = "STALE_PREFIX"
+PROJECTION_CONFLICT = "CONFLICT"
+PROJECTION_STALE_REASON = "EPISODE_PROJECTION_STALE"
 
 
 class PilotError(RuntimeError):
@@ -37,6 +44,7 @@ class PilotPipeline:
                 self.client.restore_telemetry(read_json(run_dir / "pilot_live_calls.json"))
             verify_pilot_artifacts(run_dir, manifest)
             if self.mode == "live":
+                reconcile_live_telemetry_projections(run_dir, manifest)
                 inspection = inspect_pilot_checkpoint(run_dir, manifest)
                 if _reconcile_legacy_writer_attempt(run_dir, manifest, inspection, fixture):
                     return {"no_op": False, "manifest": manifest}
@@ -523,9 +531,12 @@ def inspect_pilot_checkpoint(run_dir: Path, manifest: dict | None = None) -> dic
         return {"checkpoint_integrity": "CORRUPT", "reconciliation_required": False, "reason_codes": [str(error)], "current": _manifest_progress(manifest), "derived": {}}
     try:
         derived = _derive_pilot_progress(run_dir, manifest)
-        _verify_live_telemetry_projection_for_episodes(run_dir, derived["completed_episodes"] + ([derived["active_episode_id"]] if derived["active_episode_id"] else []))
     except Exception as error:
         return {"checkpoint_integrity": "CORRUPT", "reconciliation_required": False, "reason_codes": [str(error)], "current": current, "derived": {}}
+    if (run_dir / "pilot_live_calls.json").exists():
+        projection_states = _live_projection_states(run_dir, manifest, read_json(run_dir / "pilot_live_calls.json"))
+        if any(state != PROJECTION_CURRENT for state in projection_states.values()):
+            reason_codes.append(PROJECTION_STALE_REASON)
     if manifest.get("mode") == "live" and "pilot_live_calls.json" in manifest.get("artifact_hashes", {}):
         actual = sha256_file(run_dir / "pilot_live_calls.json")
         if manifest["artifact_hashes"]["pilot_live_calls.json"] != actual:
@@ -575,6 +586,11 @@ def reconcile_pilot_checkpoint(fixture_path: Path, run_dir: Path) -> dict:
         return {"no_op": True, **inspection}
     if inspection["checkpoint_integrity"] != "RECONCILABLE":
         raise StorageError("pilot checkpoint corrupt")
+    projection_states = reconcile_live_telemetry_projections(run_dir, manifest)
+    changed_files = [f"episodes/{episode_id}/live_calls.json" for episode_id, state in sorted(projection_states.items()) if state in {PROJECTION_MISSING, PROJECTION_STALE_PREFIX}]
+    inspection = inspect_pilot_checkpoint(run_dir, manifest)
+    if inspection["checkpoint_integrity"] == "VALID":
+        return {"no_op": False, "changed_files": changed_files, **inspection}
     derived = inspection["derived"]
     telemetry = read_json(run_dir / "pilot_live_calls.json") if (run_dir / "pilot_live_calls.json").exists() else {"calls": [], "contract_failures": []}
     manifest["completed_episodes"] = derived["completed_episodes"]
@@ -595,7 +611,7 @@ def reconcile_pilot_checkpoint(fixture_path: Path, run_dir: Path) -> dict:
     }
     write_json(manifest_path, manifest)
     after = inspect_pilot_checkpoint(run_dir, manifest)
-    return {"no_op": False, "changed_files": ["pilot_manifest.json"], **after}
+    return {"no_op": False, "changed_files": changed_files + ["pilot_manifest.json"], **after}
 
 
 def _episode_files(path: Path) -> list[str]:
@@ -665,42 +681,80 @@ def _root_artifact_index_stale(manifest: dict, derived: dict) -> bool:
     return bool(expected - set(manifest.get("artifact_hashes", {})))
 
 
-def _verify_live_telemetry_projections(run_dir: Path, manifest: dict) -> None:
+def episode_projection_document(root_telemetry: dict, episode_id: str) -> dict:
+    return scope_projection(root_telemetry, f"episode:{episode_id}")
+
+
+def classify_episode_projection(root_telemetry: dict, episode_id: str, projection: object) -> str:
+    canonical = episode_projection_document(root_telemetry, episode_id)
+    if projection is None:
+        return PROJECTION_MISSING
+    if not isinstance(projection, dict) or not isinstance(projection.get("calls"), list) or not isinstance(projection.get("contract_failures", []), list):
+        return PROJECTION_CONFLICT
+    calls = projection["calls"]
+    if calls != canonical["calls"][: len(calls)]:
+        return PROJECTION_CONFLICT
+    root_failures = list(root_telemetry.get("contract_failures", []))
+    if any(item not in root_failures for item in projection.get("contract_failures", [])):
+        return PROJECTION_CONFLICT
+    return PROJECTION_CURRENT if projection == canonical else PROJECTION_STALE_PREFIX
+
+
+def _live_projection_states(run_dir: Path, manifest: dict, root_telemetry: dict) -> dict[str, str]:
+    states: dict[str, str] = {}
+    for episode_id in manifest.get("episode_ids", []):
+        episode_dir = run_dir / "episodes" / episode_id
+        if not episode_dir.exists():
+            continue
+        path = episode_dir / "live_calls.json"
+        try:
+            projection = read_json(path) if path.exists() else None
+        except ValueError:
+            projection = object()
+        states[episode_id] = classify_episode_projection(root_telemetry, episode_id, projection)
+    return states
+
+
+def reconcile_live_telemetry_projections(run_dir: Path, manifest: dict) -> dict[str, str]:
+    """Rebuild MISSING/STALE_PREFIX episode projections from canonical root telemetry."""
+    if manifest.get("mode") != "live" or not (run_dir / "pilot_live_calls.json").exists():
+        return {}
+    root = _verify_root_live_telemetry(run_dir, manifest)
+    states = _live_projection_states(run_dir, manifest, root)
+    for episode_id, state in states.items():
+        if state == PROJECTION_CONFLICT:
+            raise StorageError("episode live telemetry projection mismatch")
+        if state in {PROJECTION_MISSING, PROJECTION_STALE_PREFIX}:
+            write_json(run_dir / "episodes" / episode_id / "live_calls.json", episode_projection_document(root, episode_id))
+    return states
+
+
+def _verify_root_live_telemetry(run_dir: Path, manifest: dict) -> dict:
     root = read_json(run_dir / "pilot_live_calls.json")
-    call_ids = [call.get("call_id") for call in root.get("calls", [])]
-    lease_sequences = [call.get("lease_sequence") for call in root.get("calls", [])]
+    calls = root.get("calls", [])
+    call_ids = [call.get("call_id") for call in calls]
+    lease_sequences = [call.get("lease_sequence") for call in calls]
     if len(call_ids) != len(set(call_ids)):
         raise StorageError("duplicate pilot live call id")
     if len(lease_sequences) != len(set(lease_sequences)):
         raise StorageError("duplicate pilot live lease sequence")
+    known_scopes = {f"episode:{episode_id}" for episode_id in manifest.get("episode_ids", [])} | {"pilot:acceptance"}
+    if any(call.get("scope_id") not in known_scopes for call in calls):
+        raise StorageError("unknown pilot live telemetry scope")
+    if any(item.get("scope_id") is not None and item.get("scope_id") not in known_scopes for item in root.get("contract_failures", [])):
+        raise StorageError("unknown pilot live telemetry scope")
     if lease_sequences and (run_dir / "routing_state.json").exists():
         routing = read_json(run_dir / "routing_state.json")
         if routing.get("next_lease_sequence", 0) <= max(lease_sequences):
             raise StorageError("routing lease sequence behind telemetry")
     verify_live_telemetry_checkpoint(root, manifest.get("live_telemetry_checkpoint"))
-    root_by_scope = {}
-    for call in root.get("calls", []):
-        root_by_scope.setdefault(call.get("scope_id"), []).append(call)
-    checked = list(manifest["completed_episodes"])
-    active_episode_id = manifest.get("active_episode_id")
-    if active_episode_id and (run_dir / "episodes" / active_episode_id / "live_calls.json").exists():
-        checked.append(active_episode_id)
-    for episode_id in checked:
-        _verify_live_telemetry_projection_for_episodes(run_dir, [episode_id], root_by_scope)
+    return root
 
 
-def _verify_live_telemetry_projection_for_episodes(run_dir: Path, episode_ids: list[str], root_by_scope: dict | None = None) -> None:
-    if root_by_scope is None:
-        root_by_scope = {}
-        for call in read_json(run_dir / "pilot_live_calls.json").get("calls", []):
-            root_by_scope.setdefault(call.get("scope_id"), []).append(call)
-    for episode_id in episode_ids:
-        live_path = run_dir / "episodes" / episode_id / "live_calls.json"
-        if not live_path.exists():
-            raise StorageError("episode live telemetry projection mismatch")
-        episode_calls = read_json(live_path).get("calls", [])
-        scope_id = f"episode:{episode_id}"
-        if episode_calls != root_by_scope.get(scope_id, []):
+def _verify_live_telemetry_projections(run_dir: Path, manifest: dict) -> None:
+    root = _verify_root_live_telemetry(run_dir, manifest)
+    for state in _live_projection_states(run_dir, manifest, root).values():
+        if state == PROJECTION_CONFLICT:
             raise StorageError("episode live telemetry projection mismatch")
 
 
@@ -720,7 +774,7 @@ def pilot_status(run_dir: Path) -> dict:
         call_ids = [call.get("call_id") for call in calls]
         lease_sequences = [call.get("lease_sequence") for call in calls]
         acceptance_calls = [call for call in calls if call.get("scope_id") == "pilot:acceptance"]
-        result.update({"model": manifest["model"], "key_pool_size": manifest["key_pool_size"], "configured_max_live": manifest["max_live"], "telemetry_schema_version": telemetry["schema_version"], "pilot_live_call_count": len(calls), "live_telemetry_checkpoint": checkpoint, "successful_live_calls": sum(call["status"] == "PASS" for call in calls), "failed_live_calls": sum(call["status"] == "FAIL" for call in calls), "transient_failure_count": sum(call["status"] == "FAIL" and call.get("error_class") in {"RATE_LIMITED", "PROVIDER_5XX", "TIMEOUT", "NETWORK_ERROR"} for call in calls), "contract_failure_count": len(telemetry.get("contract_failures", [])), "used_key_slots": sorted({call["key_slot"] for call in calls}), "rotation_count": sum(1 for call in calls if call["status"] == "FAIL" and call.get("error_class")), "episode_call_counts": {episode_id: len(read_json(run_dir / "episodes" / episode_id / "live_calls.json")["calls"]) for episode_id in manifest["completed_episodes"]}, "acceptance_call_count": len(acceptance_calls), "acceptance_pass_calls": sum(call["status"] == "PASS" for call in acceptance_calls), "call_ids_unique": len(call_ids) == len(set(call_ids)), "lease_sequences_unique": len(lease_sequences) == len(set(lease_sequences))})
+        result.update({"model": manifest["model"], "key_pool_size": manifest["key_pool_size"], "configured_max_live": manifest["max_live"], "telemetry_schema_version": telemetry["schema_version"], "pilot_live_call_count": len(calls), "live_telemetry_checkpoint": checkpoint, "successful_live_calls": sum(call["status"] == "PASS" for call in calls), "failed_live_calls": sum(call["status"] == "FAIL" for call in calls), "transient_failure_count": sum(call["status"] == "FAIL" and call.get("error_class") in {"RATE_LIMITED", "PROVIDER_5XX", "TIMEOUT", "NETWORK_ERROR"} for call in calls), "contract_failure_count": len(telemetry.get("contract_failures", [])), "used_key_slots": sorted({call["key_slot"] for call in calls}), "rotation_count": sum(1 for call in calls if call["status"] == "FAIL" and call.get("error_class")), "episode_call_counts": {episode_id: sum(call.get("scope_id") == f"episode:{episode_id}" for call in calls) for episode_id in manifest["completed_episodes"]}, "acceptance_call_count": len(acceptance_calls), "acceptance_pass_calls": sum(call["status"] == "PASS" for call in acceptance_calls), "call_ids_unique": len(call_ids) == len(set(call_ids)), "lease_sequences_unique": len(lease_sequences) == len(set(lease_sequences))})
     return result
 
 

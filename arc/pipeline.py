@@ -81,7 +81,7 @@ class MockPipeline:
                 raise PipelineError("LEGACY_ROUTING_SCHEMA")
             if manifest["source_hash"] != source_hash or manifest["scenario"] != scenario or manifest.get("mode", "mock") != self.mode:
                 raise PipelineError("source or scenario changed; refusing reuse")
-            verify_artifacts(run_dir, manifest, self._operational_files() if self.mode == "live" else None)
+            verify_artifacts(run_dir, _verifiable_manifest(manifest), self._operational_files() if self.mode == "live" else None)
             if "PLAN_MERGED" in manifest["completed_stages"] and ("episode_plan.json" not in manifest["artifact_hashes"] or not (run_dir / "episode_plan.json").exists()):
                 raise PipelineError("PLAN_MERGED without episode plan")
             if self.mode == "live" and (run_dir / "live_calls.json").exists():
@@ -301,6 +301,8 @@ class MockPipeline:
         if state == "NOT_STARTED":
             if any(item is not None for item in evidence) or manifest.get("writer_contract_code") is not None or completed or draft.exists() or draft_contract.exists():
                 raise PipelineError("invalid writer evidence")
+            if self.mode == "live" and self._consumed_prose_response(run_dir, "writer"):
+                raise PipelineError("WRITER_RECONCILIATION_REQUIRED")
             return
         digest, characters, received_at, call_id, lease = evidence
         if not isinstance(digest, str) or len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest) or type(characters) is not int or characters < 0 or not isinstance(received_at, str) or not isinstance(call_id, str) or type(lease) is not int:
@@ -322,6 +324,12 @@ class MockPipeline:
             calls = [call for call in read_json(telemetry_path).get("calls", []) if call.get("call_id") == call_id and call.get("stage") == "writer" and call.get("role") == "canonical"]
             if len(calls) != 1 or calls[0].get("status") != "PASS" or calls[0].get("response_sha256") != digest or calls[0].get("output_characters") != characters or calls[0].get("lease_sequence") != lease:
                 raise PipelineError("invalid writer telemetry evidence")
+
+    def _consumed_prose_response(self, run_dir: Path, stage: str) -> bool:
+        telemetry_path = run_dir / "live_calls.json"
+        if not telemetry_path.exists():
+            return False
+        return any(call.get("stage") == stage and call.get("role") == "canonical" and call.get("status") == "PASS" for call in read_json(telemetry_path).get("calls", []))
 
     @staticmethod
     def _initial_revision_state() -> dict:
@@ -354,6 +362,8 @@ class MockPipeline:
         if state == "NOT_STARTED":
             if any(item is not None for item in evidence) or manifest.get("revision_contract_code") is not None or "REVISION_COMPLETED" in manifest["completed_stages"] or (run_dir / "revised.md").exists():
                 raise PipelineError("invalid revision evidence")
+            if self.mode == "live" and self._consumed_prose_response(run_dir, "revision"):
+                raise PipelineError("REVISION_RECONCILIATION_REQUIRED")
             return
         digest, characters, received_at, call_id, lease = evidence
         if not isinstance(digest, str) or len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest) or type(characters) is not int or characters < 0 or not isinstance(received_at, str) or not isinstance(call_id, str) or type(lease) is not int:
@@ -463,7 +473,8 @@ class MockPipeline:
         if self.mode == "live":
             telemetry = self.client.telemetry()
             manifest["live_call_count"] = len(telemetry["calls"])
-            self._commit_artifact(run_dir, manifest, "live_calls.json", telemetry)
+            write_json(run_dir / "live_calls.json", telemetry)
+            manifest["artifact_hashes"].pop("live_calls.json", None)
 
     def _reconcile_invalid_memory_merge(self, source: dict, run_dir: Path, manifest: dict) -> None:
         if "MEMORY_MERGED" not in manifest["completed_stages"]:
@@ -519,20 +530,29 @@ class MockPipeline:
 
     @staticmethod
     def _operational_files() -> set[str]:
-        return {"routing_state.json", "planning_workers.partial.json", "review_workers.partial.json", "memory_workers.partial.json"}
+        return {"routing_state.json", "live_calls.json", "planning_workers.partial.json", "review_workers.partial.json", "memory_workers.partial.json"}
+
+
+def _verifiable_manifest(manifest: dict) -> dict:
+    if manifest.get("mode") != "live" or "live_calls.json" not in manifest.get("artifact_hashes", {}):
+        return manifest
+    checked = dict(manifest)
+    checked["artifact_hashes"] = {name: digest for name, digest in manifest["artifact_hashes"].items() if name != "live_calls.json"}
+    return checked
 
 
 def status(run_dir: Path) -> dict:
     manifest = read_json(run_dir / "manifest.json")
-    operational = {"routing_state.json", "planning_workers.partial.json", "review_workers.partial.json", "memory_workers.partial.json"} if manifest.get("mode") == "live" else None
-    verify_artifacts(run_dir, manifest, operational)
+    operational = MockPipeline._operational_files() if manifest.get("mode") == "live" else None
+    verify_artifacts(run_dir, _verifiable_manifest(manifest), operational)
     if manifest["status"] == "COMPLETE" and "MEMORY_APPLIED" not in manifest["completed_stages"]:
         raise StorageError("COMPLETE without MEMORY_APPLIED")
     result = {"mode": manifest.get("mode", "mock"), "fixture_id": manifest["fixture_id"], "episode_id": manifest["episode_id"], "status": manifest["status"], "completed_stages": manifest["completed_stages"], "review_verdict": manifest["review_verdict"], "writer_call_count": manifest["writer_call_count"], "revision_count": manifest["revision_count"], "final_exists": (run_dir / "final.md").exists(), "memory_merged": "MEMORY_MERGED" in manifest["completed_stages"], "memory_applied": "MEMORY_APPLIED" in manifest["completed_stages"], "last_error": manifest["last_error"]}
     if result["mode"] == "live":
-        telemetry = read_json(run_dir / "live_calls.json")
+        telemetry_path = run_dir / "live_calls.json"
+        telemetry = read_json(telemetry_path) if telemetry_path.exists() else {"schema_version": None, "calls": [], "contract_failures": []}
         calls = telemetry["calls"]
-        result.update({"model": manifest["model"], "key_pool_size": manifest["key_pool_size"], "configured_max_live": manifest["max_live"], "telemetry_schema_version": telemetry["schema_version"], "live_call_count": len(calls), "successful_live_calls": sum(call["status"] == "PASS" for call in calls), "failed_live_calls": sum(call["status"] == "FAIL" for call in calls), "contract_failure_count": len(telemetry.get("contract_failures", [])), "used_key_slots": sorted({call["key_slot"] for call in calls}), "per_wave_max_active_calls": telemetry["max_active_by_stage"], "final_character_count": len((run_dir / "final.md").read_text(encoding="utf-8")) if (run_dir / "final.md").exists() else 0})
+        result.update({"model": manifest["model"], "key_pool_size": manifest["key_pool_size"], "configured_max_live": manifest["max_live"], "telemetry_schema_version": telemetry["schema_version"], "live_call_count": len(calls), "successful_live_calls": sum(call["status"] == "PASS" for call in calls), "failed_live_calls": sum(call["status"] == "FAIL" for call in calls), "contract_failure_count": len(telemetry.get("contract_failures", [])), "used_key_slots": sorted({call["key_slot"] for call in calls}), "per_wave_max_active_calls": telemetry.get("max_active_by_stage", {}), "final_character_count": len((run_dir / "final.md").read_text(encoding="utf-8")) if (run_dir / "final.md").exists() else 0})
     return result
 
 

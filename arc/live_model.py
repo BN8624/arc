@@ -155,6 +155,17 @@ class RoutingStateStore:
         return data
 
 
+def scope_projection(telemetry: dict, scope_id: str) -> dict:
+    """Deterministically project one scope out of canonical telemetry."""
+    return {
+        "schema_version": telemetry.get("schema_version"),
+        "provider": telemetry.get("provider"),
+        "model": telemetry.get("model"),
+        "calls": [call for call in telemetry.get("calls", []) if call.get("scope_id") == scope_id],
+        "contract_failures": [item for item in telemetry.get("contract_failures", []) if item.get("scope_id") == scope_id],
+    }
+
+
 class AtomicTelemetryStore:
     def __init__(self, path: Path):
         self.path = path
@@ -376,9 +387,9 @@ class GemmaPoolClient:
                 self._telemetry_sink(self._telemetry_snapshot())
 
     def _telemetry_snapshot(self, scope_id: str | None = None) -> dict:
-        calls = [call for call in self.calls if scope_id is None or call.get("scope_id") == scope_id]
-        calls = sorted(calls, key=lambda call: (call.get("logical_order", 0), call.get("attempt", 0)))
-        return {"schema_version": 2, "provider": "gemini_developer_api", "model": self.config.model, "calls": calls, "contract_failures": self.contract_failures, "max_active_by_stage": self.max_active_by_stage}
+        calls = sorted(self.calls, key=lambda call: (call.get("logical_order", 0), call.get("attempt", 0)))
+        snapshot = {"schema_version": 2, "provider": "gemini_developer_api", "model": self.config.model, "calls": calls, "contract_failures": self.contract_failures, "max_active_by_stage": self.max_active_by_stage}
+        return scope_projection(snapshot, scope_id) if scope_id is not None else snapshot
 
     def telemetry(self, scope_id: str | None = None) -> dict:
         with self._lock:
