@@ -192,6 +192,40 @@ def test_transition_payload_pins_evidence_contract(tmp_path):
     assert "Select and copy the exact evidence excerpt before composing the reason." in contract
     assert "Do not derive the excerpt from the reason or adaptation summary." in contract
     assert "8 to 400 characters are accepted; roughly 20 to 120 characters are recommended" in contract
+    assert "evidence_refs must equal the sorted unique ref values cited across all adaptation-decision evidence items." in contract
+
+
+def test_transition_payload_pins_continuity_contract(tmp_path):
+    episode_id = "episode_007"
+    next_id = "episode_008"
+    episode_dir = tmp_path / "episodes" / episode_id
+    episode_dir.mkdir(parents=True)
+    (episode_dir / "final.md").write_text("An exact final excerpt for the transition artifact.", encoding="utf-8")
+    write_json(episode_dir / "episode_plan.json", {"objective": "A safe JSON excerpt."})
+    write_json(episode_dir / "memory_update.json", {"summary": "A memory update excerpt."})
+    write_json(episode_dir / "memory_after.json", {"summary": "A memory after excerpt."})
+
+    payload = PilotPipeline(object(), scenario="pass", mode="mock")._transition_payload(
+        tmp_path,
+        {"pilot_id": "pilot-test", "episode_ids": [episode_id, next_id]},
+        episode_id,
+        next_id,
+        {"rolling_plan": {"immediate_horizon": ["next item"], "near_horizon": []}, "required_next_episode_continuity": []},
+        0,
+    )
+    contract = payload["continuity_contract"]
+
+    assert isinstance(contract, str) and contract
+    assert "Partition the provided required_next_episode_continuity list exactly" in contract
+    assert "every item must appear exactly once" in contract
+    assert "copied character-for-character unchanged" in contract
+    assert "continuity_satisfied holds items fulfilled by the completed episode's final prose or memory results" in contract
+    assert "continuity_deferred holds items still pending, which are carried to the next episode source" in contract
+    assert "Never add, rewrite, merge, split, or omit items" in contract
+    assert "Never insert memory facts, relationships, or any string that is not in required_next_episode_continuity into either list." in contract
+    assert "The two lists must not overlap" in contract
+    assert "An empty list is valid when nothing falls in that category" in contract
+    assert "adaptation_summary must be a non-blank string" in contract
 
 
 def _client(tmp_path, key_count: int = 11) -> tuple[GemmaPoolClient, dict[str, _Provider]]:
