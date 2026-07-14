@@ -549,19 +549,3 @@ def validate_grounded_pilot_acceptance(value: object, workers: list[dict]) -> di
     if value != aggregate_pilot_acceptance(workers):
         raise ContractError("pilot acceptance does not match its deterministic aggregation")
     return value
-
-
-def validate_pilot_acceptance(value: dict, evidence_refs: list[str]) -> dict:
-    required = {"verdict", "dimension_results", "critical_findings", "strengths_to_preserve", "evidence_refs"}
-    if set(value) != required or value["verdict"] not in {"PASS", "HOLD"} or set(value["dimension_results"]) != set(PILOT_REVIEW_ROLES):
-        raise ContractError("invalid pilot acceptance")
-    dimensions = value["dimension_results"]
-    if any(result not in {"PASS", "HOLD"} for result in dimensions.values()) or not isinstance(value["critical_findings"], list) or len(value["critical_findings"]) > 7 or len(value["critical_findings"]) != len(set(value["critical_findings"])):
-        raise ContractError("invalid pilot acceptance findings")
-    if value["verdict"] == "PASS" and (any(result != "PASS" for result in dimensions.values()) or value["critical_findings"]):
-        raise ContractError("pilot PASS has unresolved findings")
-    if value["verdict"] == "HOLD" and (all(result == "PASS" for result in dimensions.values()) or not value["critical_findings"]):
-        raise ContractError("pilot HOLD lacks critical finding")
-    if not isinstance(value["evidence_refs"], list) or not value["evidence_refs"] or set(value["evidence_refs"]) - set(evidence_refs):
-        raise ContractError("invalid pilot acceptance evidence")
-    return value

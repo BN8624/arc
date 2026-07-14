@@ -7,7 +7,7 @@ from pathlib import Path
 from .contracts import ContractError, parse_object, validate_worker
 from .live_model import scope_projection
 from .pipeline import MockPipeline, WaveCheckpoint, status
-from .pilot_contracts import PILOT_REVIEW_ROLES, ROLLING_PLAN_HORIZON_LIMITS, STABLE_MEMORY_FIELDS, TRANSITION_ACTIONS, TRANSITION_CONTRACT_VERSION, TRANSITION_EVIDENCE_FILES, TRANSITION_RESPONSE_FIELDS, TRANSITION_SCHEMA_VERSION, canonical_bytes, rolling_plan_hash, transition_action_counts, validate_pilot_acceptance, validate_pilot_fixture, validate_transition, validate_transition_response
+from .pilot_contracts import ACCEPTANCE_EXCERPT_MAX_CHARACTERS, ACCEPTANCE_EXCERPT_MIN_CHARACTERS, ACCEPTANCE_RUBRIC, ACCEPTANCE_RUBRIC_VERSION, PILOT_REVIEW_ROLES, ROLLING_PLAN_HORIZON_LIMITS, STABLE_MEMORY_FIELDS, TRANSITION_ACTIONS, TRANSITION_CONTRACT_VERSION, TRANSITION_EVIDENCE_FILES, TRANSITION_RESPONSE_FIELDS, TRANSITION_SCHEMA_VERSION, acceptance_catalog_plan, aggregate_pilot_acceptance, canonical_bytes, rolling_plan_hash, transition_action_counts, validate_acceptance_worker, validate_grounded_pilot_acceptance, validate_pilot_fixture, validate_transition, validate_transition_response
 from .storage import StorageError, read_json, sha256_bytes, sha256_file, write_json
 
 PROJECTION_CURRENT = "CURRENT"
@@ -139,7 +139,7 @@ class PilotPipeline:
                 else:
                     self._verify_completed_transition(run_dir, manifest, transition_id, episode_id, ids[index + 1], source, index)
         if "pilot_acceptance.json" not in manifest["artifact_hashes"]:
-            evidence = self._write_evidence_packet(run_dir, manifest)
+            catalog = self._write_evidence_packet(run_dir, manifest)
             self._save_checkpoint(run_dir, manifest)
             workers_path = run_dir / "pilot_review_workers.json"
             if workers_path.exists():
@@ -149,17 +149,26 @@ class PilotPipeline:
                 if not isinstance(workers, list) or [worker.get("role") for worker in workers] != PILOT_REVIEW_ROLES:
                     raise PilotError("invalid canonical pilot review workers")
                 for worker in workers:
-                    self._review_worker_contract(worker, worker["role"])
+                    self._review_worker_contract(worker, worker["role"], catalog, manifest["episode_ids"])
             else:
-                workers = self._review_workers(run_dir, manifest, evidence)
+                workers = self._review_workers(run_dir, manifest, catalog)
                 self._save_checkpoint(run_dir, manifest)
                 self._write_artifact(run_dir, manifest, "pilot_review_workers.json", workers)
-            acceptance = self._acceptance(evidence, workers)
+            acceptance = aggregate_pilot_acceptance(workers)
             self._write_artifact(run_dir, manifest, "pilot_acceptance.json", acceptance)
             manifest["acceptance_verdict"] = acceptance["verdict"]
         else:
+            catalog = build_acceptance_evidence_catalog(run_dir, manifest)
+            workers_path = run_dir / "pilot_review_workers.json"
+            if manifest["artifact_hashes"].get("pilot_review_workers.json") != sha256_file(workers_path):
+                raise PilotError("pilot review worker hash mismatch")
+            workers = read_json(workers_path)
+            if not isinstance(workers, list) or [worker.get("role") for worker in workers] != PILOT_REVIEW_ROLES:
+                raise PilotError("invalid canonical pilot review workers")
+            for worker in workers:
+                self._review_worker_contract(worker, worker["role"], catalog, manifest["episode_ids"])
             acceptance = read_json(run_dir / "pilot_acceptance.json")
-            validate_pilot_acceptance(acceptance, self._evidence_refs(manifest))
+            validate_grounded_pilot_acceptance(acceptance, workers)
             manifest["acceptance_verdict"] = acceptance["verdict"]
         manifest["status"] = "COMPLETE" if manifest["acceptance_verdict"] == "PASS" else "HOLD"
         manifest["active_episode_id"] = None
@@ -303,38 +312,31 @@ class PilotPipeline:
                 raise PilotError("transition mutated stable memory")
         return next_source
 
-    def _write_evidence_packet(self, run_dir: Path, manifest: dict) -> list[str]:
-        evidence = {"pilot_id": manifest["pilot_id"], "episode_ids": manifest["episode_ids"], "episodes": [], "transitions": [], "rolling_plan_hashes": [], "rolling_plan_adaptation": rolling_plan_adaptation_summary(run_dir, manifest)}
-        refs = []
+    def _write_evidence_packet(self, run_dir: Path, manifest: dict) -> list[dict]:
+        catalog = build_acceptance_evidence_catalog(run_dir, manifest)
+        evidence = {"pilot_id": manifest["pilot_id"], "episode_ids": manifest["episode_ids"], "episodes": [], "transitions": [], "rolling_plan_hashes": [], "rolling_plan_adaptation": rolling_plan_adaptation_summary(run_dir, manifest), "acceptance_evidence_catalog": catalog, "acceptance_rubric_version": ACCEPTANCE_RUBRIC_VERSION}
         for episode_id in manifest["episode_ids"]:
             root = run_dir / "episodes" / episode_id
             source = read_json(run_dir / "episode_sources" / f"{episode_id}.json")
             evidence["episodes"].append({"episode_id": episode_id, "plan": read_json(root / "episode_plan.json"), "final": (root / "final.md").read_text(encoding="utf-8"), "review_verdict": read_json(root / "review_decision.json")["verdict"], "writer_call_count": read_json(root / "manifest.json")["writer_call_count"], "revision_count": read_json(root / "manifest.json")["revision_count"], "memory_before": {field: source[field] for field in STABLE_MEMORY_FIELDS}, "memory_after": {field: read_json(root / "memory_after.json")[field] for field in STABLE_MEMORY_FIELDS}})
             evidence["rolling_plan_hashes"].append(sha256_bytes(canonical_bytes(source["rolling_plan"])))
-            refs.extend([f"episodes/{episode_id}/final.md", f"episodes/{episode_id}/memory_after.json"])
         for episode_id, next_id in zip(manifest["episode_ids"], manifest["episode_ids"][1:]):
-            name = f"transitions/{episode_id}_to_{next_id}.json"
-            evidence["transitions"].append(read_json(run_dir / name))
-            refs.append(name)
+            evidence["transitions"].append(read_json(run_dir / f"transitions/{episode_id}_to_{next_id}.json"))
         self._write_artifact(run_dir, manifest, "pilot_evidence_packet.json", evidence)
-        return refs
+        return catalog
 
-    def _evidence_refs(self, manifest: dict) -> list[str]:
-        refs = []
-        for episode_id in manifest["episode_ids"]:
-            refs.extend([f"episodes/{episode_id}/final.md", f"episodes/{episode_id}/memory_after.json"])
-        for episode_id, next_id in zip(manifest["episode_ids"], manifest["episode_ids"][1:]):
-            refs.append(f"transitions/{episode_id}_to_{next_id}.json")
-        return refs
-
-    def _review_workers(self, run_dir: Path, manifest: dict, evidence_refs: list[str]) -> list[dict]:
+    def _review_workers(self, run_dir: Path, manifest: dict, catalog: list[dict]) -> list[dict]:
         evidence_hash = manifest["artifact_hashes"]["pilot_evidence_packet.json"]
-        checkpoint = WaveCheckpoint(run_dir / "pilot_review_workers.partial.json", "pilot_review", {"pilot_id": manifest["pilot_id"], "mode": manifest["mode"], "scenario": self.scenario, "episode_ids": manifest["episode_ids"], "evidence_packet_hash": evidence_hash}, PILOT_REVIEW_ROLES)
-        workers = [checkpoint.result(role) for role in PILOT_REVIEW_ROLES if checkpoint.result(role)]
+        checkpoint = WaveCheckpoint(run_dir / "pilot_review_workers.partial.json", "pilot_review", {"pilot_id": manifest["pilot_id"], "mode": manifest["mode"], "scenario": self.scenario, "episode_ids": manifest["episode_ids"], "evidence_packet_hash": evidence_hash, "acceptance_rubric_version": ACCEPTANCE_RUBRIC_VERSION}, PILOT_REVIEW_ROLES)
+        workers = []
+        for role in PILOT_REVIEW_ROLES:
+            completed = checkpoint.result(role)
+            if completed:
+                workers.append(self._review_worker_contract(completed, role, catalog, manifest["episode_ids"]))
         first_error = None
         from concurrent.futures import ThreadPoolExecutor, as_completed
         with ThreadPoolExecutor(max_workers=len(PILOT_REVIEW_ROLES)) as executor:
-            futures = {executor.submit(self._review_worker, run_dir, manifest, role, evidence_hash): role for role in PILOT_REVIEW_ROLES if not checkpoint.result(role)}
+            futures = {executor.submit(self._review_worker, run_dir, manifest, role, evidence_hash, catalog): role for role in PILOT_REVIEW_ROLES if not checkpoint.result(role)}
             for future in as_completed(futures):
                 try:
                     worker = future.result()
@@ -346,32 +348,41 @@ class PilotPipeline:
             raise first_error
         return sorted(workers, key=lambda worker: PILOT_REVIEW_ROLES.index(worker["role"]))
 
-    def _review_worker(self, run_dir: Path, manifest: dict, role: str, evidence_hash: str) -> dict:
-        payload = {"pilot_id": manifest["pilot_id"], "mode": manifest["mode"], "scenario": self.scenario, "episode_ids": manifest["episode_ids"], "evidence_packet_hash": evidence_hash, "dimension": role, "allowed_evidence_refs": ["pilot_evidence_packet.json"], "contract": "proposal.dimension_result is PASS or HOLD; HOLD requires proposal.critical_finding"}
-        if self.mode == "live":
-            payload.update({"pilot_evidence_packet": read_json(run_dir / "pilot_evidence_packet.json"), "dimension_question": f"Evaluate pilot dimension: {role}.", "strict_output_schema": {"worker_id": f"pilot_review-{role}", "role": role, "verdict": "OK", "primary_finding": "string", "primary_risk": "string", "evidence_refs": ["pilot_evidence_packet.json"], "proposal": {"dimension_result": "PASS|HOLD", "critical_finding": "string|null"}}})
+    def _review_worker_payload(self, manifest: dict, role: str, evidence_hash: str, catalog: list[dict]) -> dict:
+        dimension = next(item for item in ACCEPTANCE_RUBRIC if item["dimension"] == role)
+        return {
+            "pilot_id": manifest["pilot_id"],
+            "mode": manifest["mode"],
+            "scenario": self.scenario,
+            "episode_ids": manifest["episode_ids"],
+            "evidence_packet_hash": evidence_hash,
+            "acceptance_rubric_version": ACCEPTANCE_RUBRIC_VERSION,
+            "dimension": role,
+            "dimension_title": dimension["title"],
+            "dimension_question": dimension["question"],
+            "criteria": dimension["criteria"],
+            "coverage_rule": dimension["coverage_rule"],
+            "evidence_catalog": catalog,
+            "evidence_contract": f"Cite only refs from evidence_catalog. Every evidence item needs an excerpt of {ACCEPTANCE_EXCERPT_MIN_CHARACTERS} to {ACCEPTANCE_EXCERPT_MAX_CHARACTERS} characters copied verbatim from that artifact's content, each criterion needs at least one evidence item per required evidence kind without duplicate items, top-level evidence_refs must equal the sorted unique refs cited by criterion_results and strengths, and coverage_refs must be the sorted unique refs you actually reviewed, containing every cited ref and satisfying coverage_rule.",
+            "consistency_contract": "dimension_result is PASS only when every criterion result is PASS, critical_finding is null, and at least one grounded strength exists. dimension_result is HOLD when at least one criterion result is HOLD and critical_finding names one HOLD criterion_id with a non-blank finding. Strengths attach only to PASS criteria of this dimension, at most two, each a concrete statement with verbatim evidence.",
+            "strict_output_schema": {"worker_id": f"pilot_review-{role}", "role": role, "verdict": "OK", "primary_finding": "string", "primary_risk": "string", "evidence_refs": ["string"], "proposal": {"dimension_result": "PASS|HOLD", "criterion_results": [{"criterion_id": "string", "result": "PASS|HOLD", "finding": "string", "evidence": [{"ref": "string", "excerpt": "string"}]}], "critical_finding": {"criterion_id": "string", "finding": "string"}, "strengths": [{"criterion_id": "string", "strength": "string", "evidence": [{"ref": "string", "excerpt": "string"}]}], "coverage_refs": ["string"]}},
+        }
+
+    def _review_worker(self, run_dir: Path, manifest: dict, role: str, evidence_hash: str, catalog: list[dict]) -> dict:
+        payload = self._review_worker_payload(manifest, role, evidence_hash, catalog)
         prompt = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         client = self._acceptance_client() if self.mode == "live" else self.client
         try:
             value = parse_object(client.generate(stage="pilot_review", role=role, prompt=prompt))
-            return self._review_worker_contract(value, role)
-        except ContractError:
+            return self._review_worker_contract(value, role, catalog, manifest["episode_ids"])
+        except ContractError as error:
             if self.mode == "live":
-                client.record_contract_failure("pilot_review", role, "UNKNOWN")
+                client.record_contract_failure("pilot_review", role, contract_code=error.contract_code or "PILOT_REVIEW_RESPONSE_NOT_OBJECT")
             raise
 
-    def _review_worker_contract(self, value: dict, role: str) -> dict:
-        worker = validate_worker(value, f"pilot_review-{role}", role)
-        proposal = worker["proposal"]
-        if set(proposal) != {"dimension_result", "critical_finding"} or proposal["dimension_result"] not in {"PASS", "HOLD"} or worker["evidence_refs"] != ["pilot_evidence_packet.json"] or (proposal["dimension_result"] == "PASS" and proposal["critical_finding"] is not None) or (proposal["dimension_result"] == "HOLD" and (not isinstance(proposal["critical_finding"], str) or not proposal["critical_finding"])):
-            raise PilotError("invalid pilot review worker")
-        return worker
-
-    def _acceptance(self, evidence_refs: list[str], workers: list[dict]) -> dict:
-        dimensions = {worker["role"]: worker["proposal"]["dimension_result"] for worker in workers}
-        findings = [worker["proposal"]["critical_finding"] for worker in workers if worker["proposal"]["critical_finding"]]
-        value = {"verdict": "PASS" if all(item == "PASS" for item in dimensions.values()) else "HOLD", "dimension_results": dimensions, "critical_findings": findings, "strengths_to_preserve": ["synthetic continuity evidence"], "evidence_refs": evidence_refs}
-        return validate_pilot_acceptance(value, evidence_refs)
+    def _review_worker_contract(self, value: dict, role: str, catalog: list[dict], episode_ids: list[str]) -> dict:
+        validate_worker(value, f"pilot_review-{role}", role)
+        return validate_acceptance_worker(value, role, catalog, episode_ids)
 
     def _write_artifact(self, run_dir: Path, manifest: dict, name: str, value: dict | list) -> None:
         manifest["artifact_hashes"][name] = write_json(run_dir / name, value)
@@ -483,6 +494,28 @@ def rolling_plan_adaptation_summary(run_dir: Path, manifest: dict) -> dict:
         "non_keep_action_count": non_keep,
         "adaptation_proven": transition_count > 0 and validated == transition_count and non_keep >= 1,
     }
+
+
+def build_acceptance_evidence_catalog(run_dir: Path, manifest: dict) -> list[dict]:
+    """Build the granular acceptance evidence catalog from actual pilot artifacts."""
+    catalog = []
+    episode_hashes: dict[str, dict] = {}
+    for ref, kind, episode_id in acceptance_catalog_plan(manifest["episode_ids"]):
+        path = run_dir / ref
+        if not path.exists():
+            raise PilotError(f"acceptance evidence artifact missing: {ref}")
+        content = path.read_bytes().decode("utf-8")
+        digest = sha256_bytes(content.encode("utf-8"))
+        if ref.startswith("episodes/"):
+            if episode_id not in episode_hashes:
+                episode_hashes[episode_id] = read_json(run_dir / "episodes" / episode_id / "manifest.json").get("artifact_hashes", {})
+            pinned = episode_hashes[episode_id].get(path.name)
+        else:
+            pinned = manifest["artifact_hashes"].get(ref)
+        if pinned != digest:
+            raise PilotError(f"acceptance evidence artifact hash mismatch: {ref}")
+        catalog.append({"ref": ref, "kind": kind, "episode_id": episode_id, "sha256": digest, "content": content})
+    return catalog
 
 
 def _read_transition_receipt(receipt_path: Path, transition_id: str, episode_id: str, next_id: str, input_hash: str | None) -> dict | None:

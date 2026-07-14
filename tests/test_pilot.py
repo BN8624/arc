@@ -179,16 +179,52 @@ def test_legacy_v1_transition_is_diagnosed_and_not_adaptation_evidence(tmp_path:
         PilotPipeline(MockModelClient("pass"), "pass").run(FIXTURE, output)
 
 
-def test_mock_pilot_output_contains_no_transition_synthetic_markers(tmp_path: Path) -> None:
+def test_mock_pilot_output_contains_no_synthetic_markers(tmp_path: Path) -> None:
     _, output = run(tmp_path)
     for path in output.rglob("*"):
         if not path.is_file():
             continue
         text = path.read_text(encoding="utf-8")
-        for marker in ("synthetic transition toward", "synthetic pilot role", "Synthetic plan adapts"):
+        for marker in ("synthetic transition toward", "synthetic pilot role", "Synthetic plan adapts", "synthetic continuity evidence", "Evaluate pilot dimension:"):
             assert marker not in text, f"{marker} in {path}"
-    # acceptance의 하드코딩된 "synthetic continuity evidence"는 이번 작업 범위 밖의 별도 미해결 항목으로 남는다.
-    assert "synthetic continuity evidence" in (output / "pilot_acceptance.json").read_text(encoding="utf-8")
+
+
+def test_mock_pass_acceptance_is_grounded_schema_v2(tmp_path: Path) -> None:
+    _, output = run(tmp_path)
+    acceptance = json.loads((output / "pilot_acceptance.json").read_text(encoding="utf-8"))
+    assert acceptance["schema_version"] == 2
+    assert acceptance["rubric_version"] == 1
+    assert acceptance["verdict"] == "PASS"
+    assert acceptance["critical_findings"] == []
+    assert len(acceptance["strengths_to_preserve"]) == 7
+    workers = json.loads((output / "pilot_review_workers.json").read_text(encoding="utf-8"))
+    derived = [{"dimension": worker["role"], **strength} for worker in workers for strength in worker["proposal"]["strengths"]]
+    assert acceptance["strengths_to_preserve"] == derived
+    assert acceptance["evidence_refs"] == sorted(set(acceptance["evidence_refs"]))
+    assert "pilot_evidence_packet.json" not in acceptance["evidence_refs"]
+    packet = json.loads((output / "pilot_evidence_packet.json").read_text(encoding="utf-8"))
+    assert packet["acceptance_rubric_version"] == 1
+    catalog_refs = {entry["ref"] for entry in packet["acceptance_evidence_catalog"]}
+    assert len(catalog_refs) == 34
+    assert set(acceptance["evidence_refs"]) <= catalog_refs
+    for worker in workers:
+        assert worker["proposal"]["coverage_refs"]
+        assert all(result["evidence"] for result in worker["proposal"]["criterion_results"])
+
+
+def test_mock_hold_acceptance_is_grounded(tmp_path: Path) -> None:
+    _, output = run(tmp_path, "pilot_hold")
+    acceptance = json.loads((output / "pilot_acceptance.json").read_text(encoding="utf-8"))
+    assert acceptance["schema_version"] == 2
+    assert acceptance["verdict"] == "HOLD"
+    assert acceptance["dimension_results"]["continuity"] == "HOLD"
+    assert len(acceptance["critical_findings"]) == 1
+    finding = acceptance["critical_findings"][0]
+    assert finding["dimension"] == "continuity"
+    assert finding["criterion_id"] == "continuity.required_obligations"
+    assert finding["evidence"]
+    assert len(acceptance["strengths_to_preserve"]) == 7
+    assert all(strength["evidence"] for strength in acceptance["strengths_to_preserve"])
 
 
 def test_pilot_fixture_rejects_duplicate_episode_ids() -> None:
@@ -364,7 +400,7 @@ def _acceptance_restart(tmp_path: Path) -> tuple[Path, dict]:
 
 
 def _review_input(manifest: dict) -> dict:
-    return {"pilot_id": manifest["pilot_id"], "mode": manifest["mode"], "scenario": manifest["scenario"], "episode_ids": manifest["episode_ids"], "evidence_packet_hash": manifest["artifact_hashes"]["pilot_evidence_packet.json"]}
+    return {"pilot_id": manifest["pilot_id"], "mode": manifest["mode"], "scenario": manifest["scenario"], "episode_ids": manifest["episode_ids"], "evidence_packet_hash": manifest["artifact_hashes"]["pilot_evidence_packet.json"], "acceptance_rubric_version": 1}
 
 
 def _review_worker(role: str) -> dict:

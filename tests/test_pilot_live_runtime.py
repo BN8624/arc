@@ -10,10 +10,10 @@ from pathlib import Path
 import pytest
 
 from arc.contracts import ContractError, PROSE_FORBIDDEN_MARKERS, PROSE_MAX_CHARACTERS, PROSE_MIN_CHARACTERS, PROSE_REPAIRABLE_MIN_CHARACTERS, validate_draft_prose, validate_prose
-from arc.mock_model import transition_adapter_response
+from arc.mock_model import acceptance_review_response, transition_adapter_response
 from arc.live_model import AtomicTelemetryStore, GemmaPoolClient, LiveCallError, LiveConfig, MODEL_NAME, RoutingStateStore
 from arc.pipeline import PLANNING_ROLES, MockPipeline, WaveCheckpoint, status
-from arc.pilot_contracts import PILOT_REVIEW_ROLES
+from arc.pilot_contracts import ACCEPTANCE_GENERIC_QUESTION_MARKER, PILOT_REVIEW_ROLES
 from arc.pilot import PilotError, PilotPipeline, classify_episode_projection, episode_projection_document, inspect_pilot_checkpoint, live_telemetry_checkpoint, reconcile_live_telemetry_projections, reconcile_pilot_checkpoint
 from arc.storage import StorageError, read_json, write_json
 
@@ -115,8 +115,7 @@ class _PilotProviderRoot:
             if marker == self.malformed_once_at and marker not in self.malformed:
                 self.malformed.add(marker)
                 return "{malformed"
-            hold = role == self.hold_dimension
-            return json.dumps({"worker_id": f"pilot_review-{role}", "role": role, "verdict": "OK", "primary_finding": f"synthetic {role} finding", "primary_risk": f"synthetic {role} risk", "evidence_refs": ["pilot_evidence_packet.json"], "proposal": {"dimension_result": "HOLD" if hold else "PASS", "critical_finding": f"synthetic {role} hold" if hold else None}})
+            return json.dumps(acceptance_review_response(payload, hold=role == self.hold_dimension), ensure_ascii=False)
         if stage == "planning_merge":
             if self.wrong_plan_once and "planning_merge:merge" not in self.malformed and (self.wrong_plan_episode is None or episode_id == self.wrong_plan_episode):
                 self.malformed.add("planning_merge:merge")
@@ -338,10 +337,6 @@ def _make_legacy_writer_output(tmp_path: Path, *, ambiguous: str | None = None) 
     return output
 
 
-def _acceptance_worker(role: str) -> dict:
-    return {"worker_id": f"pilot_review-{role}", "role": role, "verdict": "OK", "primary_finding": f"synthetic {role} finding", "primary_risk": f"synthetic {role} risk", "evidence_refs": ["pilot_evidence_packet.json"], "proposal": {"dimension_result": "PASS", "critical_finding": None}}
-
-
 def _make_acceptance_partial_output(tmp_path: Path) -> Path:
     output = tmp_path / "pilot-live"
     client, _ = _pilot_client(output)
@@ -349,17 +344,18 @@ def _make_acceptance_partial_output(tmp_path: Path) -> Path:
 
     manifest = read_json(output / "pilot_manifest.json")
     completed_roles = ["readability", "character_consistency", "continuity"]
+    workers = {worker["role"]: worker for worker in read_json(output / "pilot_review_workers.json")}
     (output / "pilot_review_workers.json").unlink(missing_ok=True)
     (output / "pilot_acceptance.json").unlink(missing_ok=True)
 
     checkpoint = WaveCheckpoint(
         output / "pilot_review_workers.partial.json",
         "pilot_review",
-        {"pilot_id": manifest["pilot_id"], "mode": manifest["mode"], "scenario": manifest["scenario"], "episode_ids": manifest["episode_ids"], "evidence_packet_hash": manifest["artifact_hashes"]["pilot_evidence_packet.json"]},
+        {"pilot_id": manifest["pilot_id"], "mode": manifest["mode"], "scenario": manifest["scenario"], "episode_ids": manifest["episode_ids"], "evidence_packet_hash": manifest["artifact_hashes"]["pilot_evidence_packet.json"], "acceptance_rubric_version": 1},
         PILOT_REVIEW_ROLES,
     )
     for role in completed_roles:
-        checkpoint.save(role, _acceptance_worker(role))
+        checkpoint.save(role, workers[role])
 
     telemetry = read_json(output / "pilot_live_calls.json")
     kept_calls = [call for call in telemetry["calls"] if call["scope_id"] != "pilot:acceptance" or call["role"] in completed_roles]
@@ -2007,16 +2003,27 @@ def _acceptance_prompts(provider_root: _PilotProviderRoot) -> list[str]:
     return [prompt for _, marker, prompt in provider_root.provider_calls if marker.startswith("pilot_review:")]
 
 
-def test_live_acceptance_prompt_contains_canonical_evidence(tmp_path):
+def test_live_acceptance_prompt_contains_dimension_rubric_and_catalog(tmp_path):
     output = tmp_path / "pilot-live"
     client, provider_root = _pilot_client(output)
 
     PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
 
-    prompt = json.loads(_acceptance_prompts(provider_root)[0])
-    assert prompt["pilot_id"] == read_json(output / "pilot_manifest.json")["pilot_id"]
-    assert len(prompt["pilot_evidence_packet"]["episodes"]) == 5
-    assert "final" in prompt["pilot_evidence_packet"]["episodes"][0]
+    payloads = [json.loads(prompt) for prompt in _acceptance_prompts(provider_root)]
+    manifest = read_json(output / "pilot_manifest.json")
+    assert len(payloads) == 7
+    questions = {payload["dimension_question"] for payload in payloads}
+    assert len(questions) == 7
+    assert all(ACCEPTANCE_GENERIC_QUESTION_MARKER not in question for question in questions)
+    for payload in payloads:
+        assert payload["pilot_id"] == manifest["pilot_id"]
+        assert payload["acceptance_rubric_version"] == 1
+        assert all(criterion["criterion_id"].startswith(f"{payload['dimension']}.") for criterion in payload["criteria"])
+        assert 2 <= len(payload["criteria"]) <= 4
+        assert len(payload["evidence_catalog"]) == 34
+        assert {entry["kind"] for entry in payload["evidence_catalog"]} == {"episode_final", "episode_plan", "episode_review", "episode_memory_update", "episode_memory_after", "episode_source", "transition"}
+        assert set(payload["strict_output_schema"]["proposal"]) == {"dimension_result", "criterion_results", "critical_finding", "strengths", "coverage_refs"}
+        assert "coverage_rule" in payload and "evidence_contract" in payload
 
 
 def test_live_acceptance_prompt_is_deterministic(tmp_path):
