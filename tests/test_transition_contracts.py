@@ -7,7 +7,8 @@ from pathlib import Path
 import pytest
 
 from arc.contracts import ContractError
-from arc.pilot_contracts import rolling_plan_hash, transition_action_counts, validate_rolling_plan, validate_transition, validate_transition_response
+from arc.evidence_candidates import build_evidence_candidate_catalog
+from arc.pilot_contracts import materialize_transition_response, rolling_plan_hash, transition_action_counts, validate_rolling_plan, validate_transition, validate_transition_response
 from arc.storage import write_json
 
 
@@ -312,14 +313,65 @@ def test_schema_field_mismatch_fails(tmp_path):
 
 
 def test_transition_response_shape():
-    response = {name: None for name in ("next_episode", "rolling_plan_after", "adaptation_decisions", "continuity_satisfied", "continuity_deferred", "adaptation_summary", "evidence_refs")}
+    response = {name: None for name in ("next_episode", "rolling_plan_after", "continuity_satisfied", "continuity_deferred", "adaptation_summary")}
+    response["adaptation_decisions"] = [{name: None for name in ("action", "horizon_before", "item_before", "horizon_after", "item_after", "reason", "evidence_candidate_ids")}]
     assert validate_transition_response(response) is response
     with pytest.raises(ContractError) as error:
         validate_transition_response([])
     assert error.value.contract_code == "TRANSITION_RESPONSE_NOT_OBJECT"
-    for mutate in (lambda value: value.pop("evidence_refs"), lambda value: value.update(transition_input_hash="x")):
+    for mutate in (lambda value: value.pop("adaptation_decisions"), lambda value: value.update(transition_input_hash="x")):
         value = dict(response)
         mutate(value)
         with pytest.raises(ContractError) as fields_error:
             validate_transition_response(value)
-        assert fields_error.value.contract_code == "TRANSITION_FIELDS_MISMATCH"
+        assert fields_error.value.contract_code == "TRANSITION_PROVIDER_FIELDS_MISMATCH"
+
+
+def _provider_response(catalog: list) -> dict:
+    canonical = _transition()
+    selected = [catalog[-1].candidate_id, catalog[0].candidate_id, catalog[-1].candidate_id]
+    return {
+        field: canonical[field]
+        for field in ("next_episode", "rolling_plan_after", "continuity_satisfied", "continuity_deferred", "adaptation_summary")
+    } | {
+        "adaptation_decisions": [
+            {key: value for key, value in decision.items() if key != "evidence"} | {"evidence_candidate_ids": selected}
+            for decision in canonical["adaptation_decisions"]
+        ]
+    }
+
+
+def test_transition_provider_candidates_materialize_in_catalog_order(tmp_path):
+    run_dir = _artifacts(tmp_path)
+    catalog = build_evidence_candidate_catalog({
+        f"episodes/{EPISODE_ID}/episode_plan.json": run_dir / "episodes" / EPISODE_ID / "episode_plan.json",
+        FINAL_REF: run_dir / "episodes" / EPISODE_ID / "final.md",
+        f"episodes/{EPISODE_ID}/memory_update.json": run_dir / "episodes" / EPISODE_ID / "memory_update.json",
+        f"episodes/{EPISODE_ID}/memory_after.json": run_dir / "episodes" / EPISODE_ID / "memory_after.json",
+    })
+    materialized = materialize_transition_response(_provider_response(catalog), catalog)
+    expected = [{"ref": catalog[0].ref, "excerpt": catalog[0].excerpt}, {"ref": catalog[-1].ref, "excerpt": catalog[-1].excerpt}]
+    assert materialized["adaptation_decisions"][0]["evidence"] == expected
+    assert materialized["evidence_refs"] == sorted({item["ref"] for item in expected})
+    assert all("evidence_candidate_ids" not in decision for decision in materialized["adaptation_decisions"])
+
+
+@pytest.mark.parametrize(
+    ("mutate", "code"),
+    [
+        (lambda response: response["adaptation_decisions"][0].update(evidence_candidate_ids=[]), "EVIDENCE_CANDIDATE_SELECTION_INVALID"),
+        (lambda response: response["adaptation_decisions"][0].update(evidence_candidate_ids=["EC_000000000000"]), "EVIDENCE_CANDIDATE_UNKNOWN"),
+        (lambda response: response["adaptation_decisions"][0].update(evidence=[{"ref": FINAL_REF, "excerpt": FINAL_TEXT}]), "TRANSITION_PROVIDER_FIELDS_MISMATCH"),
+    ],
+)
+def test_transition_provider_candidate_contract_failures(tmp_path, mutate, code):
+    run_dir = _artifacts(tmp_path)
+    catalog = build_evidence_candidate_catalog({
+        f"episodes/{EPISODE_ID}/{name}": run_dir / "episodes" / EPISODE_ID / name
+        for name in ("episode_plan.json", "final.md", "memory_update.json", "memory_after.json")
+    })
+    response = _provider_response(catalog)
+    mutate(response)
+    with pytest.raises(ContractError) as error:
+        materialize_transition_response(response, catalog)
+    assert error.value.contract_code == code

@@ -6,12 +6,13 @@ import json
 from pathlib import Path
 
 from .contracts import ContractError, validate_fixture
+from .evidence_candidates import EvidenceCandidateCatalogError, materialize_candidate_ids
 
 
 PILOT_REVIEW_ROLES = ["readability", "character_consistency", "continuity", "rolling_plan_adaptation", "memory_correctness", "narrative_weight", "episode_to_episode_interest"]
 STABLE_MEMORY_FIELDS = ("series_compass", "world_rules", "characters", "confirmed_facts", "relationship_state", "open_conflicts", "promises", "episode_summaries", "important_excerpts")
 TRANSITION_SCHEMA_VERSION = 2
-TRANSITION_CONTRACT_VERSION = 1
+TRANSITION_CONTRACT_VERSION = 2
 TRANSITION_ACTIONS = ("KEEP", "CHANGE", "DROP", "ADD")
 ROLLING_PLAN_HORIZONS = ("immediate_horizon", "near_horizon")
 ROLLING_PLAN_HORIZON_LIMITS = {"immediate_horizon": 4, "near_horizon": 8}
@@ -19,7 +20,10 @@ TRANSITION_EVIDENCE_FILES = ("episode_plan.json", "final.md", "memory_after.json
 TRANSITION_EXCERPT_MIN_CHARACTERS = 8
 TRANSITION_EXCERPT_MAX_CHARACTERS = 400
 TRANSITION_FORBIDDEN_MARKERS = ("synthetic transition toward", "synthetic pilot role", "Synthetic plan adapts")
-TRANSITION_RESPONSE_FIELDS = ("next_episode", "rolling_plan_after", "adaptation_decisions", "continuity_satisfied", "continuity_deferred", "adaptation_summary", "evidence_refs")
+TRANSITION_PROVIDER_RESPONSE_FIELDS = ("next_episode", "rolling_plan_after", "adaptation_decisions", "continuity_satisfied", "continuity_deferred", "adaptation_summary")
+TRANSITION_CANONICAL_RESPONSE_FIELDS = (*TRANSITION_PROVIDER_RESPONSE_FIELDS, "evidence_refs")
+TRANSITION_RESPONSE_FIELDS = TRANSITION_PROVIDER_RESPONSE_FIELDS
+TRANSITION_PROVIDER_DECISION_FIELDS = ("action", "horizon_before", "item_before", "horizon_after", "item_after", "reason", "evidence_candidate_ids")
 EPISODE_IMPORTANCE_VALUES = ("ordinary", "major", "pivot")
 
 
@@ -141,9 +145,49 @@ def validate_transition_evidence(decisions: list[dict], evidence_refs: object, c
 def validate_transition_response(value: object) -> dict:
     if not isinstance(value, dict):
         raise ContractError("transition response must be a JSON object", "TRANSITION_RESPONSE_NOT_OBJECT")
-    if set(value) != set(TRANSITION_RESPONSE_FIELDS):
-        raise ContractError("transition response fields mismatch", "TRANSITION_FIELDS_MISMATCH")
+    if set(value) != set(TRANSITION_PROVIDER_RESPONSE_FIELDS):
+        raise ContractError("transition provider response fields mismatch", "TRANSITION_PROVIDER_FIELDS_MISMATCH")
+    for decision in value["adaptation_decisions"] if isinstance(value["adaptation_decisions"], list) else ():
+        if not isinstance(decision, dict) or set(decision) != set(TRANSITION_PROVIDER_DECISION_FIELDS):
+            raise ContractError("transition provider decision fields mismatch", "TRANSITION_PROVIDER_FIELDS_MISMATCH")
     return value
+
+
+def materialize_transition_response(value: object, candidate_catalog: object) -> dict:
+    """Convert provider candidate selections into the unchanged canonical evidence shape."""
+    response = validate_transition_response(value)
+    if not isinstance(response["adaptation_decisions"], list):
+        raise ContractError("adaptation decisions must be a list", "EVIDENCE_CANDIDATE_SELECTION_INVALID")
+
+    materialized_decisions = []
+    refs: set[str] = set()
+    for decision in response["adaptation_decisions"]:
+        candidate_ids = decision["evidence_candidate_ids"]
+        if (
+            not isinstance(candidate_ids, list)
+            or not candidate_ids
+            or any(not isinstance(candidate_id, str) or not candidate_id.strip() for candidate_id in candidate_ids)
+        ):
+            raise ContractError("each transition decision requires candidate IDs", "EVIDENCE_CANDIDATE_SELECTION_INVALID")
+        try:
+            evidence = materialize_candidate_ids(candidate_ids, candidate_catalog)
+        except EvidenceCandidateCatalogError as error:
+            raise ContractError(str(error), getattr(error, "contract_code", "EVIDENCE_CANDIDATE_UNKNOWN")) from error
+        except TypeError as error:
+            raise ContractError("evidence candidate catalog is invalid", "EVIDENCE_CANDIDATE_CATALOG_INVALID") from error
+        refs.update(item["ref"] for item in evidence)
+        materialized_decisions.append({**decision, "evidence": evidence})
+        materialized_decisions[-1].pop("evidence_candidate_ids")
+
+    return {
+        "next_episode": response["next_episode"],
+        "rolling_plan_after": response["rolling_plan_after"],
+        "adaptation_decisions": materialized_decisions,
+        "continuity_satisfied": response["continuity_satisfied"],
+        "continuity_deferred": response["continuity_deferred"],
+        "adaptation_summary": response["adaptation_summary"],
+        "evidence_refs": sorted(refs),
+    }
 
 
 def transition_action_counts(value: dict) -> dict[str, int]:

@@ -134,9 +134,9 @@ class KeepOnlyTransitionClient(MockModelClient):
         payload = json.loads(prompt)
         completed_id = payload["completed_episode_id"]
         plan = payload["rolling_plan"]
-        evidence = [{"ref": f"episodes/{completed_id}/final.md", "excerpt": payload["final"][:64]}]
-        decisions = [{"action": "KEEP", "horizon_before": horizon, "item_before": item, "horizon_after": horizon, "item_after": item, "reason": f"The {completed_id} outcome confirms this item.", "evidence": list(evidence)} for horizon in ("immediate_horizon", "near_horizon") for item in plan[horizon]]
-        return {"next_episode": {"episode_id": payload["next_episode_id"], "importance": "ordinary", "required_role": plan["immediate_horizon"][0]}, "rolling_plan_after": {"immediate_horizon": list(plan["immediate_horizon"]), "near_horizon": list(plan["near_horizon"])}, "adaptation_decisions": decisions, "continuity_satisfied": [], "continuity_deferred": list(payload["required_next_episode_continuity"]), "adaptation_summary": f"Completed {completed_id} confirmed the existing plan without changes.", "evidence_refs": [f"episodes/{completed_id}/final.md"]}
+        candidate_id = payload["evidence_candidates"][0]["candidate_id"]
+        decisions = [{"action": "KEEP", "horizon_before": horizon, "item_before": item, "horizon_after": horizon, "item_after": item, "reason": f"The {completed_id} outcome confirms this item.", "evidence_candidate_ids": [candidate_id]} for horizon in ("immediate_horizon", "near_horizon") for item in plan[horizon]]
+        return {"next_episode": {"episode_id": payload["next_episode_id"], "importance": "ordinary", "required_role": plan["immediate_horizon"][0]}, "rolling_plan_after": {"immediate_horizon": list(plan["immediate_horizon"]), "near_horizon": list(plan["near_horizon"])}, "adaptation_decisions": decisions, "continuity_satisfied": [], "continuity_deferred": list(payload["required_next_episode_continuity"]), "adaptation_summary": f"Completed {completed_id} confirmed the existing plan without changes."}
 
 
 def test_keep_only_pilot_completes_but_is_not_adaptation_proven(tmp_path: Path) -> None:

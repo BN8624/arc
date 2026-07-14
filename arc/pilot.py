@@ -5,9 +5,10 @@ import json
 from pathlib import Path
 
 from .contracts import ContractError, parse_object, validate_worker
+from .evidence_candidates import EVIDENCE_CANDIDATE_CATALOG_VERSION, EvidenceCandidateCatalogError, build_evidence_candidate_catalog
 from .live_model import scope_projection
 from .pipeline import MockPipeline, WaveCheckpoint, status
-from .pilot_contracts import ACCEPTANCE_EXCERPT_MAX_CHARACTERS, ACCEPTANCE_EXCERPT_MIN_CHARACTERS, ACCEPTANCE_RUBRIC, ACCEPTANCE_RUBRIC_VERSION, ACCEPTANCE_SCHEMA_VERSION, PILOT_REVIEW_ROLES, ROLLING_PLAN_HORIZON_LIMITS, STABLE_MEMORY_FIELDS, TRANSITION_ACTIONS, TRANSITION_CONTRACT_VERSION, TRANSITION_EVIDENCE_FILES, TRANSITION_RESPONSE_FIELDS, TRANSITION_SCHEMA_VERSION, acceptance_catalog_plan, aggregate_pilot_acceptance, canonical_bytes, rolling_plan_hash, transition_action_counts, validate_acceptance_worker, validate_grounded_pilot_acceptance, validate_pilot_fixture, validate_transition, validate_transition_response
+from .pilot_contracts import ACCEPTANCE_EXCERPT_MAX_CHARACTERS, ACCEPTANCE_EXCERPT_MIN_CHARACTERS, ACCEPTANCE_RUBRIC, ACCEPTANCE_RUBRIC_VERSION, ACCEPTANCE_SCHEMA_VERSION, PILOT_REVIEW_ROLES, ROLLING_PLAN_HORIZON_LIMITS, STABLE_MEMORY_FIELDS, TRANSITION_ACTIONS, TRANSITION_CANONICAL_RESPONSE_FIELDS, TRANSITION_CONTRACT_VERSION, TRANSITION_EVIDENCE_FILES, TRANSITION_SCHEMA_VERSION, acceptance_catalog_plan, aggregate_pilot_acceptance, canonical_bytes, materialize_transition_response, rolling_plan_hash, transition_action_counts, validate_acceptance_worker, validate_grounded_pilot_acceptance, validate_pilot_fixture, validate_transition, validate_transition_response
 from .storage import StorageError, read_json, sha256_bytes, sha256_file, write_json
 
 PROJECTION_CURRENT = "CURRENT"
@@ -233,13 +234,14 @@ class PilotPipeline:
             "final": (episode_dir / "final.md").read_text(encoding="utf-8"),
             "memory_update": read_json(episode_dir / "memory_update.json"),
             "memory_after": read_json(episode_dir / "memory_after.json"),
-            "allowed_evidence_refs": [f"episodes/{episode_id}/{name}" for name in TRANSITION_EVIDENCE_FILES],
+            "evidence_candidate_catalog_version": EVIDENCE_CANDIDATE_CATALOG_VERSION,
+            "evidence_candidates": [candidate.to_dict() for candidate in _transition_candidate_catalog(run_dir, episode_id)],
             "plan_limits": dict(ROLLING_PLAN_HORIZON_LIMITS),
-            "action_contract": "KEEP: item_before exists exactly once in the source rolling plan and item_after equals item_before. CHANGE: item_before exists exactly once and item_after is a different non-blank string placed at horizon_after. DROP: horizon_after and item_after are null and the item appears nowhere in rolling_plan_after. ADD: horizon_before and item_before are null and item_after is a new item absent from the source plan. Every decision needs a non-blank reason and at least one evidence excerpt copied verbatim from an allowed artifact.",
-            "evidence_contract": f'Each evidence excerpt must be an exact contiguous character-for-character substring copied from the artifact content provided in this payload. Copy-paste verbatim only; never paraphrase, summarize, or reconstruct from memory. Field-to-ref binding: the "final" field is episodes/{episode_id}/final.md; "episode_plan" is episodes/{episode_id}/episode_plan.json; "memory_update" is episodes/{episode_id}/memory_update.json; "memory_after" is episodes/{episode_id}/memory_after.json. An excerpt must be verified against the artifact named by its ref. For JSON artifacts, copy only a plain-text span inside one string value that contains no JSON escape sequences such as \\\", \\\\, \\n, \\r, or \\t; never quote across keys, quotes, brackets, or commas, because on-disk formatting differs from this payload. Select and copy the exact evidence excerpt before composing the reason. Do not derive the excerpt from the reason or adaptation summary. Length: 8 to 400 characters are accepted; roughly 20 to 120 characters are recommended. A shorter exact quote is safer than a longer one, and a valid shorter excerpt is acceptable when no 20-character safe span exists. A single non-verbatim excerpt rejects the entire response permanently and terminates the pilot run; there is no retry. evidence_refs must equal the sorted unique ref values cited across all adaptation-decision evidence items.',
+            "action_contract": "KEEP: item_before exists exactly once in the source rolling plan and item_after equals item_before. CHANGE: item_before exists exactly once and item_after is a different non-blank string placed at horizon_after. DROP: horizon_after and item_after are null and the item appears nowhere in rolling_plan_after. ADD: horizon_before and item_before are null and item_after is a new item absent from the source plan. Every decision needs a non-blank reason and at least one evidence_candidate_ids entry.",
+            "candidate_selection_contract": "Select at least one evidence_candidate_ids value for every adaptation decision, using only candidate_id values from evidence_candidates. Candidate IDs are code-generated and already bind the exact artifact ref and excerpt; do not edit them, create new IDs, or output raw evidence, evidence_refs, ref, or excerpt fields. Select candidate IDs before writing the reason. An unknown or fabricated candidate ID is a terminal contract failure with no retry. Code derives canonical evidence and sorted unique evidence_refs from the selected IDs.",
             "continuity_contract": "Partition the provided required_next_episode_continuity list exactly: every item must appear exactly once, copied character-for-character unchanged, in either continuity_satisfied or continuity_deferred. continuity_satisfied holds items fulfilled by the completed episode's final prose or memory results; continuity_deferred holds items still pending, which are carried to the next episode source. Never add, rewrite, merge, split, or omit items. Never insert memory facts, relationships, or any string that is not in required_next_episode_continuity into either list. The two lists must not overlap. An empty list is valid when nothing falls in that category. adaptation_summary must be a non-blank string. Partition only the top-level required_next_episode_continuity field of this payload. Do not use memory_update.required_next_episode_continuity or memory_after.required_next_episode_continuity as the partition source: memory_update lists new continuity items produced by the completed episode, memory_after already contains both the original and newly produced items, and code appends the new items to the next episode source automatically. An item may appear in continuity_satisfied or continuity_deferred if and only if it appears in the top-level required_next_episode_continuity list. Ignore nested-list membership; if an item also appears in a nested list, partition it once based solely on its top-level membership.",
             "accounting_rules": "Consume every source plan item with exactly one KEEP, CHANGE, or DROP decision, in source plan order (immediate_horizon first, then near_horizon). Applying the decisions in order must rebuild rolling_plan_after exactly. rolling_plan_after.immediate_horizon needs at least one item, items are unique across both horizons, and next_episode.required_role must equal rolling_plan_after.immediate_horizon[0]. Do not generate identities or hashes; return only the fields in strict_output_schema.",
-            "strict_output_schema": {"next_episode": {"episode_id": next_id, "importance": "ordinary|major|pivot", "required_role": "string"}, "rolling_plan_after": {"immediate_horizon": ["string"], "near_horizon": ["string"]}, "adaptation_decisions": [{"action": "KEEP|CHANGE|DROP|ADD", "horizon_before": "immediate_horizon|near_horizon|null", "item_before": "string|null", "horizon_after": "immediate_horizon|near_horizon|null", "item_after": "string|null", "reason": "string", "evidence": [{"ref": f"episodes/{episode_id}/final.md", "excerpt": "string"}]}], "continuity_satisfied": ["string"], "continuity_deferred": ["string"], "adaptation_summary": "string", "evidence_refs": ["string"]},
+            "strict_output_schema": {"next_episode": {"episode_id": next_id, "importance": "ordinary|major|pivot", "required_role": "string"}, "rolling_plan_after": {"immediate_horizon": ["string"], "near_horizon": ["string"]}, "adaptation_decisions": [{"action": "KEEP|CHANGE|DROP|ADD", "horizon_before": "immediate_horizon|near_horizon|null", "item_before": "string|null", "horizon_after": "immediate_horizon|near_horizon|null", "item_after": "string|null", "reason": "string", "evidence_candidate_ids": ["candidate_id"]}], "continuity_satisfied": ["string"], "continuity_deferred": ["string"], "adaptation_summary": "string"},
         }
 
     def _transition(self, run_dir: Path, manifest: dict, transition_id: str, episode_id: str, next_id: str, source: dict, input_hash: str, index: int) -> tuple[dict, dict]:
@@ -273,7 +275,8 @@ class PilotPipeline:
             raise
 
     def _transition_from_response(self, run_dir: Path, episode_id: str, next_id: str, source: dict, input_hash: str, raw: str) -> tuple[dict, dict]:
-        response = validate_transition_response(parse_object(raw))
+        provider_response = validate_transition_response(parse_object(raw))
+        response = materialize_transition_response(provider_response, _transition_candidate_catalog(run_dir, episode_id))
         transition = {"schema_version": TRANSITION_SCHEMA_VERSION, "completed_episode_id": episode_id, "next_episode_id": next_id, "transition_input_hash": input_hash, "next_source_hash": "pending", "rolling_plan_before_hash": rolling_plan_hash(source["rolling_plan"]), **response}
         validate_transition(transition, source, next_id, run_dir)
         next_source = self._next_source_from_transition(run_dir, episode_id, transition)
@@ -289,7 +292,7 @@ class PilotPipeline:
         receipt = _read_transition_receipt(receipt_path, transition_id, episode_id, next_id, input_hash)
         if receipt is None:
             return
-        _verify_receipt_matches_transition(receipt, transition)
+        _verify_receipt_matches_transition(receipt, transition, run_dir, episode_id)
         if receipt["state"] != "COMPLETED":
             receipt.update({"state": "COMPLETED", "contract_code": None})
             write_json(receipt_path, receipt)
@@ -460,9 +463,20 @@ def _unique(values: list[str]) -> list[str]:
     return list(dict.fromkeys(values))
 
 
+def _transition_candidate_catalog(run_dir: Path, episode_id: str):
+    artifacts = {
+        f"episodes/{episode_id}/{name}": run_dir / "episodes" / episode_id / name
+        for name in TRANSITION_EVIDENCE_FILES
+    }
+    try:
+        return build_evidence_candidate_catalog(artifacts)
+    except (EvidenceCandidateCatalogError, OSError) as error:
+        raise ContractError("transition evidence candidate catalog is invalid", "EVIDENCE_CANDIDATE_CATALOG_INVALID") from error
+
+
 def _transition_input_value(run_dir: Path, pilot_id: str, episode_ids: list[str], episode_id: str, next_id: str, source: dict, index: int) -> dict:
     root = run_dir / "episodes" / episode_id
-    return {"pilot_id": pilot_id, "completed_episode_id": episode_id, "next_episode_id": next_id, "source_hash": sha256_bytes(canonical_bytes(source)), "episode_plan_hash": sha256_file(root / "episode_plan.json"), "final_hash": sha256_file(root / "final.md"), "memory_update_hash": sha256_file(root / "memory_update.json"), "memory_after_hash": sha256_file(root / "memory_after.json"), "rolling_plan": source["rolling_plan"], "required_continuity": source["required_next_episode_continuity"], "remaining_episode_count": len(episode_ids) - index - 1, "transition_schema_version": TRANSITION_SCHEMA_VERSION, "transition_contract_version": TRANSITION_CONTRACT_VERSION}
+    return {"pilot_id": pilot_id, "completed_episode_id": episode_id, "next_episode_id": next_id, "source_hash": sha256_bytes(canonical_bytes(source)), "episode_plan_hash": sha256_file(root / "episode_plan.json"), "final_hash": sha256_file(root / "final.md"), "memory_update_hash": sha256_file(root / "memory_update.json"), "memory_after_hash": sha256_file(root / "memory_after.json"), "rolling_plan": source["rolling_plan"], "required_continuity": source["required_next_episode_continuity"], "remaining_episode_count": len(episode_ids) - index - 1, "transition_schema_version": TRANSITION_SCHEMA_VERSION, "transition_contract_version": TRANSITION_CONTRACT_VERSION, "evidence_candidate_catalog_version": EVIDENCE_CANDIDATE_CATALOG_VERSION}
 
 
 def _json_file_hash(value: object) -> str:
@@ -662,14 +676,15 @@ def _read_transition_receipt(receipt_path: Path, transition_id: str, episode_id:
     return receipt
 
 
-def _verify_receipt_matches_transition(receipt: dict, transition: dict) -> None:
+def _verify_receipt_matches_transition(receipt: dict, transition: dict, run_dir: Path, episode_id: str) -> None:
     if receipt["state"] == "REJECTED":
         raise PilotError("rejected transition receipt conflicts with canonical transition")
     try:
-        response = validate_transition_response(parse_object(receipt["raw_response"]))
+        provider_response = validate_transition_response(parse_object(receipt["raw_response"]))
+        response = materialize_transition_response(provider_response, _transition_candidate_catalog(run_dir, episode_id))
     except ContractError:
         raise PilotError("transition receipt response does not match canonical transition") from None
-    if any(response[field] != transition.get(field) for field in TRANSITION_RESPONSE_FIELDS):
+    if any(response[field] != transition.get(field) for field in TRANSITION_CANONICAL_RESPONSE_FIELDS):
         raise PilotError("transition receipt response does not match canonical transition")
 
 
@@ -685,7 +700,7 @@ def _verify_transition_receipts(run_dir: Path, manifest: dict) -> None:
             transition = read_json(transition_path)
             if receipt["transition_input_hash"] != transition.get("transition_input_hash"):
                 raise PilotError("transition receipt input hash mismatch")
-            _verify_receipt_matches_transition(receipt, transition)
+            _verify_receipt_matches_transition(receipt, transition, run_dir, episode_id)
 
 
 def verify_pilot_artifacts(run_dir: Path, manifest: dict) -> None:

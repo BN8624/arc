@@ -10,19 +10,19 @@ def transition_adapter_response(payload: dict) -> dict:
     """Deterministic evidence-grounded transition adaptation for fake providers."""
     completed_episode_id = payload["completed_episode_id"]
     plan = payload["rolling_plan"]
-    evidence = [{"ref": f"episodes/{completed_episode_id}/final.md", "excerpt": payload["final"][:64]}]
+    candidate_id = payload["evidence_candidates"][0]["candidate_id"]
     decisions = []
     for item in plan["immediate_horizon"]:
-        decisions.append({"action": "KEEP", "horizon_before": "immediate_horizon", "item_before": item, "horizon_after": "immediate_horizon", "item_after": item, "reason": f"The {completed_episode_id} outcome still requires this objective.", "evidence": list(evidence)})
+        decisions.append({"action": "KEEP", "horizon_before": "immediate_horizon", "item_before": item, "horizon_after": "immediate_horizon", "item_after": item, "reason": f"The {completed_episode_id} outcome still requires this objective.", "evidence_candidate_ids": [candidate_id]})
     near = plan["near_horizon"]
     for index, item in enumerate(near):
         if len(near) >= 2 and index == 0:
-            decisions.append({"action": "DROP", "horizon_before": "near_horizon", "item_before": item, "horizon_after": None, "item_after": None, "reason": f"The {completed_episode_id} outcome resolved this direction.", "evidence": list(evidence)})
+            decisions.append({"action": "DROP", "horizon_before": "near_horizon", "item_before": item, "horizon_after": None, "item_after": None, "reason": f"The {completed_episode_id} outcome resolved this direction.", "evidence_candidate_ids": [candidate_id]})
         elif index == len(near) - 1:
-            decisions.append({"action": "CHANGE", "horizon_before": "near_horizon", "item_before": item, "horizon_after": "near_horizon", "item_after": f"adapted direction after {completed_episode_id}", "reason": f"The {completed_episode_id} outcome redirects this item.", "evidence": list(evidence)})
+            decisions.append({"action": "CHANGE", "horizon_before": "near_horizon", "item_before": item, "horizon_after": "near_horizon", "item_after": f"adapted direction after {completed_episode_id}", "reason": f"The {completed_episode_id} outcome redirects this item.", "evidence_candidate_ids": [candidate_id]})
         else:
-            decisions.append({"action": "KEEP", "horizon_before": "near_horizon", "item_before": item, "horizon_after": "near_horizon", "item_after": item, "reason": f"The {completed_episode_id} outcome leaves this direction open.", "evidence": list(evidence)})
-    decisions.append({"action": "ADD", "horizon_before": None, "item_before": None, "horizon_after": "near_horizon", "item_after": f"deferred hook from {completed_episode_id}", "reason": f"The {completed_episode_id} ending opened a new deferred hook.", "evidence": list(evidence)})
+            decisions.append({"action": "KEEP", "horizon_before": "near_horizon", "item_before": item, "horizon_after": "near_horizon", "item_after": item, "reason": f"The {completed_episode_id} outcome leaves this direction open.", "evidence_candidate_ids": [candidate_id]})
+    decisions.append({"action": "ADD", "horizon_before": None, "item_before": None, "horizon_after": "near_horizon", "item_after": f"deferred hook from {completed_episode_id}", "reason": f"The {completed_episode_id} ending opened a new deferred hook.", "evidence_candidate_ids": [candidate_id]})
     plan_after = {"immediate_horizon": [decision["item_after"] for decision in decisions if decision["horizon_after"] == "immediate_horizon"], "near_horizon": [decision["item_after"] for decision in decisions if decision["horizon_after"] == "near_horizon"]}
     return {
         "next_episode": {"episode_id": payload["next_episode_id"], "importance": "ordinary", "required_role": plan_after["immediate_horizon"][0]},
@@ -31,7 +31,6 @@ def transition_adapter_response(payload: dict) -> dict:
         "continuity_satisfied": [],
         "continuity_deferred": list(payload["required_next_episode_continuity"]),
         "adaptation_summary": f"Adapted the rolling plan from {completed_episode_id} results toward {payload['next_episode_id']}.",
-        "evidence_refs": sorted({item["ref"] for decision in decisions for item in decision["evidence"]}),
     }
 
 

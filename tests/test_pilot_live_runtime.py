@@ -161,7 +161,7 @@ def _config(key_count: int = 11) -> LiveConfig:
     return LiveConfig(MODEL_NAME, {f"K{i:02d}": f"key-{i:02d}" for i in range(1, key_count + 1)}, launch_interval=0.0)
 
 
-def test_transition_payload_pins_evidence_contract(tmp_path):
+def test_transition_payload_pins_candidate_selection_contract(tmp_path):
     episode_id = "episode_007"
     next_id = "episode_008"
     episode_dir = tmp_path / "episodes" / episode_id
@@ -179,20 +179,19 @@ def test_transition_payload_pins_evidence_contract(tmp_path):
         {"rolling_plan": {"immediate_horizon": ["next item"], "near_horizon": []}, "required_next_episode_continuity": []},
         0,
     )
-    contract = payload["evidence_contract"]
+    contract = payload["candidate_selection_contract"]
 
     assert isinstance(contract, str) and contract
-    assert "exact contiguous character-for-character substring" in contract
-    assert "Copy-paste verbatim only; never paraphrase, summarize, or reconstruct from memory." in contract
-    assert 'contains no JSON escape sequences such as \\", \\\\, \\n, \\r, or \\t' in contract
-    assert f'the "final" field is episodes/{episode_id}/final.md' in contract
-    assert f'"episode_plan" is episodes/{episode_id}/episode_plan.json' in contract
-    assert f'"memory_update" is episodes/{episode_id}/memory_update.json' in contract
-    assert f'"memory_after" is episodes/{episode_id}/memory_after.json' in contract
-    assert "Select and copy the exact evidence excerpt before composing the reason." in contract
-    assert "Do not derive the excerpt from the reason or adaptation summary." in contract
-    assert "8 to 400 characters are accepted; roughly 20 to 120 characters are recommended" in contract
-    assert "evidence_refs must equal the sorted unique ref values cited across all adaptation-decision evidence items." in contract
+    assert payload["evidence_candidate_catalog_version"] == 1
+    assert payload["evidence_candidates"]
+    assert "at least one evidence_candidate_ids" in contract
+    assert "using only candidate_id values from evidence_candidates" in contract
+    assert "do not edit them, create new IDs" in contract
+    assert "Select candidate IDs before writing the reason" in contract
+    assert "unknown or fabricated candidate ID is a terminal contract failure" in contract
+    assert "evidence" not in payload["strict_output_schema"]["adaptation_decisions"][0]
+    assert "ref" not in payload["strict_output_schema"]["adaptation_decisions"][0]
+    assert "excerpt" not in payload["strict_output_schema"]["adaptation_decisions"][0]
 
 
 def test_transition_payload_pins_continuity_contract(tmp_path):
@@ -3016,7 +3015,9 @@ def test_transition_receipts_match_provider_output(tmp_path):
         assert receipt["response_sha256"] == calls[0]["response_sha256"]
         transition = read_json(output / "transitions" / f"{episode_id}_to_{next_id}.json")
         response = json.loads(receipt["raw_response"])
-        assert all(response[field] == transition[field] for field in ("next_episode", "rolling_plan_after", "adaptation_decisions", "continuity_satisfied", "continuity_deferred", "adaptation_summary", "evidence_refs"))
+        assert "evidence_refs" not in response
+        assert all("evidence" not in decision and "evidence_candidate_ids" in decision for decision in response["adaptation_decisions"])
+        assert all(response[field] == transition[field] for field in ("next_episode", "rolling_plan_after", "continuity_satisfied", "continuity_deferred", "adaptation_summary"))
 
 
 def _projection_root_doc() -> dict:
