@@ -226,6 +226,11 @@ def test_transition_payload_pins_continuity_contract(tmp_path):
     assert "The two lists must not overlap" in contract
     assert "An empty list is valid when nothing falls in that category" in contract
     assert "adaptation_summary must be a non-blank string" in contract
+    assert "Partition only the top-level required_next_episode_continuity field of this payload." in contract
+    assert "Do not use memory_update.required_next_episode_continuity or memory_after.required_next_episode_continuity as the partition source" in contract
+    assert "code appends the new items to the next episode source automatically" in contract
+    assert "An item may appear in continuity_satisfied or continuity_deferred if and only if it appears in the top-level required_next_episode_continuity list." in contract
+    assert "Ignore nested-list membership; if an item also appears in a nested list, partition it once based solely on its top-level membership." in contract
 
 
 def _client(tmp_path, key_count: int = 11) -> tuple[GemmaPoolClient, dict[str, _Provider]]:
