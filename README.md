@@ -1,6 +1,10 @@
 # ARC
 
+[![CI](https://github.com/BN8624/arc/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/BN8624/arc/actions/workflows/ci.yml)
+
 ARC is an AI system for creating readable, long-running serialized novels.
+
+GitHub Actions runs the offline test suite on pushes to main and pull requests.
 
 ARC is a generator. It is not a work title, genre, world, or fixed narrative structure. Each novel created by ARC is an independent project with its own creative specification.
 
