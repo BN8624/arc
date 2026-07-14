@@ -7,7 +7,7 @@ from pathlib import Path
 from .contracts import ContractError, parse_object, validate_worker
 from .live_model import scope_projection
 from .pipeline import MockPipeline, WaveCheckpoint, status
-from .pilot_contracts import PILOT_REVIEW_ROLES, ROLLING_PLAN_HORIZON_LIMITS, STABLE_MEMORY_FIELDS, TRANSITION_CONTRACT_VERSION, TRANSITION_EVIDENCE_FILES, TRANSITION_RESPONSE_FIELDS, TRANSITION_SCHEMA_VERSION, canonical_bytes, rolling_plan_hash, validate_pilot_acceptance, validate_pilot_fixture, validate_transition, validate_transition_response
+from .pilot_contracts import PILOT_REVIEW_ROLES, ROLLING_PLAN_HORIZON_LIMITS, STABLE_MEMORY_FIELDS, TRANSITION_ACTIONS, TRANSITION_CONTRACT_VERSION, TRANSITION_EVIDENCE_FILES, TRANSITION_RESPONSE_FIELDS, TRANSITION_SCHEMA_VERSION, canonical_bytes, rolling_plan_hash, transition_action_counts, validate_pilot_acceptance, validate_pilot_fixture, validate_transition, validate_transition_response
 from .storage import StorageError, read_json, sha256_bytes, sha256_file, write_json
 
 PROJECTION_CURRENT = "CURRENT"
@@ -304,7 +304,7 @@ class PilotPipeline:
         return next_source
 
     def _write_evidence_packet(self, run_dir: Path, manifest: dict) -> list[str]:
-        evidence = {"pilot_id": manifest["pilot_id"], "episode_ids": manifest["episode_ids"], "episodes": [], "transitions": [], "rolling_plan_hashes": []}
+        evidence = {"pilot_id": manifest["pilot_id"], "episode_ids": manifest["episode_ids"], "episodes": [], "transitions": [], "rolling_plan_hashes": [], "rolling_plan_adaptation": rolling_plan_adaptation_summary(run_dir, manifest)}
         refs = []
         for episode_id in manifest["episode_ids"]:
             root = run_dir / "episodes" / episode_id
@@ -457,6 +457,32 @@ def verify_live_telemetry_checkpoint(telemetry: dict, checkpoint: dict | None) -
 def _pilot_transition_ids(manifest: dict) -> list[tuple[str, str, str]]:
     ids = manifest["episode_ids"]
     return [(f"{episode_id}_to_{next_id}", episode_id, next_id) for episode_id, next_id in zip(ids, ids[1:])]
+
+
+def rolling_plan_adaptation_summary(run_dir: Path, manifest: dict) -> dict:
+    """Prove adaptation from validated non-KEEP transition actions, never from plan hash diversity."""
+    counts = {action: 0 for action in TRANSITION_ACTIONS}
+    transition_count = validated = legacy = 0
+    for transition_id, _, _ in _pilot_transition_ids(manifest):
+        if transition_id not in manifest.get("completed_transitions", []):
+            continue
+        transition_count += 1
+        transition = read_json(run_dir / "transitions" / f"{transition_id}.json")
+        if transition.get("schema_version") != TRANSITION_SCHEMA_VERSION:
+            legacy += 1
+            continue
+        validated += 1
+        for action, count in transition_action_counts(transition).items():
+            counts[action] += count
+    non_keep = counts["CHANGE"] + counts["DROP"] + counts["ADD"]
+    return {
+        "transition_count": transition_count,
+        "validated_transition_count": validated,
+        "legacy_transition_count": legacy,
+        "action_counts": counts,
+        "non_keep_action_count": non_keep,
+        "adaptation_proven": transition_count > 0 and validated == transition_count and non_keep >= 1,
+    }
 
 
 def _read_transition_receipt(receipt_path: Path, transition_id: str, episode_id: str, next_id: str, input_hash: str | None) -> dict | None:
@@ -897,8 +923,8 @@ def pilot_status(run_dir: Path) -> dict:
         raise StorageError("; ".join(inspection["reason_codes"]))
     episodes = {episode_id: status(run_dir / "episodes" / episode_id)["status"] for episode_id in manifest["completed_episodes"]}
     finals = all((run_dir / "episodes" / episode_id / "final.md").exists() for episode_id in manifest["completed_episodes"])
-    sources = [episode_id for episode_id in manifest["episode_ids"] if (run_dir / "episode_sources" / f"{episode_id}.json").exists()]
-    result = {"mode": manifest.get("mode", "mock"), "pilot_id": manifest["pilot_id"], "status": manifest["status"], "episode_count": len(manifest["episode_ids"]), "completed_episode_count": len(manifest["completed_episodes"]), "completed_transition_count": len(manifest["completed_transitions"]), "active_episode_id": manifest["active_episode_id"], "episode_statuses": episodes, "writer_call_count": sum(item["writer_call_count"] for item in manifest["episode_records"]), "revision_count": sum(item["revision_count"] for item in manifest["episode_records"]), "acceptance_verdict": manifest["acceptance_verdict"], "finals_exist": finals, "memory_chain_valid": _memory_chain_valid(run_dir, manifest), "rolling_plan_adapted": len({sha256_bytes(canonical_bytes(read_json(run_dir / "episode_sources" / f"{episode_id}.json")["rolling_plan"])) for episode_id in sources}) > 1, "checkpoint_integrity": inspection["checkpoint_integrity"], "reconciliation_required": inspection["reconciliation_required"], "reason_codes": inspection["reason_codes"], "current": inspection["current"], "derived": inspection["derived"]}
+    adaptation = rolling_plan_adaptation_summary(run_dir, manifest)
+    result = {"mode": manifest.get("mode", "mock"), "pilot_id": manifest["pilot_id"], "status": manifest["status"], "episode_count": len(manifest["episode_ids"]), "completed_episode_count": len(manifest["completed_episodes"]), "completed_transition_count": len(manifest["completed_transitions"]), "active_episode_id": manifest["active_episode_id"], "episode_statuses": episodes, "writer_call_count": sum(item["writer_call_count"] for item in manifest["episode_records"]), "revision_count": sum(item["revision_count"] for item in manifest["episode_records"]), "acceptance_verdict": manifest["acceptance_verdict"], "finals_exist": finals, "memory_chain_valid": _memory_chain_valid(run_dir, manifest), "rolling_plan_adapted": adaptation["adaptation_proven"], "rolling_plan_adaptation_action_counts": adaptation["action_counts"], "legacy_transition_count": adaptation["legacy_transition_count"], "checkpoint_integrity": inspection["checkpoint_integrity"], "reconciliation_required": inspection["reconciliation_required"], "reason_codes": inspection["reason_codes"], "current": inspection["current"], "derived": inspection["derived"]}
     if result["mode"] == "live":
         telemetry = read_json(run_dir / "pilot_live_calls.json")
         checkpoint = manifest.get("live_telemetry_checkpoint")

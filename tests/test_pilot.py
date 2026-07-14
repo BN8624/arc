@@ -115,6 +115,80 @@ def test_mock_transitions_are_schema_v2_with_accounted_adaptation(tmp_path: Path
         assert next_source["current_episode"]["required_role"] == transition["rolling_plan_after"]["immediate_horizon"][0]
     assert counts["CHANGE"] + counts["DROP"] + counts["ADD"] >= 1
     assert counts["CHANGE"] >= 1 and counts["DROP"] >= 1 and counts["ADD"] >= 1
+    current = pilot_status(output)
+    assert current["rolling_plan_adapted"] is True
+    assert current["rolling_plan_adaptation_action_counts"] == counts
+    assert current["legacy_transition_count"] == 0
+    packet = json.loads((output / "pilot_evidence_packet.json").read_text(encoding="utf-8"))
+    summary = packet["rolling_plan_adaptation"]
+    assert summary["adaptation_proven"] is True
+    assert summary["transition_count"] == summary["validated_transition_count"] == 4
+    assert summary["action_counts"] == counts
+    assert summary["non_keep_action_count"] == counts["CHANGE"] + counts["DROP"] + counts["ADD"]
+
+
+class KeepOnlyTransitionClient(MockModelClient):
+    def _response(self, stage: str, role: str, prompt: str) -> dict:
+        if stage != "transition":
+            return super()._response(stage, role, prompt)
+        payload = json.loads(prompt)
+        completed_id = payload["completed_episode_id"]
+        plan = payload["rolling_plan"]
+        evidence = [{"ref": f"episodes/{completed_id}/final.md", "excerpt": payload["final"][:64]}]
+        decisions = [{"action": "KEEP", "horizon_before": horizon, "item_before": item, "horizon_after": horizon, "item_after": item, "reason": f"The {completed_id} outcome confirms this item.", "evidence": list(evidence)} for horizon in ("immediate_horizon", "near_horizon") for item in plan[horizon]]
+        return {"next_episode": {"episode_id": payload["next_episode_id"], "importance": "ordinary", "required_role": plan["immediate_horizon"][0]}, "rolling_plan_after": {"immediate_horizon": list(plan["immediate_horizon"]), "near_horizon": list(plan["near_horizon"])}, "adaptation_decisions": decisions, "continuity_satisfied": [], "continuity_deferred": list(payload["required_next_episode_continuity"]), "adaptation_summary": f"Completed {completed_id} confirmed the existing plan without changes.", "evidence_refs": [f"episodes/{completed_id}/final.md"]}
+
+
+def test_keep_only_pilot_completes_but_is_not_adaptation_proven(tmp_path: Path) -> None:
+    client = KeepOnlyTransitionClient("pass")
+    output = tmp_path / "keep-only"
+    PilotPipeline(client, "pass").run(FIXTURE, output)
+
+    current = pilot_status(output)
+    assert current["status"] == "COMPLETE"
+    assert current["completed_transition_count"] == 4
+    assert current["rolling_plan_adapted"] is False
+    counts = current["rolling_plan_adaptation_action_counts"]
+    assert counts["CHANGE"] == counts["DROP"] == counts["ADD"] == 0 and counts["KEEP"] == 12
+    packet = json.loads((output / "pilot_evidence_packet.json").read_text(encoding="utf-8"))
+    assert packet["rolling_plan_adaptation"]["adaptation_proven"] is False
+    assert packet["rolling_plan_adaptation"]["non_keep_action_count"] == 0
+
+
+def test_legacy_v1_transition_is_diagnosed_and_not_adaptation_evidence(tmp_path: Path) -> None:
+    from arc.storage import write_json
+
+    _, output = run(tmp_path)
+    transition_path = output / "transitions" / "episode_001_to_episode_002.json"
+    transition = json.loads(transition_path.read_text(encoding="utf-8"))
+    legacy = {"schema_version": 1, "completed_episode_id": "episode_001", "next_episode_id": "episode_002", "transition_input_hash": transition["transition_input_hash"], "next_source_hash": transition["next_source_hash"], "next_episode": transition["next_episode"], "rolling_plan_after": transition["rolling_plan_after"], "continuity_satisfied": [], "continuity_deferred": list(transition["continuity_deferred"]), "adaptation_summary": "legacy synthetic summary", "evidence_refs": list(transition["evidence_refs"])}
+    digest = write_json(transition_path, legacy)
+    manifest_path = output / "pilot_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["artifact_hashes"]["transitions/episode_001_to_episode_002.json"] = digest
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    current = pilot_status(output)
+    assert current["legacy_transition_count"] == 1
+    assert current["rolling_plan_adapted"] is False
+
+    manifest["status"] = "RUNNING"
+    manifest["completed_transitions"].remove("episode_001_to_episode_002")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(Exception, match="LEGACY_SYNTHETIC_TRANSITION"):
+        PilotPipeline(MockModelClient("pass"), "pass").run(FIXTURE, output)
+
+
+def test_mock_pilot_output_contains_no_transition_synthetic_markers(tmp_path: Path) -> None:
+    _, output = run(tmp_path)
+    for path in output.rglob("*"):
+        if not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8")
+        for marker in ("synthetic transition toward", "synthetic pilot role", "Synthetic plan adapts"):
+            assert marker not in text, f"{marker} in {path}"
+    # acceptance의 하드코딩된 "synthetic continuity evidence"는 이번 작업 범위 밖의 별도 미해결 항목으로 남는다.
+    assert "synthetic continuity evidence" in (output / "pilot_acceptance.json").read_text(encoding="utf-8")
 
 
 def test_pilot_fixture_rejects_duplicate_episode_ids() -> None:
