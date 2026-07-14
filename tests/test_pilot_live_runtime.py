@@ -2510,16 +2510,38 @@ def test_classify_projection_missing_and_current():
     assert classify_episode_projection(root, "episode_001", canonical) == "CURRENT"
 
 
+def _projection_failure_root_doc() -> dict:
+    root = _projection_root_doc()
+    root["contract_failures"] = [
+        {"event_id": "CF001", "scope_id": "episode:episode_001", "stage": "planning_merge", "role": "merge", "contract_code": "PLAN_FIELDS_MISMATCH"},
+        {"event_id": "CF004", "scope_id": "episode:episode_001", "stage": "writer", "role": "canonical", "contract_code": "PROSE_LENGTH"},
+        {"event_id": "CF005", "scope_id": "episode:episode_002", "stage": "planning_merge", "role": "merge", "contract_code": "PLAN_FIELDS_MISMATCH"},
+        {"event_id": "CF002", "scope_id": "pilot:acceptance", "stage": "pilot_review", "role": "readability", "contract_code": "UNKNOWN"},
+        {"event_id": "CF003", "scope_id": None, "stage": "planning_merge", "role": "merge", "contract_code": "UNKNOWN"},
+    ]
+    return root
+
+
 def test_classify_projection_stale_prefix():
+    root = _projection_failure_root_doc()
+    canonical = episode_projection_document(root, "episode_001")
+
+    calls_prefix = {**canonical, "calls": canonical["calls"][:1]}
+    assert classify_episode_projection(root, "episode_001", calls_prefix) == "STALE_PREFIX"
+    failures_prefix = {**canonical, "contract_failures": canonical["contract_failures"][:1]}
+    assert classify_episode_projection(root, "episode_001", failures_prefix) == "STALE_PREFIX"
+    both_prefix = {**canonical, "calls": canonical["calls"][:1], "contract_failures": canonical["contract_failures"][:1]}
+    assert classify_episode_projection(root, "episode_001", both_prefix) == "STALE_PREFIX"
+    empty = {**canonical, "calls": [], "contract_failures": []}
+    assert classify_episode_projection(root, "episode_001", empty) == "STALE_PREFIX"
+
+
+def test_classify_projection_legacy_unfiltered_failures_is_conflict():
     root = _projection_root_doc()
     canonical = episode_projection_document(root, "episode_001")
 
-    shorter = {**canonical, "calls": canonical["calls"][:1]}
-    assert classify_episode_projection(root, "episode_001", shorter) == "STALE_PREFIX"
-    empty = {**canonical, "calls": [], "contract_failures": []}
-    assert classify_episode_projection(root, "episode_001", empty) == "STALE_PREFIX"
     legacy_unfiltered = {**canonical, "contract_failures": list(root["contract_failures"]), "max_active_by_stage": {"planning": 2}}
-    assert classify_episode_projection(root, "episode_001", legacy_unfiltered) == "STALE_PREFIX"
+    assert classify_episode_projection(root, "episode_001", legacy_unfiltered) == "CONFLICT"
 
 
 @pytest.mark.parametrize("mutate", [
@@ -2541,10 +2563,37 @@ def test_classify_projection_conflicts(mutate):
     assert classify_episode_projection(root, "episode_001", mutate(canonical, root)) == "CONFLICT"
 
 
+@pytest.mark.parametrize("mutate", [
+    lambda canonical, root: {**canonical, "contract_failures": canonical["contract_failures"] + [root["contract_failures"][2]]},
+    lambda canonical, root: {**canonical, "contract_failures": canonical["contract_failures"] + [root["contract_failures"][3]]},
+    lambda canonical, root: {**canonical, "contract_failures": canonical["contract_failures"] + [root["contract_failures"][4]]},
+    lambda canonical, root: {**canonical, "contract_failures": list(reversed(canonical["contract_failures"]))},
+    lambda canonical, root: {**canonical, "contract_failures": canonical["contract_failures"][1:]},
+    lambda canonical, root: {**canonical, "contract_failures": [canonical["contract_failures"][0], canonical["contract_failures"][0]]},
+    lambda canonical, root: {**canonical, "contract_failures": [dict(canonical["contract_failures"][0], contract_code="tampered"), canonical["contract_failures"][1]]},
+    lambda canonical, root: {**canonical, "contract_failures": canonical["contract_failures"] + [{"event_id": "CF999", "scope_id": "episode:episode_001", "contract_code": "FABRICATED"}]},
+    lambda canonical, root: {**canonical, "contract_failures": "tampered"},
+    lambda canonical, root: {key: value for key, value in canonical.items() if key != "contract_failures"},
+])
+def test_classify_projection_failure_conflicts(mutate):
+    root = _projection_failure_root_doc()
+    canonical = episode_projection_document(root, "episode_001")
+
+    assert classify_episode_projection(root, "episode_001", mutate(canonical, root)) == "CONFLICT"
+
+
 def test_classify_projection_ahead_of_shortened_root_is_conflict():
     root = _projection_root_doc()
     canonical = episode_projection_document(root, "episode_001")
     shortened_root = {**root, "calls": root["calls"][:1]}
+
+    assert classify_episode_projection(shortened_root, "episode_001", canonical) == "CONFLICT"
+
+
+def test_classify_projection_ahead_of_shortened_root_failures_is_conflict():
+    root = _projection_failure_root_doc()
+    canonical = episode_projection_document(root, "episode_001")
+    shortened_root = {**root, "contract_failures": root["contract_failures"][:1]}
 
     assert classify_episode_projection(shortened_root, "episode_001", canonical) == "CONFLICT"
 
@@ -2584,6 +2633,56 @@ def test_reconcile_projections_fails_closed_on_conflict_without_overwrite(tmp_pa
     with pytest.raises(StorageError, match="telemetry projection mismatch"):
         reconcile_live_telemetry_projections(output, manifest)
     assert conflict_path.read_bytes() == before
+
+
+def _completed_pilot_with_episode_002_failures(output):
+    client, _ = _pilot_client(output, _PilotProviderRoot(wrong_plan_once=True, wrong_plan_episode="episode_002"))
+    with pytest.raises(Exception):
+        PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    resumed_client, _ = _pilot_client(output)
+    result = PilotPipeline(resumed_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    assert result["manifest"]["status"] == "COMPLETE"
+    return read_json(output / "pilot_manifest.json")
+
+
+def test_reconcile_projections_regenerates_truncated_failure_prefix(tmp_path):
+    output = tmp_path / "pilot-live"
+    manifest = _completed_pilot_with_episode_002_failures(output)
+    stale_path = output / "episodes" / "episode_002" / "live_calls.json"
+    canonical_bytes_before = stale_path.read_bytes()
+    stale = read_json(stale_path)
+    assert stale["contract_failures"]
+    stale["contract_failures"] = []
+    write_json(stale_path, stale)
+
+    states = reconcile_live_telemetry_projections(output, manifest)
+
+    assert states["episode_002"] == "STALE_PREFIX"
+    assert stale_path.read_bytes() == canonical_bytes_before
+    after_first = _file_bytes(output)
+    assert reconcile_live_telemetry_projections(output, manifest) == {episode_id: "CURRENT" for episode_id in manifest["episode_ids"]}
+    assert _file_bytes(output) == after_first
+
+
+def test_reconcile_projections_fails_closed_on_foreign_failure_without_overwrite(tmp_path):
+    output = tmp_path / "pilot-live"
+    manifest = _completed_pilot_with_episode_002_failures(output)
+    root = read_json(output / "pilot_live_calls.json")
+    foreign = next(item for item in root["contract_failures"] if item["scope_id"] == "episode:episode_002")
+    conflict_path = output / "episodes" / "episode_003" / "live_calls.json"
+    conflict = read_json(conflict_path)
+    conflict["contract_failures"] = [foreign]
+    write_json(conflict_path, conflict)
+    before = _file_bytes(output)
+
+    with pytest.raises(StorageError, match="telemetry projection mismatch"):
+        reconcile_live_telemetry_projections(output, manifest)
+    assert _file_bytes(output) == before
+
+    resume_client, resume_root = _pilot_client(output)
+    with pytest.raises(StorageError, match="telemetry projection mismatch"):
+        PilotPipeline(resume_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    assert resume_root.provider_calls == []
 
 
 def test_projection_regeneration_replace_failure_preserves_original(tmp_path, monkeypatch):

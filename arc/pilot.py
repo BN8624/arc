@@ -690,13 +690,13 @@ def classify_episode_projection(root_telemetry: dict, episode_id: str, projectio
     canonical = episode_projection_document(root_telemetry, episode_id)
     if projection is None:
         return PROJECTION_MISSING
-    if not isinstance(projection, dict) or not isinstance(projection.get("calls"), list) or not isinstance(projection.get("contract_failures", []), list):
+    if not isinstance(projection, dict) or not isinstance(projection.get("calls"), list) or not isinstance(projection.get("contract_failures"), list):
         return PROJECTION_CONFLICT
     calls = projection["calls"]
     if calls != canonical["calls"][: len(calls)]:
         return PROJECTION_CONFLICT
-    root_failures = list(root_telemetry.get("contract_failures", []))
-    if any(item not in root_failures for item in projection.get("contract_failures", [])):
+    failures = projection["contract_failures"]
+    if failures != canonical["contract_failures"][: len(failures)]:
         return PROJECTION_CONFLICT
     return PROJECTION_CURRENT if projection == canonical else PROJECTION_STALE_PREFIX
 
