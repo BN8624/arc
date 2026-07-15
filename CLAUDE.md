@@ -15,7 +15,7 @@
 
 1. 주문서 전제와 저장소 상태만 짧게 확인한다 (HEAD, worktree clean, 기준 테스트).
 2. Luna에게 주문서를 넘겨 구현시킨다. **구현과 함께 로컬 커밋 분리, read-only 진단 스크립트 실행, 최종 보고 초안까지 Luna 산출물로 요구한다** (codex 샌드박스는 네트워크만 차단, `git commit` 가능).
-3. Claude가 커밋별 diff를 직접 검수하고 결함 목록을 확정한다. **수정은 직접 하지 않고 Luna 세션을 resume해서 시킨다.** Claude는 수정 diff 재검수만 한다. **같은 결함에 대해 Luna 수정이 3회 실패하면 Claude가 직접 고친다** (모델 한계 인정, 무한 반복 금지).
+3. Claude가 커밋별 diff를 직접 검수하고 결함 목록을 확정한다. **수정은 직접 하지 않고 Luna 세션을 resume해서 시킨다.** Claude는 수정 diff 재검수만 한다. **같은 결함에 대해 Luna 수정이 1회 실패하면 Claude가 직접 고친다** (모델 한계 인정, 무한 반복 금지).
 4. Sol Medium 읽기 전용 QA를 **한 번만** 호출한다.
 5. QA 지적은 Claude가 검증해 실제 결함만 확정하고, 수정은 다시 Luna resume으로.
 6. 전체 테스트 통과 후 push, 커밋별 CI green + JUnit XML 직접 파싱 확인.
