@@ -3533,7 +3533,7 @@ def test_pilot_live_legacy_terminal_episode_noops_without_provider_calls(tmp_pat
 
     before = _file_bytes(output)
     resumed_client, resumed_root = _pilot_client(output)
-    result = PilotPipeline(resumed_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    result = PilotPipeline(resumed_client, scenario=None, mode="live", require_prose_calibration=True).run(PILOT_FIXTURE, output)
     assert result["no_op"] is True
     assert resumed_root.provider_calls == []
     assert _file_bytes(output) == before

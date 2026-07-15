@@ -111,7 +111,7 @@ def main() -> None:
     pilot_live.add_argument("fixture", type=Path)
     pilot_live.add_argument("--output", type=Path, required=True)
     pilot_live.add_argument("--preflight", type=Path, required=True)
-    pilot_live.add_argument("--prose-calibration", type=Path, required=True)
+    pilot_live.add_argument("--prose-calibration", type=Path)
     pilot_live_state = commands.add_parser("pilot-live-status")
     pilot_live_state.add_argument("output", type=Path)
     pilot_live_reconcile = commands.add_parser("pilot-live-reconcile")
@@ -169,7 +169,8 @@ def main() -> None:
         from .live_model import LiveConfig
         config = LiveConfig.from_environment()
         current_head = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
-        validate_pilot_calibration(args.prose_calibration, model=config.model, output_token_limit=config.prose_limit, current_head=current_head, prompt_templates_hash_value=prompt_templates_hash(), quota_config_snapshot_value=quota_config_snapshot(config))
+        if args.prose_calibration is not None:
+            validate_pilot_calibration(args.prose_calibration, model=config.model, output_token_limit=config.prose_limit, current_head=current_head, prompt_templates_hash_value=prompt_templates_hash(), quota_config_snapshot_value=quota_config_snapshot(config))
         current = pilot_status(args.output) if (args.output / "pilot_manifest.json").exists() else None
         if current and current.get("checkpoint_integrity") == "RECONCILABLE" and set(current.get("reason_codes", [])) - {PROJECTION_STALE_REASON}:
             raise RuntimeError("pilot checkpoint reconciliation required")

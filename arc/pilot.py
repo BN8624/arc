@@ -39,9 +39,6 @@ class PilotPipeline:
 
     def run(self, fixture_path: Path, run_dir: Path) -> dict:
         calibration = None
-        if self.mode == "live" and self.require_prose_calibration and self.prose_calibration is None:
-            from .calibration import ProseCalibrationError, CALIBRATION_REQUIRED
-            raise ProseCalibrationError(CALIBRATION_REQUIRED)
         if self.mode == "live" and self.prose_calibration is not None:
             try:
                 current_head = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
@@ -54,8 +51,12 @@ class PilotPipeline:
         fixture = validate_pilot_fixture(json.loads(raw.decode("utf-8")))
         source_hash = sha256_bytes(raw)
         manifest_path = run_dir / "pilot_manifest.json"
+        manifest = read_json(manifest_path) if manifest_path.exists() else None
+        if self.mode == "live" and self.require_prose_calibration and self.prose_calibration is None and (manifest is None or manifest.get("status") not in {"COMPLETE", "HOLD"}):
+            from .calibration import ProseCalibrationError, CALIBRATION_REQUIRED
+            raise ProseCalibrationError(CALIBRATION_REQUIRED)
         if manifest_path.exists():
-            manifest = read_json(manifest_path)
+            assert manifest is not None
             if manifest["source_hash"] != source_hash or manifest["scenario"] != self.scenario or manifest["mode"] != self.mode:
                 raise PilotError("pilot input changed; refusing reuse")
             if self.mode == "live" and (run_dir / "pilot_live_calls.json").exists():
