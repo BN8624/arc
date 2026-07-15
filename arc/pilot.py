@@ -929,14 +929,15 @@ def _reconcile_legacy_writer_attempt(run_dir: Path, manifest: dict, inspection: 
     if not episode_manifest_path.exists():
         return False
     episode = read_json(episode_manifest_path)
-    writer_keys = set(MockPipeline._initial_writer_state())
+    writer_keys = {"writer_attempt_state", "writer_exhausted", "writer_response_sha256", "writer_character_count", "writer_contract_code", "writer_response_received_at", "writer_call_id", "writer_lease_sequence"}
     present = writer_keys & set(episode)
+    legacy_writer_state = {"writer_attempt_state": "NOT_STARTED", "writer_exhausted": False, "writer_response_sha256": None, "writer_character_count": None, "writer_contract_code": None, "writer_response_received_at": None, "writer_call_id": None, "writer_lease_sequence": None}
     error = episode.get("last_error") if isinstance(episode.get("last_error"), dict) else {}
     suspicious = episode.get("writer_call_count") == 0 and error.get("stage") == "writer"
     if not suspicious:
         return False
     if present:
-        if present == writer_keys and all(episode.get(key) == value for key, value in MockPipeline._initial_writer_state().items()):
+        if present == writer_keys and all(episode.get(key) == value for key, value in legacy_writer_state.items()):
             return False
         raise PilotError("WRITER_RECONCILIATION_BLOCKED")
     telemetry = read_json(run_dir / "pilot_live_calls.json")

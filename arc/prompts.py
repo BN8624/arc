@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from math import ceil
 
-from .contracts import ContractError, PROSE_MAX_CHARACTERS, PROSE_MIN_CHARACTERS
+from .contracts import ContractError, PROSE_MAX_CHARACTERS, PROSE_MIN_CHARACTERS, PROSE_PROVIDER_CONTRACT_VERSION
 
 
 JSON_STAGES = {"planning", "planning_merge", "review", "review_merge", "memory", "memory_merge", "preflight"}
@@ -89,6 +89,19 @@ def _revision_guidance(payload: dict) -> str:
     )
 
 
+def _prose_output_contract() -> str:
+    return (
+        "FINAL OUTPUT CONTRACT\n"
+        'Return exactly one JSON object with exactly one key named "text".\n'
+        "The text value must contain only the complete Korean novel prose.\n"
+        "Do not add keys, Markdown fences, explanation, title, character count, or process notes.\n"
+        "Return no text before or after the JSON object.\n"
+        '최종 응답은 정확히 {"text":"..."} 형태의 JSON 객체 하나만 반환하라.\n'
+        "text 값 안에는 완성된 한국어 소설 본문만 넣어라.\n"
+        "객체 전후에 설명·코드블록·제목·글자 수·작업 메모를 붙이지 마라."
+    )
+
+
 def _planning_merge_rule(payload: dict) -> str:
     explicit_id = payload.get("episode_id")
     context_id = payload.get("context", {}).get("episode_id")
@@ -118,7 +131,7 @@ def build_prompt(stage: str, role: str, payload: dict) -> str:
             "instead of barely clearing the validation floor. Expand causes, actions, dialogue, sensory details, reactions, "
             "transitions, and consequences naturally within the existing plan and canon. Do not add unsupported new settings, "
             "repeat sentences, pad with filler modifiers, summarize yourself, report a character count, or include headings, "
-            "scene numbers, SCENE 1, Markdown fences, JSON, or process notes."
+            "scene numbers, SCENE 1, or process notes."
         )
         instruction += " " + _prose_structural_guidance() + " " + _writer_plan_guidance()
     elif stage == "revision":
@@ -127,7 +140,7 @@ def build_prompt(stage: str, role: str, payload: dict) -> str:
             "characters, order, point of view, and ending. Return one full replacement from beginning to end; do not append "
             "fragments to the original. Expand rushed actions, dialogue, transitions, and aftermath inside the prose. Do not "
             "change canon outside review requirements, repeat sentences, pad with filler, report a character count, or include "
-            "headings, scene numbers, Markdown fences, JSON, or process notes."
+            "headings, scene numbers, or process notes."
         )
         instruction += " " + _prose_structural_guidance() + " " + _revision_guidance(payload)
     else:
@@ -164,4 +177,10 @@ Select resolved existing conflicts only by ID from CURRENT_OPEN_CONFLICT_OPTIONS
         role_rule = f"Rewrite the whole draft as one coherent {target_band} canonical prose passage. Do not append fragments to the original draft."
     else:
         role_rule = "Perform only the assigned task."
-    return f"{instruction}\n{role_rule}\nStage: {stage}\nRole: {role}\nInput JSON:\n{json.dumps(payload, ensure_ascii=False)}"
+    prompt_payload = dict(payload)
+    if stage in {"writer", "revision"}:
+        prompt_payload["prose_provider_contract_version"] = PROSE_PROVIDER_CONTRACT_VERSION
+    prompt = f"{instruction}\n{role_rule}\nStage: {stage}\nRole: {role}\nInput JSON:\n{json.dumps(prompt_payload, ensure_ascii=False)}"
+    if stage in {"writer", "revision"}:
+        prompt += f"\n\n{_prose_output_contract()}"
+    return prompt

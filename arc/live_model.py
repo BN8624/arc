@@ -16,6 +16,8 @@ import json
 from pathlib import Path
 from enum import Enum
 
+from .contracts import PROSE_PROVIDER_CONTRACT_VERSION, PROSE_PROVIDER_RESPONSE_SCHEMA
+
 
 MODEL_NAME = "gemma-4-31b-it"
 DESK_ORDER = (
@@ -458,9 +460,18 @@ class GemmaPoolClient:
 
     def _generation_config(self, stage: str):
         values = {"candidateCount": 1, "maxOutputTokens": self.config.json_limit if stage not in {"writer", "revision"} else self.config.prose_limit, "thinkingConfig": {"thinkingLevel": self.config.thinking_level}}
-        if stage not in {"writer", "revision"}:
-            values["responseMimeType"] = "application/json"
-        return self._types.GenerateContentConfig(**values) if self._types else values
+        values["responseMimeType"] = "application/json"
+        if stage in {"writer", "revision"}:
+            values["responseSchema"] = PROSE_PROVIDER_RESPONSE_SCHEMA
+        if not self._types:
+            return values
+        try:
+            return self._types.GenerateContentConfig(**values)
+        except TypeError:
+            if stage not in {"writer", "revision"} or "responseSchema" not in values:
+                raise
+            values.pop("responseSchema")
+            return self._types.GenerateContentConfig(**values)
 
     def _max_output_tokens(self, stage: str) -> int:
         return self.config.prose_limit if stage in {"writer", "revision"} else self.config.json_limit
@@ -469,7 +480,7 @@ class GemmaPoolClient:
         usage = getattr(response, "usage_metadata", None) if response else None
         with self._lock:
             previous = max((call.get("provider_started_monotonic", 0.0) for call in self.calls), default=0.0)
-            self.calls.append({**(reservation or {}), "stage": stage, "role": role, "key_slot": slot, "status": status, "started_at": datetime.now(timezone.utc).isoformat(), "provider_started_at": datetime.now(timezone.utc).isoformat(), "provider_started_monotonic": provider_start, "scheduled_start_at": scheduled, "launch_sequence": launch_sequence, "launch_wait_ms": round(max(0, (provider_start or 0)-(scheduled or 0))*1000), "previous_launch_gap_ms": None if not previous or provider_start is None else round((provider_start-previous)*1000), "finished_at": datetime.now(timezone.utc).isoformat(), "latency_ms": round((time.perf_counter() - tick) * 1000), "input_characters": len(prompt), "output_characters": len(text), "prompt_tokens": getattr(usage, "prompt_token_count", None), "output_tokens": getattr(usage, "candidates_token_count", None), "total_tokens": getattr(usage, "total_token_count", None), "response_sha256": hashlib.sha256(text.encode()).hexdigest() if isinstance(text, str) else None, "error_class": error_class, "http_status": http_status, "provider_code": None})
+            self.calls.append({**(reservation or {}), "stage": stage, "role": role, "key_slot": slot, "status": status, "provider_contract_version": PROSE_PROVIDER_CONTRACT_VERSION if stage in {"writer", "revision"} and status == "PASS" else None, "started_at": datetime.now(timezone.utc).isoformat(), "provider_started_at": datetime.now(timezone.utc).isoformat(), "provider_started_monotonic": provider_start, "scheduled_start_at": scheduled, "launch_sequence": launch_sequence, "launch_wait_ms": round(max(0, (provider_start or 0)-(scheduled or 0))*1000), "previous_launch_gap_ms": None if not previous or provider_start is None else round((provider_start-previous)*1000), "finished_at": datetime.now(timezone.utc).isoformat(), "latency_ms": round((time.perf_counter() - tick) * 1000), "input_characters": len(prompt), "output_characters": len(text), "prompt_tokens": getattr(usage, "prompt_token_count", None), "output_tokens": getattr(usage, "candidates_token_count", None), "total_tokens": getattr(usage, "total_token_count", None), "response_sha256": hashlib.sha256(text.encode()).hexdigest() if isinstance(text, str) else None, "error_class": error_class, "http_status": http_status, "provider_code": None})
             if self._telemetry_sink:
                 self._telemetry_sink(self._telemetry_snapshot())
 

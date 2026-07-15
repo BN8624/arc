@@ -56,7 +56,8 @@ class _PilotModels:
         if "Input JSON:\n" in contents:
             stage = contents.split("Stage: ", 1)[1].split("\n", 1)[0]
             role = contents.split("Role: ", 1)[1].split("\n", 1)[0]
-            payload = json.loads(contents.split("Input JSON:\n", 1)[1])
+            payload_text = contents.split("Input JSON:\n", 1)[1].split("\n\nFINAL OUTPUT CONTRACT", 1)[0]
+            payload = json.loads(payload_text)
         else:
             payload = json.loads(contents)
             stage = payload.get("stage", "pilot_review")
@@ -126,14 +127,14 @@ class _PilotProviderRoot:
             marker = f"writer:{episode_id}"
             if self.writer_text_once_episode == episode_id and marker not in self.malformed:
                 self.malformed.add(marker)
-                return self.writer_text if self.writer_text is not None else ""
+                return self._prose_wire(self.writer_text if self.writer_text is not None else "")
             if self.short_writer_once_episode == episode_id and marker not in self.malformed:
                 self.malformed.add(marker)
-                return "short prose"
+                return self._prose_wire("short prose")
             if self.repairable_writer_once_episode == episode_id and marker not in self.malformed:
                 self.malformed.add(marker)
-                return "A" * 3500
-            return ("A synthetic live episode sentence. " * 160)[:4800]
+                return self._prose_wire("A" * 3500)
+            return self._prose_wire(("A synthetic live episode sentence. " * 160)[:4800])
         if stage == "review_merge":
             verdict = "HOLD" if episode_id == self.hold_episode else "PASS"
             if verdict == "HOLD":
@@ -144,11 +145,11 @@ class _PilotProviderRoot:
         if stage == "revision":
             marker = f"revision:{episode_id}"
             if self.revision_text is not None:
-                return self.revision_text
+                return self._prose_wire(self.revision_text)
             if self.short_revision_once_episode == episode_id and marker not in self.malformed:
                 self.malformed.add(marker)
-                return "B" * 3500
-            return ("A revised synthetic live episode sentence. " * 150)[:4800]
+                return self._prose_wire("B" * 3500)
+            return self._prose_wire(("A revised synthetic live episode sentence. " * 150)[:4800])
         if stage == "memory_merge":
             return json.dumps({"episode_id": episode_id, "confirmed_facts_added": [f"synthetic fact {episode_id}"], "relationship_changes": [f"synthetic relationship {episode_id}"], "conflict_ids_resolved": [], "conflicts_opened": [f"synthetic opened conflict {episode_id}"], "promises_added": [f"synthetic promise {episode_id}"], "important_excerpts_added": [f"synthetic excerpt {episode_id}"], "episode_summary": f"synthetic episode summary {episode_id}", "required_next_episode_continuity": [f"synthetic continuity {episode_id}"], "evidence_refs": ["final.md"]})
         if stage == "transition":
@@ -156,6 +157,12 @@ class _PilotProviderRoot:
                 return "{malformed transition"
             return json.dumps(transition_adapter_response(payload), ensure_ascii=False)
         raise RuntimeError(f"unknown live stage: {stage}:{role}")
+
+    @staticmethod
+    def _prose_wire(value: str) -> str:
+        if value.lstrip().startswith(("{", "[", "```")):
+            return value
+        return json.dumps({"text": value}, ensure_ascii=False)
 
 
 def _config(key_count: int = 11) -> LiveConfig:
@@ -383,7 +390,7 @@ def _file_bytes(output: Path) -> dict[str, bytes]:
 def _episode_from_prompt(prompt: str) -> str | None:
     if "Input JSON:\n" not in prompt:
         return None
-    payload = json.loads(prompt.split("Input JSON:\n", 1)[1])
+    payload = json.loads(prompt.split("Input JSON:\n", 1)[1].split("\n\nFINAL OUTPUT CONTRACT", 1)[0])
     return payload.get("episode_id") or payload.get("context", {}).get("episode_id")
 
 
@@ -489,7 +496,7 @@ def _make_legacy_writer_output(tmp_path: Path, *, ambiguous: str | None = None) 
     episode.update({"status": "ERROR", "writer_call_count": 0, "last_error": {"error_class": "CONTRACT_ERROR", "stage": "writer", "role": "canonical", "contract_code": "PROSE_TOO_SHORT", "character_count": 2858, "call_id": "L008-A001", "message": "sanitized prose contract failure"}})
     telemetry = read_json(output / "pilot_live_calls.json")
     response = next(call for call in telemetry["calls"] if call["scope_id"] == "episode:episode_001" and call["stage"] == "writer")
-    response.update({"call_id": "L008-A001", "key_slot": "K04", "lease_sequence": 15})
+    response.update({"call_id": "L008-A001", "key_slot": "K04", "lease_sequence": 15, "output_characters": 2858, "response_sha256": hashlib.sha256(("A" * 2858).encode()).hexdigest()})
     failure = next(item for item in telemetry["contract_failures"] if item["scope_id"] == "episode:episode_001" and item["stage"] == "writer")
     failure.update({"call_id": "L008-A001", "key_slot": "K04", "character_count": 2858, "contract_code": "PROSE_TOO_SHORT"})
     if ambiguous == "response":
@@ -760,6 +767,12 @@ def test_live_pilot_runs_five_episodes_with_one_base_client(tmp_path):
     assert manifest["pilot_live_call_count"] == len(read_json(output / "pilot_live_calls.json")["calls"])
     episode_scopes = {call["scope_id"] for call in read_json(output / "pilot_live_calls.json")["calls"] if call["scope_id"].startswith("episode:")}
     assert len(episode_scopes) == 5
+    for episode_id in manifest["episode_ids"]:
+        episode = read_json(output / "episodes" / episode_id / "manifest.json")
+        assert episode["writer_provider_contract_version"] == 1
+        assert episode["writer_provider_response_sha256"] != episode["writer_materialized_prose_sha256"]
+        assert episode["writer_materialized_prose_sha256"] == hashlib.sha256((output / "episodes" / episode_id / "draft.md").read_bytes()).hexdigest()
+        assert "{" not in (output / "episodes" / episode_id / "draft.md").read_text(encoding="utf-8")
     assert provider_root.provider_calls
 
 
@@ -1197,6 +1210,9 @@ def test_repairable_draft_is_saved_and_revised_once(tmp_path):
     assert manifest["writer_contract_code"] == "PROSE_UNDERLENGTH_REPAIRABLE"
     assert manifest["writer_response_sha256"] == hashlib.sha256((ep4 / "draft.md").read_bytes()).hexdigest()
     assert manifest["revision_count"] == 1
+    assert manifest["revision_provider_contract_version"] == 1
+    assert manifest["revision_provider_response_sha256"] != manifest["revision_materialized_prose_sha256"]
+    assert manifest["revision_materialized_prose_sha256"] == hashlib.sha256((ep4 / "revised.md").read_bytes()).hexdigest()
     assert (ep4 / "final.md").read_text(encoding="utf-8") == (ep4 / "revised.md").read_text(encoding="utf-8")
 
 
@@ -1249,7 +1265,8 @@ def test_invalid_revision_response_is_consumed_and_holds(tmp_path, revision_text
     assert result["manifest"]["status"] == "HOLD"
     assert episode["revision_count"] == 1
     assert episode["revision_attempt_state"] == "REJECTED"
-    assert episode["revision_character_count"] == len(revision_text)
+    expected_count = None if not revision_text or revision_text.lstrip().startswith(("[", "```")) else len("bad") if revision_text == '{"text":"bad"}' else len(revision_text)
+    assert episode["revision_character_count"] == expected_count
     assert len(revision_calls) == 1
     assert not (output / "episodes" / "episode_004" / "revised.md").exists()
 
