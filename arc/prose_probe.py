@@ -7,7 +7,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .contracts import ContractError, PROSE_MAX_CHARACTERS, PROSE_MIN_CHARACTERS, PROSE_REPAIRABLE_MIN_CHARACTERS, validate_prose
+from .contracts import ContractError, PROSE_MAX_CHARACTERS, PROSE_MIN_CHARACTERS, PROSE_PROVIDER_CONTRACT_VERSION, PROSE_REPAIRABLE_MIN_CHARACTERS, materialize_prose_provider_response, validate_prose
 from .prompts import build_prompt, revision_expansion_guidance
 from .storage import read_json, sha256_bytes, sha256_file, verify_artifacts, write_json
 
@@ -87,19 +87,31 @@ def _load_preflight(preflight: Path) -> tuple[dict, str]:
 def _stage_result(client: object, stage: str, prompt: str, text: str) -> dict:
     calls = [call for call in client.telemetry().get("calls", []) if call.get("stage") == stage and call.get("role") == "canonical"]
     content_calls = [call for call in calls if call.get("status") == "PASS"]
-    call = content_calls[-1] if content_calls else {}
-    verdict, contract_code = "PASS", None
+    raw_digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    matching_content_calls = [call for call in content_calls if call.get("response_sha256") == raw_digest]
+    call = matching_content_calls[-1] if matching_content_calls else {}
+    materialized_digest, character_count = None, None
+    envelope_valid, verdict, contract_code = False, "FAIL", None
     try:
-        validate_prose(text)
+        materialized = materialize_prose_provider_response(text, stage=stage)
+        envelope_valid = True
+        materialized_digest = hashlib.sha256(materialized.encode("utf-8")).hexdigest()
+        character_count = len(materialized)
+        validate_prose(materialized)
+        verdict = "PASS"
     except ContractError as error:
-        verdict, contract_code = "FAIL", error.contract_code
-        client.record_contract_failure(stage, "canonical", contract_code=contract_code, character_count=len(text))
+        contract_code = error.contract_code
+        client.record_contract_failure(stage, "canonical", contract_code=contract_code, character_count=character_count)
     return {
         "stage": stage,
+        "prose_provider_contract_version": PROSE_PROVIDER_CONTRACT_VERSION,
         "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
-        "response_sha256": hashlib.sha256(text.encode()).hexdigest(),
-        "character_count": len(text),
+        "raw_response_sha256": raw_digest,
+        "materialized_prose_sha256": materialized_digest,
+        "envelope_valid": envelope_valid,
+        "character_count": character_count,
         "validation_verdict": verdict,
+        "prose_contract_code": contract_code,
         "contract_code": contract_code,
         "call_id": call.get("call_id"),
         "key_slot": call.get("key_slot"),
@@ -188,7 +200,13 @@ def run_prose_live_probe(source_episode: Path, output: Path, preflight: Path, cl
     call_ids = [call.get("call_id") for call in calls]
     leases = [call.get("lease_sequence") for call in calls]
     duplicate_content = any(result["actual_content_response_count"] > 1 for result in results)
-    identity_valid = all(call_ids) and len(call_ids) == len(set(call_ids)) and all(isinstance(value, int) for value in leases) and len(leases) == len(set(leases))
+    identity_valid = (
+        all(call_ids)
+        and len(call_ids) == len(set(call_ids))
+        and all(isinstance(value, int) for value in leases)
+        and len(leases) == len(set(leases))
+        and all(result.get("call_id") and result.get("key_slot") and isinstance(result.get("lease_sequence"), int) for result in results)
+    )
     source_unchanged = source["hashes"] == {name: sha256_file(source_episode / name) for name in SOURCE_FILES}
     usage_valid = usage is None or (usage["pairing_valid"] and usage["event_ids_unique"] and usage["ownership_valid"])
     if duplicate_content or not identity_valid or not source_unchanged or not usage_valid:
@@ -201,7 +219,7 @@ def run_prose_live_probe(source_episode: Path, output: Path, preflight: Path, cl
         overall_status = "NOT_PROVEN"
     _, safe_expansion = revision_expansion_guidance(source["draft_contract"]["character_count"])
     document = {
-        "schema_version": 1,
+        "schema_version": 2,
         "model": getattr(getattr(client, "config", None), "model", preflight_document.get("model")),
         "source_episode_path": str(source_episode),
         "source_artifact_hashes": source["hashes"],
@@ -241,7 +259,23 @@ def prose_live_probe_status(output: Path) -> dict:
     if document.get("telemetry_checkpoint") != _telemetry_checkpoint(telemetry):
         raise ProseProbeError("probe telemetry checkpoint mismatch")
     forbidden = ("raw_prompt", "raw_response", "provider_response", "api_key", "request_headers")
-    serialized = json.dumps({"manifest": document, "telemetry": telemetry}, ensure_ascii=False).lower()
-    if any(name in serialized for name in forbidden):
+    def has_forbidden_key(value: object) -> bool:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                normalized_key = key.lower().replace("-", "_") if isinstance(key, str) else str(key).lower().replace("-", "_")
+                if normalized_key == "raw_response_sha256":
+                    valid_digest = isinstance(item, str) and len(item) == 64 and all(character in "0123456789abcdef" for character in item)
+                    if not valid_digest:
+                        return True
+                elif any(token in normalized_key for token in forbidden):
+                    return True
+                if has_forbidden_key(item):
+                    return True
+            return False
+        if isinstance(value, list):
+            return any(has_forbidden_key(item) for item in value)
+        return False
+
+    if has_forbidden_key({"manifest": document, "telemetry": telemetry}):
         raise ProseProbeError("forbidden probe data detected")
     return document

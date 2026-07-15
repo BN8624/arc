@@ -2,6 +2,7 @@ from __future__ import annotations
 # Bounded prose live probe의 입력, 호출 경계, artifact 안전성을 검증한다.
 
 import hashlib
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -22,9 +23,9 @@ class Gate:
 
 
 class FakeClient:
-    def __init__(self, writer: str, revision: str, fail_stage: str | None = None, duplicate: bool = False):
+    def __init__(self, writer: str, revision: str, fail_stage: str | None = None, duplicate: bool = False, raw_response: bool = False, telemetry_hash_mismatch: bool = False):
         self.config, self.usage_gate = Config(), Gate()
-        self.responses, self.fail_stage, self.duplicate = {"writer": writer, "revision": revision}, fail_stage, duplicate
+        self.responses, self.fail_stage, self.duplicate, self.telemetry_hash_mismatch = ({"writer": writer, "revision": revision} if raw_response else {"writer": json.dumps({"text": writer}, ensure_ascii=False), "revision": json.dumps({"text": revision}, ensure_ascii=False)}), fail_stage, duplicate, telemetry_hash_mismatch
         self.calls, self.contract_failures = [], []
 
     def generate(self, *, stage, role, prompt):
@@ -33,7 +34,10 @@ class FakeClient:
         text = self.responses[stage]
         count = 2 if self.duplicate and stage == "writer" else 1
         for attempt in range(1, count + 1):
-            self.calls.append({"stage": stage, "role": role, "status": "PASS", "call_id": f"{stage}-{attempt}", "key_slot": "K01", "lease_sequence": len(self.calls) + 1, "response_sha256": hashlib.sha256(text.encode()).hexdigest(), "output_characters": len(text)})
+            response_sha256 = hashlib.sha256(text.encode()).hexdigest()
+            if self.telemetry_hash_mismatch and stage == "writer":
+                response_sha256 = "0" * 64
+            self.calls.append({"stage": stage, "role": role, "status": "PASS", "call_id": f"{stage}-{attempt}", "key_slot": "K01", "lease_sequence": len(self.calls) + 1, "response_sha256": response_sha256, "output_characters": len(text)})
         return text
 
     def telemetry(self):
@@ -74,6 +78,9 @@ def test_probe_passes_with_exactly_one_valid_writer_and_revision_response(tmp_pa
     persist_telemetry(output, client)
     assert result["overall_status"] == "PASS"
     assert [item["actual_content_response_count"] for item in result["stages"]] == [1, 1]
+    assert all(item["envelope_valid"] for item in result["stages"])
+    assert all(item["prose_provider_contract_version"] == 1 for item in result["stages"])
+    assert all(item["raw_response_sha256"] != item["materialized_prose_sha256"] for item in result["stages"])
     assert result["source_draft_character_count"] == 3474
     assert result["revision_safe_expansion"] == 1526
     assert prose_live_probe_status(output)["overall_status"] == "PASS"
@@ -97,9 +104,48 @@ def test_probe_classifies_terminal_transport_failure_as_incomplete(tmp_path):
     assert result["stages"] == []
 
 
+def test_probe_rejects_provider_envelope_without_materialized_prose(tmp_path):
+    result = run_prose_live_probe(source_episode(tmp_path), tmp_path / "probe", preflight(tmp_path), FakeClient('{"text":"가", "extra": 1}', '{"text":"나"}', raw_response=True))
+    assert result["overall_status"] == "NOT_PROVEN"
+    assert result["stages"][0]["envelope_valid"] is False
+    assert result["stages"][0]["prose_contract_code"] == "PROSE_PROVIDER_FIELDS_MISMATCH"
+    assert result["stages"][0]["materialized_prose_sha256"] is None
+
+
 def test_probe_blocks_duplicate_content_evidence(tmp_path):
     result = run_prose_live_probe(source_episode(tmp_path), tmp_path / "probe", preflight(tmp_path), FakeClient("가" * 5200, "나" * 5200, duplicate=True))
     assert result["overall_status"] == "SAFETY_BLOCKED"
+
+
+def test_probe_blocks_telemetry_response_hash_mismatch(tmp_path):
+    result = run_prose_live_probe(source_episode(tmp_path), tmp_path / "probe", preflight(tmp_path), FakeClient("가" * 5200, "나" * 5200, telemetry_hash_mismatch=True))
+    assert result["overall_status"] == "SAFETY_BLOCKED"
+    assert result["stages"][0]["call_id"] is None
+
+
+@pytest.mark.parametrize("forbidden_key", ["raw_response_copy", "api-key"])
+def test_probe_status_rejects_normalized_forbidden_key(tmp_path, forbidden_key):
+    client = FakeClient("가" * 5200, "나" * 5200)
+    output = tmp_path / "probe"
+    run_prose_live_probe(source_episode(tmp_path), output, preflight(tmp_path), client)
+    persist_telemetry(output, client)
+    manifest = read_json(output / "prose_probe.json")
+    manifest[forbidden_key] = "redacted"
+    write_json(output / "prose_probe.json", manifest)
+    with pytest.raises(ProseProbeError, match="forbidden probe data"):
+        prose_live_probe_status(output)
+
+
+def test_probe_status_rejects_invalid_raw_response_hash(tmp_path):
+    client = FakeClient("가" * 5200, "나" * 5200)
+    output = tmp_path / "probe"
+    run_prose_live_probe(source_episode(tmp_path), output, preflight(tmp_path), client)
+    persist_telemetry(output, client)
+    manifest = read_json(output / "prose_probe.json")
+    manifest["stages"][0]["raw_response_sha256"] = "not-a-lowercase-hex-digest"
+    write_json(output / "prose_probe.json", manifest)
+    with pytest.raises(ProseProbeError, match="forbidden probe data"):
+        prose_live_probe_status(output)
 
 
 def test_probe_rejects_invalid_source_before_client_use(tmp_path):
