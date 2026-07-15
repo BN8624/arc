@@ -23,11 +23,13 @@ PROSE_MIN_CHARACTERS = 4000
 PROSE_MAX_CHARACTERS = 8000
 PROSE_REPAIRABLE_MIN_CHARACTERS = 3000
 PROSE_PROVIDER_CONTRACT_VERSION = 1
+PROSE_GENERATION_PROFILE_VERSION = 2
 PROSE_PROVIDER_RESPONSE_FIELDS = {"text"}
 PROSE_PROVIDER_RESPONSE_MALFORMED = "PROSE_PROVIDER_RESPONSE_MALFORMED"
 PROSE_PROVIDER_RESPONSE_NOT_OBJECT = "PROSE_PROVIDER_RESPONSE_NOT_OBJECT"
 PROSE_PROVIDER_FIELDS_MISMATCH = "PROSE_PROVIDER_FIELDS_MISMATCH"
 PROSE_PROVIDER_TEXT_INVALID = "PROSE_PROVIDER_TEXT_INVALID"
+PROSE_PROVIDER_DUPLICATE_FIELD = "PROSE_PROVIDER_DUPLICATE_FIELD"
 
 
 REQUIRED_FIXTURE_KEYS = {
@@ -51,8 +53,16 @@ def materialize_prose_provider_response(raw_response: str, *, stage: str) -> str
     """Materialize the unchanged prose text from the strict provider v1 envelope."""
     if stage not in {"writer", "revision"}:
         raise ContractError("prose provider stage is invalid", PROSE_PROVIDER_TEXT_INVALID)
+    def reject_duplicate_fields(pairs: list[tuple[str, object]]) -> dict:
+        value: dict[str, object] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ContractError("prose provider response contains a duplicate field", PROSE_PROVIDER_DUPLICATE_FIELD)
+            value[key] = item
+        return value
+
     try:
-        value = json.loads(raw_response)
+        value = json.loads(raw_response, object_pairs_hook=reject_duplicate_fields)
     except (TypeError, json.JSONDecodeError) as error:
         raise ContractError("malformed prose provider JSON response", PROSE_PROVIDER_RESPONSE_MALFORMED) from error
     if not isinstance(value, dict):

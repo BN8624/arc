@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
-from .contracts import ContractError, parse_object, validate_worker
+from .contracts import ContractError, PROSE_GENERATION_PROFILE_VERSION, parse_object, validate_worker
+from .calibration import prompt_templates_hash, quota_config_snapshot, validate_pilot_calibration
 from .evidence_candidates import EVIDENCE_CANDIDATE_CATALOG_VERSION, EvidenceCandidateCatalogError, EvidenceCandidateProjectionError, build_bounded_candidate_projection, build_evidence_candidate_catalog
 from .live_model import scope_projection
 from .pipeline import MockPipeline, WaveCheckpoint, status
@@ -26,16 +28,28 @@ class PilotError(RuntimeError):
 
 
 class PilotPipeline:
-    def __init__(self, client, scenario: str | None = "pass", mode: str = "mock"):
+    def __init__(self, client, scenario: str | None = "pass", mode: str = "mock", prose_calibration: Path | None = None, require_prose_calibration: bool = False):
         if mode not in {"mock", "live"}:
             raise PilotError("unknown pilot mode")
         if mode == "mock" and scenario not in {"pass", "episode_hold", "pilot_hold"}:
             raise PilotError("unknown pilot scenario")
         if mode == "live" and scenario is not None:
             raise PilotError("live pilot does not accept mock scenario")
-        self.client, self.scenario, self.mode = client, scenario, mode
+        self.client, self.scenario, self.mode, self.prose_calibration, self.require_prose_calibration = client, scenario, mode, prose_calibration, require_prose_calibration
 
     def run(self, fixture_path: Path, run_dir: Path) -> dict:
+        calibration = None
+        if self.mode == "live" and self.require_prose_calibration and self.prose_calibration is None:
+            from .calibration import ProseCalibrationError, CALIBRATION_REQUIRED
+            raise ProseCalibrationError(CALIBRATION_REQUIRED)
+        if self.mode == "live" and self.prose_calibration is not None:
+            try:
+                current_head = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+            except (OSError, subprocess.CalledProcessError):
+                current_head = None
+            calibration = validate_pilot_calibration(self.prose_calibration, model=self.client.config.model, output_token_limit=self.client.config.prose_limit, current_head=current_head, prompt_templates_hash_value=prompt_templates_hash(), quota_config_snapshot_value=quota_config_snapshot(self.client.config))
+            selected_config = calibration["profiles"][calibration["selected_profile"]]["config"]
+            self.client.set_prose_thinking_level(selected_config["thinking_level"])
         raw = fixture_path.read_bytes()
         fixture = validate_pilot_fixture(json.loads(raw.decode("utf-8")))
         source_hash = sha256_bytes(raw)
@@ -74,7 +88,7 @@ class PilotPipeline:
             run_dir.mkdir(parents=True, exist_ok=True)
             manifest = {"schema_version": 1, "mode": self.mode, "pilot_id": fixture["pilot_id"], "fixture_id": fixture["initial_source"]["fixture_id"], "source_hash": source_hash, "scenario": self.scenario, "status": "RUNNING", "episode_ids": fixture["episode_ids"], "completed_episodes": [], "completed_transitions": [], "active_episode_id": fixture["episode_ids"][0], "episode_records": [], "artifact_hashes": {}, "acceptance_verdict": None, "last_error": None}
             if self.mode == "live":
-                manifest.update({"provider": "gemini_developer_api", "model": self.client.config.model, "key_pool_size": len(self.client.config.keys), "max_live": self.client.config.max_live, "routing_schema_version": 2, "routing_mode": "dynamic_key_pool", "pilot_live_call_count": 0})
+                manifest.update({"provider": "gemini_developer_api", "model": self.client.config.model, "key_pool_size": len(self.client.config.keys), "max_live": self.client.config.max_live, "routing_schema_version": 2, "routing_mode": "dynamic_key_pool", "pilot_live_call_count": 0, "prose_generation_profile_version": PROSE_GENERATION_PROFILE_VERSION, "quota_project_bucket_count": len(set(getattr(self.client.config, "quota_project_buckets", {}).values())) if getattr(self.client.config, "quota_project_buckets", None) else len(self.client.config.keys), "prose_calibration_sha256": sha256_file(self.prose_calibration) if self.prose_calibration else None, "selected_prose_profile": calibration.get("selected_profile") if calibration else None})
             self._save_checkpoint(run_dir, manifest)
         try:
             self._advance(fixture, run_dir, manifest)

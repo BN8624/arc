@@ -17,6 +17,7 @@ from pathlib import Path
 from enum import Enum
 
 from .contracts import PROSE_PROVIDER_CONTRACT_VERSION
+from .quota import ProjectQuotaError, ProjectQuotaAdmission, QuotaLimits, limits_from_environment, parse_project_buckets
 
 
 MODEL_NAME = "gemma-4-31b-it"
@@ -230,11 +231,22 @@ class LiveConfig:
     max_transport_attempts_per_desk: int = 22
     max_transport_retry_seconds_per_desk: int = 600
     max_provider_attempts_per_run: int = 300
+    provider_rpm_limit: int = 30
+    provider_input_tpm_limit: int = 16000
+    provider_rpd_limit: int = 14400
+    provider_rpm_safety_limit: int = 27
+    provider_input_tpm_safety_limit: int = 14000
+    provider_rpd_safety_limit: int = 13000
+    max_input_tokens_per_request: int = 14000
+    quota_project_buckets: dict[str, str] | None = None
+    prose_thinking_level: str = "high"
 
     @classmethod
     def from_environment(cls, env: dict[str, str] | None = None) -> "LiveConfig":
         env = os.environ if env is None else env
         try:
+            limits = limits_from_environment(env)
+            slots = [f"K{i:02d}" for i in range(1, 12)]
             config = cls(
                 env.get("MODEL", ""),
                 {f"K{i:02d}": env.get(f"GOOGLE_API_KEY_{i}", "") for i in range(1, 12)},
@@ -248,6 +260,15 @@ class LiveConfig:
                 int(env.get("ARC_MAX_TRANSPORT_ATTEMPTS_PER_DESK", "22")),
                 int(env.get("ARC_MAX_TRANSPORT_RETRY_SECONDS_PER_DESK", "600")),
                 int(env.get("ARC_MAX_PROVIDER_ATTEMPTS_PER_RUN", "300")),
+                limits.rpm,
+                limits.input_tpm,
+                limits.rpd,
+                limits.safety_rpm,
+                limits.safety_input_tpm,
+                limits.safety_rpd,
+                limits.max_input_tokens_per_request,
+                parse_project_buckets(env.get("ARC_QUOTA_PROJECT_BUCKETS_JSON"), slots),
+                env.get("ARC_PROSE_THINKING_LEVEL", "high"),
             )
         except (ValueError, KeyError) as error:
             raise LiveConfigError("numeric live configuration is invalid") from error
@@ -263,6 +284,21 @@ class LiveConfig:
             raise LiveConfigError("live limits are invalid")
         if self.thinking_level not in {"low", "medium", "high"}:
             raise LiveConfigError("thinking level is invalid")
+        if self.prose_thinking_level not in {"high", "minimal"}:
+            raise LiveConfigError("prose thinking level is invalid")
+        try:
+            limits_from_environment({
+                "ARC_PROVIDER_RPM_LIMIT": str(self.provider_rpm_limit),
+                "ARC_PROVIDER_INPUT_TPM_LIMIT": str(self.provider_input_tpm_limit),
+                "ARC_PROVIDER_RPD_LIMIT": str(self.provider_rpd_limit),
+                "ARC_PROVIDER_RPM_SAFETY_LIMIT": str(self.provider_rpm_safety_limit),
+                "ARC_PROVIDER_INPUT_TPM_SAFETY_LIMIT": str(self.provider_input_tpm_safety_limit),
+                "ARC_PROVIDER_RPD_SAFETY_LIMIT": str(self.provider_rpd_safety_limit),
+                "ARC_MAX_INPUT_TOKENS_PER_REQUEST": str(self.max_input_tokens_per_request),
+            })
+            parse_project_buckets(json.dumps(self.quota_project_buckets) if self.quota_project_buckets is not None else None, list(self.keys))
+        except ProjectQuotaError as error:
+            raise LiveConfigError(error.error_code) from error
 
 
 class LaunchPacer:
@@ -322,6 +358,7 @@ class ScopedGemmaPoolClient:
 class GemmaPoolClient:
     def __init__(self, config: LiveConfig, client_factory: Callable[[str], object] | None = None, state_store: RoutingStateStore | None = None, telemetry_sink: Callable[[dict], None] | None = None, usage_gate: object | None = None, monotonic: Callable[[], float] | None = None, sleeper: Callable[[float], None] | None = None):
         self.config, self._lock, self.calls = config, threading.Lock(), []
+        self._prose_thinking_level = config.prose_thinking_level
         self._clock = monotonic or time.monotonic
         self._sleeper = sleeper
         self._provider_attempts_reserved = 0
@@ -331,6 +368,7 @@ class GemmaPoolClient:
             from .usage import TokenGate, UsageLedger
             usage_gate = TokenGate(UsageLedger())
         self.usage_gate = usage_gate
+        self.quota = ProjectQuotaAdmission(list(config.keys), QuotaLimits(config.provider_rpm_limit, config.provider_input_tpm_limit, config.provider_rpd_limit, config.provider_rpm_safety_limit, config.provider_input_tpm_safety_limit, config.provider_rpd_safety_limit, config.max_input_tokens_per_request), config.quota_project_buckets, usage_ledger=getattr(usage_gate, "ledger", None))
         self.pacer = LaunchPacer(config.launch_interval, monotonic=self._clock, sleeper=sleeper or time.sleep)
         self.pool = DynamicKeyPool(list(config.keys), monotonic=self._clock, state_store=state_store, waiter=sleeper)
         self.contract_failures: list[dict] = []
@@ -367,16 +405,18 @@ class GemmaPoolClient:
         while desk_attempts < self.config.max_transport_attempts_per_desk:
             if self._clock() >= deadline:
                 raise self._transport_exhausted(desk, desk_attempts, started, last_error)
-            if not self._reserve_provider_attempt(desk):
+            with self._lock:
+                attempt_budget_exhausted = self._provider_attempts_reserved >= self.config.max_provider_attempts_per_run
+            if attempt_budget_exhausted:
+                self.record_contract_failure(desk.stage, desk.role, contract_code="RUN_PROVIDER_ATTEMPT_BUDGET_EXHAUSTED", scope_id=desk.scope_id)
                 raise LiveCallError("RUN_PROVIDER_ATTEMPT_BUDGET_EXHAUSTED", desk.stage, desk.role, "NONE", "run provider attempt budget exhausted", details={"max_provider_attempts_per_run": self.config.max_provider_attempts_per_run, "provider_attempts_used": self._provider_attempts_reserved})
             try:
                 slot, lease_sequence = self.pool.lease(deadline=deadline)
             except (RetryDeadlineExceeded, LiveConfigError):
-                self._release_provider_reservation()
                 raise self._transport_exhausted(desk, desk_attempts, started, last_error)
             desk_attempts += 1
             try:
-                text = self._invoke(slot, desk, prompt, lease_sequence)
+                text = self._invoke(slot, desk, prompt, lease_sequence, deadline=deadline)
                 self.pool.release(slot)
                 return text
             except LiveCallError as error:
@@ -412,35 +452,99 @@ class GemmaPoolClient:
     def generate(self, *, stage: str, role: str, prompt: str) -> str:
         return self.generate_for_desk(desk=logical_desk(stage, role), prompt=prompt)
 
-    def _invoke(self, slot: str, desk: LogicalDesk, prompt: str, lease_sequence: int | None = None) -> str:
+    def _invoke(self, slot: str, desk: LogicalDesk, prompt: str, lease_sequence: int | None = None, *, deadline: float | None = None) -> str:
         started, tick = datetime.now(timezone.utc), time.perf_counter()
         stage, role, logical_order = desk.stage, desk.role, desk.logical_order
         generation_event_id = None
         response = None
         with self._lock:
             attempt = 1 + sum(call.get("desk_id", f"{call['stage']}:{call['role']}") == desk.desk_id for call in self.calls)
-            reservation = {"call_id": f"L{logical_order:03d}-A{attempt:03d}", "scope_id": desk.scope_id, "desk_id": desk.desk_id, "logical_order": logical_order, "attempt": attempt, "lease_sequence": lease_sequence}
+            reservation = {"call_id": f"L{logical_order:03d}-A{attempt:03d}", "scope_id": desk.scope_id, "desk_id": desk.desk_id, "logical_order": logical_order, "attempt": attempt, "lease_sequence": lease_sequence, "input_hash": hashlib.sha256(prompt.encode()).hexdigest()}
             self.active_by_stage[stage] = self.active_by_stage.get(stage, 0) + 1
             self.max_active_by_stage[stage] = max(self.max_active_by_stage.get(stage, 0), self.active_by_stage[stage])
         try:
             config = self._generation_config(stage)
             call = {**reservation, "stage": stage, "role": role}
             if self.usage_gate:
-                generation_event_id, _ = self.usage_gate.admit(client=self._clients[slot], model=self.config.model, prompt=prompt, config=config, key_slot_id=slot, call=call, max_output_tokens=self._max_output_tokens(stage))
+                generation_event_id, input_tokens = self.usage_gate.admit(client=self._clients[slot], model=self.config.model, prompt=prompt, config=config, key_slot_id=slot, call=call, max_output_tokens=self._max_output_tokens(stage), max_input_tokens=self.config.max_input_tokens_per_request)
+            else:
+                input_tokens = 0
+            attempted_slots = set()
+            release_times = []
+            quota_deadline = time.time() + self.config.max_transport_retry_seconds_per_desk
+            quota_reservation = None
+            while quota_reservation is None:
+                attempted_slots.add(slot)
+                try:
+                    quota_reservation = self.quota.reserve_for_slot(slot, input_tokens)
+                    if len(attempted_slots) > 1:
+                        self.quota.ledger.reroute_count += 1
+                except ProjectQuotaError as quota_error:
+                    release_at = quota_error.details.get("release_at")
+                    if release_at is not None:
+                        release_times.append(float(release_at))
+                    self.pool.release(slot)
+                    if len(attempted_slots) >= len(self.config.keys):
+                        if not release_times:
+                            raise quota_error
+                        wait_until = min(release_times)
+                        now = time.time()
+                        if now >= quota_deadline or now + max(0.0, wait_until - now) > quota_deadline:
+                            raise ProjectQuotaError(PROJECT_QUOTA_ADMISSION_EXHAUSTED, "NO_PROJECT_AVAILABLE_BEFORE_DEADLINE", details={"release_at": wait_until}) from None
+                        self.quota.ledger.wait_count += 1
+                        wait_seconds = max(0.0, wait_until - now)
+                        (self._sleeper or time.sleep)(wait_seconds)
+                        attempted_slots.clear()
+                        release_times.clear()
+                    slot, lease_sequence = self.pool.lease(deadline=deadline)
+                    if slot in attempted_slots:
+                        raise quota_error
+                    reservation["lease_sequence"] = lease_sequence
+            quota_snapshot = self.quota.ledger.snapshot().get(quota_reservation.bucket_id, {})
+            reservation.update({"quota_admission_passed": True, "quota_admission_evidence": {"mode": "local", "project_bucket": quota_reservation.bucket_id, "reserved_input_tokens": input_tokens}, "project_bucket": quota_reservation.bucket_id, "reserved_input_tokens": input_tokens, "rolling_rpm_at_dispatch": quota_snapshot.get("rolling_request_count"), "rolling_tpm_at_dispatch": quota_snapshot.get("rolling_reserved_input_tokens"), "daily_rpd_at_dispatch": quota_snapshot.get("daily_request_count")})
             launch_sequence, scheduled, provider_start = self.pacer.wait()
-            if self.usage_gate and generation_event_id:
-                self.usage_gate.mark_dispatched(generation_event_id)
+            if not self._reserve_provider_attempt(desk):
+                self.quota.ledger.release(quota_reservation.reservation_id)
+                if self.usage_gate and generation_event_id:
+                    self.usage_gate.finish(event_id=generation_event_id, response=None, succeeded=False, error_code="RUN_PROVIDER_ATTEMPT_BUDGET_EXHAUSTED")
+                raise LiveCallError("RUN_PROVIDER_ATTEMPT_BUDGET_EXHAUSTED", stage, role, slot, "run provider attempt budget exhausted", details={"max_provider_attempts_per_run": self.config.max_provider_attempts_per_run, "provider_attempts_used": self._provider_attempts_reserved})
+            generation_marked = False
+            quota_dispatched = False
+            try:
+                if self.usage_gate and generation_event_id:
+                    self.usage_gate.mark_dispatched(generation_event_id)
+                    generation_marked = True
+                self.quota.ledger.dispatch(quota_reservation.reservation_id)
+                quota_dispatched = True
+            except Exception as error:
+                self._release_provider_reservation()
+                if not quota_dispatched:
+                    self.quota.ledger.release(quota_reservation.reservation_id)
+                if self.usage_gate and generation_event_id:
+                    if generation_marked:
+                        self.usage_gate.finish(event_id=generation_event_id, response=None, succeeded=False, error_code="DISPATCH_BOOKKEEPING_FAILED")
+                    elif hasattr(self.usage_gate, "cancel"):
+                        self.usage_gate.cancel(generation_event_id, "DISPATCH_BOOKKEEPING_FAILED")
+                    generation_event_id = None
+                quota_reservation = None
+                raise LiveCallError("DISPATCH_BOOKKEEPING_FAILED", stage, role, slot, "dispatch bookkeeping failed before provider dispatch") from error
             response = self._clients[slot].models.generate_content(model=self.config.model, contents=prompt, config=config)
             text = getattr(response, "text", None)
             if not isinstance(text, str) or (stage not in {"writer", "revision"} and not text.strip()):
                 if self.usage_gate and generation_event_id:
                     self.usage_gate.finish(event_id=generation_event_id, response=response, succeeded=False, error_code="EMPTY_RESPONSE")
+                self.quota.ledger.finish(quota_reservation.reservation_id, succeeded=False)
                 self._append(stage, role, slot, "FAIL", started, tick, prompt, "", response, "EMPTY_RESPONSE", None, reservation, launch_sequence, scheduled, provider_start)
                 raise LiveCallError("EMPTY_RESPONSE", stage, role, slot, "provider returned no usable text")
             if self.usage_gate and generation_event_id:
                 self.usage_gate.finish(event_id=generation_event_id, response=response, succeeded=True)
+            self.quota.ledger.finish(quota_reservation.reservation_id, succeeded=True)
             self._append(stage, role, slot, "PASS", started, tick, prompt, text, response, reservation=reservation, launch_sequence=launch_sequence, scheduled=scheduled, provider_start=provider_start)
             return text
+        except ProjectQuotaError as error:
+            if self.usage_gate and generation_event_id:
+                self.usage_gate.finish(event_id=generation_event_id, response=None, succeeded=False, error_code=error.error_code)
+            raise LiveCallError(error.error_code, stage, role, slot, "project quota admission blocked", details={"reason": error.reason, **error.details}) from None
         except LiveCallError:
             raise
         except Exception as error:
@@ -452,6 +556,9 @@ class GemmaPoolClient:
                 error_class = mapping.get(status, "PROVIDER_5XX" if isinstance(status, int) and status >= 500 else "TIMEOUT" if isinstance(error, (TimeoutError, socket.timeout)) else "NETWORK_ERROR" if isinstance(error, ConnectionError) else "UNKNOWN_PROVIDER_ERROR")
             if self.usage_gate and generation_event_id:
                 self.usage_gate.finish(event_id=generation_event_id, response=response, succeeded=False, error_code=error_class)
+            if "quota_reservation" in locals() and quota_reservation is not None:
+                self.quota.ledger.finish(quota_reservation.reservation_id, succeeded=False)
+            reservation["provider_returned_429"] = error_class == "RATE_LIMITED"
             self._append(stage, role, slot, "FAIL", started, tick, prompt, "", None, error_class, status if isinstance(status, int) else None, reservation, locals().get("launch_sequence"), locals().get("scheduled"), locals().get("provider_start"))
             raise LiveCallError(error_class, stage, role, slot, "provider request failed", status if isinstance(status, int) else None) from None
         finally:
@@ -459,11 +566,17 @@ class GemmaPoolClient:
                 self.active_by_stage[stage] -= 1
 
     def _generation_config(self, stage: str):
-        values = {"candidateCount": 1, "maxOutputTokens": self.config.json_limit if stage not in {"writer", "revision"} else self.config.prose_limit, "thinkingConfig": {"thinkingLevel": self.config.thinking_level}}
+        thinking_level = self.config.thinking_level if stage not in {"writer", "revision"} else self._prose_thinking_level
+        values = {"candidateCount": 1, "maxOutputTokens": self.config.json_limit if stage not in {"writer", "revision"} else self.config.prose_limit, "thinkingConfig": {"thinkingLevel": thinking_level}}
         values["responseMimeType"] = "application/json"
         if not self._types:
             return values
         return self._types.GenerateContentConfig(**values)
+
+    def set_prose_thinking_level(self, level: str) -> None:
+        if level not in {"high", "minimal"}:
+            raise LiveConfigError("prose thinking level is invalid")
+        self._prose_thinking_level = level
 
     def _max_output_tokens(self, stage: str) -> int:
         return self.config.prose_limit if stage in {"writer", "revision"} else self.config.json_limit
@@ -472,13 +585,14 @@ class GemmaPoolClient:
         usage = getattr(response, "usage_metadata", None) if response else None
         with self._lock:
             previous = max((call.get("provider_started_monotonic", 0.0) for call in self.calls), default=0.0)
-            self.calls.append({**(reservation or {}), "stage": stage, "role": role, "key_slot": slot, "status": status, "provider_contract_version": PROSE_PROVIDER_CONTRACT_VERSION if stage in {"writer", "revision"} and status == "PASS" else None, "started_at": datetime.now(timezone.utc).isoformat(), "provider_started_at": datetime.now(timezone.utc).isoformat(), "provider_started_monotonic": provider_start, "scheduled_start_at": scheduled, "launch_sequence": launch_sequence, "launch_wait_ms": round(max(0, (provider_start or 0)-(scheduled or 0))*1000), "previous_launch_gap_ms": None if not previous or provider_start is None else round((provider_start-previous)*1000), "finished_at": datetime.now(timezone.utc).isoformat(), "latency_ms": round((time.perf_counter() - tick) * 1000), "input_characters": len(prompt), "output_characters": len(text), "prompt_tokens": getattr(usage, "prompt_token_count", None), "output_tokens": getattr(usage, "candidates_token_count", None), "total_tokens": getattr(usage, "total_token_count", None), "response_sha256": hashlib.sha256(text.encode()).hexdigest() if isinstance(text, str) else None, "error_class": error_class, "http_status": http_status, "provider_code": None})
+            self.calls.append({**(reservation or {}), "stage": stage, "role": role, "key_slot": slot, "status": status, "provider_contract_version": PROSE_PROVIDER_CONTRACT_VERSION if stage in {"writer", "revision"} and status == "PASS" else None, "started_at": datetime.now(timezone.utc).isoformat(), "provider_started_at": datetime.now(timezone.utc).isoformat(), "provider_started_monotonic": provider_start, "scheduled_start_at": scheduled, "launch_sequence": launch_sequence, "launch_wait_ms": round(max(0, (provider_start or 0)-(scheduled or 0))*1000), "previous_launch_gap_ms": None if not previous or provider_start is None else round((provider_start-previous)*1000), "finished_at": datetime.now(timezone.utc).isoformat(), "latency_ms": round((time.perf_counter() - tick) * 1000), "input_characters": len(prompt), "output_characters": len(text), "prompt_tokens": getattr(usage, "prompt_token_count", None), "output_tokens": getattr(usage, "candidates_token_count", None), "reasoning_tokens": getattr(usage, "thoughts_token_count", None), "total_tokens": getattr(usage, "total_token_count", None), "response_sha256": hashlib.sha256(text.encode()).hexdigest() if isinstance(text, str) else None, "error_class": error_class, "http_status": http_status, "provider_code": None})
             if self._telemetry_sink:
                 self._telemetry_sink(self._telemetry_snapshot())
 
     def _telemetry_snapshot(self, scope_id: str | None = None) -> dict:
         calls = sorted(self.calls, key=lambda call: (call.get("logical_order", 0), call.get("attempt", 0)))
-        snapshot = {"schema_version": 2, "provider": "gemini_developer_api", "model": self.config.model, "calls": calls, "contract_failures": self.contract_failures, "max_active_by_stage": self.max_active_by_stage, "prompt_budget": self.prompt_budget, "retry_budget": {"max_attempts_per_desk": self.config.max_transport_attempts_per_desk, "max_retry_seconds_per_desk": self.config.max_transport_retry_seconds_per_desk, "max_provider_attempts_per_run": self.config.max_provider_attempts_per_run, "provider_attempts_used": self._provider_attempts_reserved, "retry_exhausted_count": sum(item.get("contract_code") == "TRANSPORT_RETRY_EXHAUSTED" for item in self.contract_failures)}}
+        quota = self.quota.telemetry()
+        snapshot = {"schema_version": 2, "provider": "gemini_developer_api", "model": self.config.model, "calls": calls, "contract_failures": self.contract_failures, "max_active_by_stage": self.max_active_by_stage, "prompt_budget": self.prompt_budget, "quota": quota, **{key: quota[key] for key in ("provider_active_limits", "provider_safety_limits", "quota_project_bucket_count", "quota_wait_count", "quota_reroute_count", "quota_blocked_count")}, "retry_budget": {"max_attempts_per_desk": self.config.max_transport_attempts_per_desk, "max_retry_seconds_per_desk": self.config.max_transport_retry_seconds_per_desk, "max_provider_attempts_per_run": self.config.max_provider_attempts_per_run, "provider_attempts_used": self._provider_attempts_reserved, "retry_exhausted_count": sum(item.get("contract_code") == "TRANSPORT_RETRY_EXHAUSTED" for item in self.contract_failures)}}
         return scope_projection(snapshot, scope_id) if scope_id is not None else snapshot
 
     def telemetry(self, scope_id: str | None = None) -> dict:
@@ -492,6 +606,14 @@ class GemmaPoolClient:
             self.max_active_by_stage = dict(telemetry.get("max_active_by_stage", {}))
             self.prompt_budget = dict(telemetry.get("prompt_budget", self.prompt_budget))
             self._provider_attempts_reserved = len(self.calls)
+            quota = telemetry.get("quota", {})
+            if quota.get("ledger_state"):
+                self.quota.ledger.restore_state(quota["ledger_state"])
+            elif quota.get("buckets"):
+                self.quota.ledger.restore(quota["buckets"])
+            self.quota.ledger.wait_count = quota.get("quota_wait_count", telemetry.get("quota_wait_count", 0))
+            self.quota.ledger.reroute_count = quota.get("quota_reroute_count", telemetry.get("quota_reroute_count", 0))
+            self.quota.ledger.blocked_count = quota.get("quota_blocked_count", telemetry.get("quota_blocked_count", 0))
 
     def record_contract_failure(self, stage: str, role: str, slot: str | None = None, contract_code: str | None = None, scope_id: str | None = None, character_count: int | None = None) -> None:
         now = datetime.now(timezone.utc).isoformat()

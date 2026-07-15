@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -14,6 +15,7 @@ from .pilot import PROJECTION_STALE_REASON, PilotPipeline, pilot_status, reconci
 from .storage import write_json
 from .usage import UsageLedger, backup_usage_db, repair_preflight_collision, usage_db_path
 from .prose_probe import PROBE_TELEMETRY, prose_live_probe_status, run_prose_live_probe
+from .calibration import PROFILE_IDS, ProseCalibrationError, prompt_templates_hash, quota_config_snapshot, prose_calibration_status, run_prose_calibration, validate_pilot_calibration
 
 
 def classify_preflight(results: list[dict]) -> dict:
@@ -109,6 +111,7 @@ def main() -> None:
     pilot_live.add_argument("fixture", type=Path)
     pilot_live.add_argument("--output", type=Path, required=True)
     pilot_live.add_argument("--preflight", type=Path, required=True)
+    pilot_live.add_argument("--prose-calibration", type=Path, required=True)
     pilot_live_state = commands.add_parser("pilot-live-status")
     pilot_live_state.add_argument("output", type=Path)
     pilot_live_reconcile = commands.add_parser("pilot-live-reconcile")
@@ -120,6 +123,13 @@ def main() -> None:
     prose_probe.add_argument("--preflight", type=Path, required=True)
     prose_probe_state = commands.add_parser("prose-live-probe-status")
     prose_probe_state.add_argument("output", type=Path)
+    calibration_run = commands.add_parser("prose-calibration-run")
+    calibration_run.add_argument("--output", type=Path, required=True)
+    calibration_run.add_argument("--preflight", type=Path, required=True)
+    calibration_run.add_argument("--profiles", nargs="+", choices=list(PROFILE_IDS), default=list(PROFILE_IDS))
+    calibration_run.add_argument("--cycles", type=int, default=3)
+    calibration_state = commands.add_parser("prose-calibration-status")
+    calibration_state.add_argument("output", type=Path)
     usage = commands.add_parser("usage")
     usage_commands = usage.add_subparsers(dest="usage_command", required=True)
     usage_status = usage_commands.add_parser("status")
@@ -155,12 +165,17 @@ def main() -> None:
     elif args.command == "pilot-status":
         print(json.dumps(pilot_status(args.output), ensure_ascii=False))
     elif args.command == "pilot-live-run":
+        load_dotenv(override=False)
+        from .live_model import LiveConfig
+        config = LiveConfig.from_environment()
+        current_head = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+        validate_pilot_calibration(args.prose_calibration, model=config.model, output_token_limit=config.prose_limit, current_head=current_head, prompt_templates_hash_value=prompt_templates_hash(), quota_config_snapshot_value=quota_config_snapshot(config))
         current = pilot_status(args.output) if (args.output / "pilot_manifest.json").exists() else None
         if current and current.get("checkpoint_integrity") == "RECONCILABLE" and set(current.get("reason_codes", [])) - {PROJECTION_STALE_REASON}:
             raise RuntimeError("pilot checkpoint reconciliation required")
         client = _load_live_client(args.preflight, args.output, args.output / "pilot_live_calls.json")
         try:
-            result = PilotPipeline(client, scenario=None, mode="live").run(args.fixture, args.output)
+            result = PilotPipeline(client, scenario=None, mode="live", prose_calibration=args.prose_calibration, require_prose_calibration=True).run(args.fixture, args.output)
             print(json.dumps({"no_op": result["no_op"], **pilot_status(args.output)}, ensure_ascii=False))
         finally:
             client.close()
@@ -176,6 +191,14 @@ def main() -> None:
             client.close()
     elif args.command == "prose-live-probe-status":
         print(json.dumps(prose_live_probe_status(args.output), ensure_ascii=False))
+    elif args.command == "prose-calibration-run":
+        client = _load_live_client(args.preflight, args.output, args.output / "prose_calibration_calls.json")
+        try:
+            print(json.dumps(run_prose_calibration(args.output, args.preflight, args.profiles, args.cycles, client), ensure_ascii=False))
+        finally:
+            client.close()
+    elif args.command == "prose-calibration-status":
+        print(json.dumps(prose_calibration_status(args.output), ensure_ascii=False))
     elif args.command == "usage":
         ledger = UsageLedger(usage_db_path())
         if args.usage_command == "status":

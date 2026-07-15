@@ -12,7 +12,7 @@ import pytest
 from arc.contracts import ContractError, PROSE_FORBIDDEN_MARKERS, PROSE_MAX_CHARACTERS, PROSE_MIN_CHARACTERS, PROSE_REPAIRABLE_MIN_CHARACTERS, validate_draft_prose, validate_prose
 from arc.mock_model import acceptance_review_response, transition_adapter_response
 from arc.live_model import AtomicTelemetryStore, GemmaPoolClient, LiveCallError, LiveConfig, LogicalDesk, MODEL_NAME, RoutingStateStore
-from arc.pipeline import PLANNING_ROLES, MockPipeline, WaveCheckpoint, status
+from arc.pipeline import PLANNING_ROLES, MockPipeline, PipelineError, WaveCheckpoint, status
 from arc.evidence_candidates import EVIDENCE_CANDIDATE_CATALOG_VERSION
 from arc.pilot_contracts import ACCEPTANCE_GENERIC_QUESTION_MARKER, ACCEPTANCE_PROVIDER_CONTRACT_VERSION, PILOT_REVIEW_ROLES
 from arc.pilot import PilotError, PilotPipeline, _transition_candidate_catalog, classify_episode_projection, episode_projection_document, inspect_pilot_checkpoint, live_telemetry_checkpoint, reconcile_live_telemetry_projections, reconcile_pilot_checkpoint
@@ -53,6 +53,7 @@ class _PilotModels:
         self.owner = owner
 
     def generate_content(self, *, model: str, contents: str, config: dict) -> _Response:
+        self.owner.root.generation_configs.append((contents.split("Stage: ", 1)[1].split("\n", 1)[0] if "Stage: " in contents else "unknown", config))
         if "Input JSON:\n" in contents:
             stage = contents.split("Stage: ", 1)[1].split("\n", 1)[0]
             role = contents.split("Role: ", 1)[1].split("\n", 1)[0]
@@ -103,6 +104,7 @@ class _PilotProviderRoot:
         self.failed: set[str] = set()
         self.malformed: set[str] = set()
         self.provider_calls: list[tuple[str, str, str]] = []
+        self.generation_configs: list[tuple[str, dict]] = []
 
     def factory(self, key: str) -> _PilotProvider:
         return _PilotProvider(self, key.replace("key-", "K"))
@@ -1155,7 +1157,7 @@ def test_writer_prompt_requires_structured_plan_development_without_changing_tar
     assert "Do not perform revision work" in prompt
 
 
-@pytest.mark.parametrize("character_count,expected", [(3000, (1000, 2000)), (3474, (526, 1526)), (3834, (166, 1200)), (3999, (1, 1200)), (4000, (0, 1200)), (4514, (0, 1200))])
+@pytest.mark.parametrize("character_count,expected", [(3000, (1000, 2200)), (3474, (526, 1800)), (3834, (166, 1800)), (3999, (1, 1800)), (4000, (0, 1800)), (4514, (0, 1800))])
 def test_revision_expansion_guidance_is_deterministic(character_count, expected):
     from arc.prompts import revision_expansion_guidance
 
@@ -1168,7 +1170,7 @@ def test_revision_prompt_uses_actual_length_and_full_replacement_expansion():
 
     payload = {"context": {}, "plan": {}, "draft": "A" * 3474, "draft_contract": {"character_count": 3474, "verdict": "REVISE_REQUIRED"}, "decision": {"required_changes": ["preserve evidence"]}}
     prompt = build_prompt("revision", "canonical", payload)
-    for meaning in ("3474 characters", "526 characters below", "roughly 1526 or more", "full replacement", "review required changes", "event order", "point of view", "ending", "consequences", "aftermath", "repetition, padding, fragments"):
+    for meaning in ("3474 characters", "526 characters below", "at least 1800 characters", "minimum_meaningful_growth", "full replacement", "review required changes", "event order", "point of view", "ending", "consequences", "aftermath", "repetition, padding, fragments"):
         assert meaning in prompt
 
 
@@ -3475,29 +3477,59 @@ def test_pilot_live_complete_noop_preserves_all_hashes(tmp_path):
     assert after == before
 
 
-def test_pilot_live_legacy_terminal_episode_noops_without_provider_calls(tmp_path):
+def _make_legacy_terminal_episode_output(tmp_path):
     output = _make_interrupted_episode_output(tmp_path)
     pilot_manifest = read_json(output / "pilot_manifest.json")
     episode_path = output / "episodes" / "episode_002" / "manifest.json"
     episode_manifest = read_json(episode_path)
     for key in ("prose_provider_contract_version", "writer_provider_contract_version", "writer_provider_response_sha256", "writer_materialized_prose_sha256", "revision_provider_contract_version", "revision_provider_response_sha256", "revision_materialized_prose_sha256"):
         episode_manifest.pop(key, None)
+
+    legacy_text = "가" * 2500
+    legacy_hash = hashlib.sha256(legacy_text.encode()).hexdigest()
+    root_telemetry = read_json(output / "pilot_live_calls.json")
+    max_lease = max(call["lease_sequence"] for call in root_telemetry["calls"])
+    prototype = [call for call in root_telemetry["calls"] if call["scope_id"] == "episode:episode_002"][-1]
+    legacy_call = {**prototype, "call_id": "legacy-writer-1", "desk_id": "episode:episode_002:writer:canonical", "stage": "writer", "role": "canonical", "status": "PASS", "attempt": 1, "lease_sequence": max_lease + 1, "response_sha256": legacy_hash, "output_characters": 2500}
+    root_telemetry["calls"] = [*root_telemetry["calls"], legacy_call]
+    root_telemetry["contract_failures"] = [*root_telemetry.get("contract_failures", []), {"stage": "writer", "role": "canonical", "scope_id": "episode:episode_002", "call_id": "legacy-writer-1", "contract_code": "PROSE_TOO_SHORT", "character_count": 2500}]
+    write_json(output / "pilot_live_calls.json", root_telemetry)
+
+    routing_state = read_json(output / "routing_state.json")
+    routing_state["next_lease_sequence"] = max_lease + 2
+    write_json(output / "routing_state.json", routing_state)
+
+    episode_manifest["artifact_hashes"]["live_calls.json"] = write_json(output / "episodes" / "episode_002" / "live_calls.json", episode_projection_document(root_telemetry, "episode_002"))
     episode_manifest.update({
         "status": "HOLD",
+        "live_call_count": 3,
         "writer_call_count": 1,
         "writer_attempt_state": "REJECTED",
         "writer_exhausted": True,
-        "writer_response_sha256": "a" * 64,
-        "writer_character_count": None,
+        "writer_response_sha256": legacy_hash,
+        "writer_character_count": 2500,
         "writer_contract_code": "PROSE_TOO_SHORT",
         "writer_response_received_at": "2025-01-01T00:00:00+00:00",
         "writer_call_id": "legacy-writer-1",
-        "writer_lease_sequence": 1,
+        "writer_lease_sequence": max_lease + 1,
+        "revision_call_count": 0,
+        "revision_attempt_state": "NOT_STARTED",
+        "revision_exhausted": False,
+        "revision_response_sha256": None,
+        "revision_character_count": None,
+        "revision_contract_code": None,
+        "revision_response_received_at": None,
+        "revision_call_id": None,
+        "revision_lease_sequence": None,
     })
     write_json(episode_path, episode_manifest)
-    pilot_manifest.update({"status": "HOLD", "active_episode_id": "episode_002"})
+    pilot_manifest.update({"status": "HOLD", "active_episode_id": "episode_002", "pilot_live_call_count": len(root_telemetry["calls"]), "live_telemetry_checkpoint": live_telemetry_checkpoint(root_telemetry)})
     write_json(output / "pilot_manifest.json", pilot_manifest)
-    reconcile_live_telemetry_projections(output, pilot_manifest)
+    return output
+
+
+def test_pilot_live_legacy_terminal_episode_noops_without_provider_calls(tmp_path):
+    output = _make_legacy_terminal_episode_output(tmp_path)
 
     before = _file_bytes(output)
     resumed_client, resumed_root = _pilot_client(output)
@@ -3506,13 +3538,15 @@ def test_pilot_live_legacy_terminal_episode_noops_without_provider_calls(tmp_pat
     assert resumed_root.provider_calls == []
     assert _file_bytes(output) == before
 
-    episode_manifest["status"] = "COMPLETE"
+
+def test_pilot_live_legacy_terminal_forged_hash_is_blocked_without_provider_calls(tmp_path):
+    output = _make_legacy_terminal_episode_output(tmp_path)
+    episode_path = output / "episodes" / "episode_002" / "manifest.json"
+    episode_manifest = read_json(episode_path)
+    episode_manifest["writer_response_sha256"] = "a" * 64
     write_json(episode_path, episode_manifest)
-    pilot_manifest["status"] = "COMPLETE"
-    write_json(output / "pilot_manifest.json", pilot_manifest)
-    before = _file_bytes(output)
+
     resumed_client, resumed_root = _pilot_client(output)
-    result = PilotPipeline(resumed_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
-    assert result["no_op"] is True
+    with pytest.raises(PipelineError, match="LEGACY_PROSE_TERMINAL_EVIDENCE_INVALID"):
+        PilotPipeline(resumed_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
     assert resumed_root.provider_calls == []
-    assert _file_bytes(output) == before

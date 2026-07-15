@@ -4,12 +4,12 @@ from __future__ import annotations
 import json
 from math import ceil
 
-from .contracts import ContractError, PROSE_MAX_CHARACTERS, PROSE_MIN_CHARACTERS, PROSE_PROVIDER_CONTRACT_VERSION
+from .contracts import ContractError, PROSE_GENERATION_PROFILE_VERSION, PROSE_MAX_CHARACTERS, PROSE_MIN_CHARACTERS, PROSE_PROVIDER_CONTRACT_VERSION
 
 
 JSON_STAGES = {"planning", "planning_merge", "review", "review_merge", "memory", "memory_merge", "preflight"}
-REVISION_SAFE_EXPANSION_FLOOR = 1200
-REVISION_EXPANSION_MARGIN = 1000
+REVISION_SAFE_EXPANSION_FLOOR = 1800
+REVISION_EXPANSION_MARGIN = 1200
 
 
 def prose_target_band(hard_min: int = PROSE_MIN_CHARACTERS, hard_max: int | None = PROSE_MAX_CHARACTERS) -> tuple[int, int]:
@@ -58,8 +58,9 @@ def _writer_plan_guidance() -> str:
         "Honor every plan.continuity_constraints item. Before returning the same single response, perform an internal expansion "
         "pass over these nine beats: objective, obstacle, action, counteraction, consequence, meaningful change, aftermath, "
         "payoff, and ending hook. Each beat must contain a concrete action, reaction, or state change rather than merely naming "
-        "the plan field. Expand the two or three thinnest beats through multiple connected prose paragraphs using dialogue, "
-        "action, counteraction, cost, and result already supported by the plan. Do not advance to the ending until consequence, "
+        "the plan field. Keep the target at 6,000 to 6,800 characters with a safe internal floor of 5,200; if the internal check is below 5,200, "
+        "expand the two or three thinnest beats through multiple connected prose paragraphs using dialogue, action, counteraction, cost, "
+        "and result already supported by the plan. Do not advance to the ending until consequence, "
         "meaningful change, aftermath, and payoff have each been dramatized. This expansion happens inside the one canonical "
         "response and never authorizes a second call. Do not invent a new central conflict or unsupported setting. "
         "최종 출력은 제목이나 번호 없이 20~24개의 자연스러운 소설 문단으로 구성하라. 짧은 대화 한 줄 문단을 제외하면 "
@@ -80,12 +81,14 @@ def _revision_guidance(payload: dict) -> str:
     hard_gap, safe_expansion = revision_expansion_guidance(character_count)
     return (
         f"The current draft is {character_count} characters and is {hard_gap} characters below the {PROSE_MIN_CHARACTERS}-character "
-        f"hard minimum. Produce a substantially expanded full replacement with roughly {safe_expansion} or more characters of "
-        "meaningful new prose development, while targeting the stated final band; this expansion amount is guidance, not a "
+        f"hard minimum. Produce a substantially expanded full replacement with at least {safe_expansion} characters of meaningful new prose development "
+        f"while targeting the stated final band. safe_final_floor is 5200 and minimum_meaningful_growth=max(1800,5200-{character_count})={safe_expansion}; "
+        "this is guidance, not a "
         "validator. Preserve the existing facts, event order, point of view, ending, and strengths, and apply only the supplied "
         "review required changes. Expand rushed action, compressed dialogue, missing counteraction, causes of emotional change, "
         "costs of choices, consequences, aftermath, and abrupt compression before the ending through coherent scenes rather than "
-        "repetition, padding, fragments, or a new central conflict."
+        "repetition, padding, fragments, or a new central conflict. Return a full replacement, never an appended fragment, "
+        "and silently check the safe floor before returning."
     )
 
 
@@ -180,6 +183,8 @@ Select resolved existing conflicts only by ID from CURRENT_OPEN_CONFLICT_OPTIONS
     prompt_payload = dict(payload)
     if stage in {"writer", "revision"}:
         prompt_payload["prose_provider_contract_version"] = PROSE_PROVIDER_CONTRACT_VERSION
+        prompt_payload["prose_generation_profile_version"] = PROSE_GENERATION_PROFILE_VERSION
+        prompt_payload.setdefault("prose_thinking_level", "high")
     prompt = f"{instruction}\n{role_rule}\nStage: {stage}\nRole: {role}\nInput JSON:\n{json.dumps(prompt_payload, ensure_ascii=False)}"
     if stage in {"writer", "revision"}:
         prompt += f"\n\n{_prose_output_contract()}"

@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .contracts import ContractError, ModelClient, PROSE_MAX_CHARACTERS, PROSE_MIN_CHARACTERS, PROSE_PROVIDER_CONTRACT_VERSION, apply_conflict_selectors, apply_memory_update, materialize_prose_provider_response, parse_object, validate_draft_prose, validate_fixture, validate_memory, validate_plan, validate_prose, validate_review, validate_worker
+from .legacy import LegacyProseEvidenceError, validate_legacy_terminal_evidence
 from .storage import StorageError, read_json, sha256_bytes, sha256_file, verify_artifacts, write_json, write_text
 
 PLANNING_ROLES = ["event", "protagonist_action", "relationship", "continuity", "readability_weight", "reader_payoff"]
@@ -278,6 +279,10 @@ class MockPipeline:
     def _validate_prose_resume_state(self, run_dir: Path, manifest: dict, stage: str) -> None:
         state = self._legacy_prose_resume_state(manifest, stage)
         if state == "LEGACY_TERMINAL":
+            try:
+                validate_legacy_terminal_evidence(run_dir, manifest, stage)
+            except LegacyProseEvidenceError as error:
+                raise PipelineError(error.error_code) from error
             return
         if state == "LEGACY_FORBIDDEN":
             raise PipelineError("LEGACY_PROSE_PROVIDER_RESUME_FORBIDDEN")
@@ -290,6 +295,10 @@ class MockPipeline:
         keys = set(self._initial_writer_state())
         legacy_state = self._legacy_prose_resume_state(manifest, "writer")
         if legacy_state == "LEGACY_TERMINAL":
+            try:
+                validate_legacy_terminal_evidence(run_dir, manifest, "writer")
+            except LegacyProseEvidenceError as error:
+                raise PipelineError(error.error_code) from error
             return
         if legacy_state == "LEGACY_FORBIDDEN":
             raise PipelineError("LEGACY_PROSE_PROVIDER_RESUME_FORBIDDEN")
@@ -362,6 +371,10 @@ class MockPipeline:
         keys = set(self._initial_revision_state())
         legacy_state = self._legacy_prose_resume_state(manifest, "revision")
         if legacy_state == "LEGACY_TERMINAL":
+            try:
+                validate_legacy_terminal_evidence(run_dir, manifest, "revision")
+            except LegacyProseEvidenceError as error:
+                raise PipelineError(error.error_code) from error
             return
         if legacy_state == "LEGACY_FORBIDDEN":
             raise PipelineError("LEGACY_PROSE_PROVIDER_RESUME_FORBIDDEN")

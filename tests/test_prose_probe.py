@@ -82,7 +82,7 @@ def test_probe_passes_with_exactly_one_valid_writer_and_revision_response(tmp_pa
     assert all(item["prose_provider_contract_version"] == 1 for item in result["stages"])
     assert all(item["raw_response_sha256"] != item["materialized_prose_sha256"] for item in result["stages"])
     assert result["source_draft_character_count"] == 3474
-    assert result["revision_safe_expansion"] == 1526
+    assert result["revision_safe_expansion"] == 1800
     assert prose_live_probe_status(output)["overall_status"] == "PASS"
     serialized = (output / "prose_probe.json").read_text() + (output / "prose_probe_calls.json").read_text()
     assert "가" * 100 not in serialized and "나" * 100 not in serialized
