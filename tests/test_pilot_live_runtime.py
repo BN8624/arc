@@ -3473,3 +3473,46 @@ def test_pilot_live_complete_noop_preserves_all_hashes(tmp_path):
     after = {path.relative_to(output).as_posix(): path.read_bytes() for path in output.rglob("*") if path.is_file()}
 
     assert after == before
+
+
+def test_pilot_live_legacy_terminal_episode_noops_without_provider_calls(tmp_path):
+    output = _make_interrupted_episode_output(tmp_path)
+    pilot_manifest = read_json(output / "pilot_manifest.json")
+    episode_path = output / "episodes" / "episode_002" / "manifest.json"
+    episode_manifest = read_json(episode_path)
+    for key in ("prose_provider_contract_version", "writer_provider_contract_version", "writer_provider_response_sha256", "writer_materialized_prose_sha256", "revision_provider_contract_version", "revision_provider_response_sha256", "revision_materialized_prose_sha256"):
+        episode_manifest.pop(key, None)
+    episode_manifest.update({
+        "status": "HOLD",
+        "writer_call_count": 1,
+        "writer_attempt_state": "REJECTED",
+        "writer_exhausted": True,
+        "writer_response_sha256": "a" * 64,
+        "writer_character_count": None,
+        "writer_contract_code": "PROSE_TOO_SHORT",
+        "writer_response_received_at": "2025-01-01T00:00:00+00:00",
+        "writer_call_id": "legacy-writer-1",
+        "writer_lease_sequence": 1,
+    })
+    write_json(episode_path, episode_manifest)
+    pilot_manifest.update({"status": "HOLD", "active_episode_id": "episode_002"})
+    write_json(output / "pilot_manifest.json", pilot_manifest)
+    reconcile_live_telemetry_projections(output, pilot_manifest)
+
+    before = _file_bytes(output)
+    resumed_client, resumed_root = _pilot_client(output)
+    result = PilotPipeline(resumed_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    assert result["no_op"] is True
+    assert resumed_root.provider_calls == []
+    assert _file_bytes(output) == before
+
+    episode_manifest["status"] = "COMPLETE"
+    write_json(episode_path, episode_manifest)
+    pilot_manifest["status"] = "COMPLETE"
+    write_json(output / "pilot_manifest.json", pilot_manifest)
+    before = _file_bytes(output)
+    resumed_client, resumed_root = _pilot_client(output)
+    result = PilotPipeline(resumed_client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+    assert result["no_op"] is True
+    assert resumed_root.provider_calls == []
+    assert _file_bytes(output) == before

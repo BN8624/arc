@@ -266,13 +266,33 @@ class MockPipeline:
     def _initial_writer_state() -> dict:
         return {"writer_provider_contract_version": None, "writer_provider_response_sha256": None, "writer_materialized_prose_sha256": None, "writer_attempt_state": "NOT_STARTED", "writer_exhausted": False, "writer_response_sha256": None, "writer_character_count": None, "writer_contract_code": None, "writer_response_received_at": None, "writer_call_id": None, "writer_lease_sequence": None}
 
+    @staticmethod
+    def _legacy_prose_resume_state(manifest: dict, stage: str) -> str:
+        prefix = f"{stage}_"
+        if f"{prefix}provider_contract_version" in manifest or not any(key in manifest for key in (f"{prefix}attempt_state", f"{prefix}response_sha256", f"{prefix}contract_code")):
+            return "V1"
+        if manifest.get("status") in {"COMPLETE", "HOLD"} and manifest.get(f"{prefix}attempt_state") in {"NOT_STARTED", "COMPLETED", "REJECTED"}:
+            return "LEGACY_TERMINAL"
+        return "LEGACY_FORBIDDEN"
+
+    def _validate_prose_resume_state(self, run_dir: Path, manifest: dict, stage: str) -> None:
+        state = self._legacy_prose_resume_state(manifest, stage)
+        if state == "LEGACY_TERMINAL":
+            return
+        if state == "LEGACY_FORBIDDEN":
+            raise PipelineError("LEGACY_PROSE_PROVIDER_RESUME_FORBIDDEN")
+        if stage == "writer":
+            self._validate_writer_state(run_dir, manifest)
+        else:
+            self._validate_revision_state(run_dir, manifest)
+
     def _prepare_writer_state(self, run_dir: Path, manifest: dict) -> None:
         keys = set(self._initial_writer_state())
-        if "writer_provider_contract_version" not in manifest:
-            if any(key in manifest for key in ("writer_attempt_state", "writer_response_sha256", "writer_contract_code")):
-                if manifest.get("status") in {"COMPLETE", "HOLD"} and manifest.get("writer_attempt_state") in {"COMPLETED", "REJECTED"}:
-                    return
-                raise PipelineError("LEGACY_PROSE_PROVIDER_RESUME_FORBIDDEN")
+        legacy_state = self._legacy_prose_resume_state(manifest, "writer")
+        if legacy_state == "LEGACY_TERMINAL":
+            return
+        if legacy_state == "LEGACY_FORBIDDEN":
+            raise PipelineError("LEGACY_PROSE_PROVIDER_RESUME_FORBIDDEN")
         present = keys & set(manifest)
         if not present:
             error = manifest.get("last_error") if isinstance(manifest.get("last_error"), dict) else {}
@@ -340,11 +360,11 @@ class MockPipeline:
 
     def _prepare_revision_state(self, run_dir: Path, manifest: dict) -> None:
         keys = set(self._initial_revision_state())
-        if "revision_provider_contract_version" not in manifest:
-            if any(key in manifest for key in ("revision_attempt_state", "revision_response_sha256", "revision_contract_code")):
-                if manifest.get("status") in {"COMPLETE", "HOLD"} and manifest.get("revision_attempt_state") in {"COMPLETED", "REJECTED"}:
-                    return
-                raise PipelineError("LEGACY_PROSE_PROVIDER_RESUME_FORBIDDEN")
+        legacy_state = self._legacy_prose_resume_state(manifest, "revision")
+        if legacy_state == "LEGACY_TERMINAL":
+            return
+        if legacy_state == "LEGACY_FORBIDDEN":
+            raise PipelineError("LEGACY_PROSE_PROVIDER_RESUME_FORBIDDEN")
         present = keys & set(manifest)
         if not present:
             error = manifest.get("last_error") if isinstance(manifest.get("last_error"), dict) else {}

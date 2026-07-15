@@ -61,8 +61,8 @@ class PilotPipeline:
                     child = MockPipeline(self._episode_client(active_episode, index), mode="live")
                     child_manifest = read_json(active_manifest)
                     if "writer_attempt_state" in child_manifest:
-                        child._validate_writer_state(active_manifest.parent, child_manifest)
-                    child._validate_revision_state(active_manifest.parent, child_manifest)
+                        child._validate_prose_resume_state(active_manifest.parent, child_manifest, "writer")
+                    child._validate_prose_resume_state(active_manifest.parent, child_manifest, "revision")
                 active_value = read_json(active_manifest) if active_manifest.exists() else {}
                 response_received = active_value.get("revision_attempt_state") == "RESPONSE_RECEIVED" or active_value.get("writer_attempt_state") == "RESPONSE_RECEIVED"
                 if inspection["checkpoint_integrity"] == "RECONCILABLE" and not response_received:
