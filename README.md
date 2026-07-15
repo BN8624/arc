@@ -47,7 +47,9 @@ arc live-run tests/fixtures/live_synthetic_work.json --output .tmp/phase2-live
 arc live-status .tmp/phase2-live
 arc pilot-mock-run tests/fixtures/pilot_synthetic_work.json --output .tmp/phase3a-pilot-pass --scenario pass
 arc pilot-status .tmp/phase3a-pilot-pass
-arc pilot-live-run tests/fixtures/pilot_synthetic_work.json --output .tmp/phase3b-pilot-live --preflight .tmp/phase2-preflight/preflight.json
+arc prose-calibration-run --output .tmp/phase3-prose-calibration --preflight .tmp/phase2-preflight/preflight.json --profiles profile_v2_high profile_v2_minimal --cycles 3
+arc prose-calibration-status .tmp/phase3-prose-calibration
+arc pilot-live-run tests/fixtures/pilot_synthetic_work.json --output .tmp/phase3b-pilot-live --preflight .tmp/phase2-preflight/preflight.json --prose-calibration .tmp/phase3-prose-calibration/prose_calibration.json
 arc pilot-live-status .tmp/phase3b-pilot-live
 ```
 

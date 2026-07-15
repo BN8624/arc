@@ -35,9 +35,10 @@ Primary model:
 - model: `gemma-4-31b-it`
 - context window: 256k tokens
 - maximum output: 32k tokens including reasoning
-- RPM per key: 15
-- TPM: unlimited
-- RPD per key: 1500
+- Provider quota is external and mutable; AI Studio's current project limits are operational truth.
+- Observed on 2026-07-15: RPM 30, input TPM 16,000, RPD 14,400. This is a snapshot, not a permanent guarantee.
+- Repository safety defaults: RPM 27, input TPM 14,000, RPD 13,000, and 14,000 input tokens per request.
+- Admission is per provider project bucket, not per key string. Multiple key slots may share one bucket; key-slot count is not project count.
 - active key pool: 11 keys
 
 Model name, key values, timeout, and output limits must be runtime configuration.
