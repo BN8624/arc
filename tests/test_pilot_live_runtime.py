@@ -316,6 +316,45 @@ def test_all_rate_limited_transport_stops_at_desk_attempt_budget(tmp_path):
     assert sum(provider.calls for provider in providers) == 22
 
 
+def test_desk_elapsed_deadline_stops_retries_before_attempt_limit(tmp_path):
+    class RateLimitedModels:
+        def __init__(self, owner):
+            self.owner = owner
+
+        def generate_content(self, **_kwargs):
+            self.owner.calls += 1
+            error = RuntimeError("rate limited")
+            error.status_code = 429
+            raise error
+
+    class RateLimitedProvider:
+        def __init__(self):
+            self.calls = 0
+            self.models = RateLimitedModels(self)
+
+    clock = [0.0]
+    providers = []
+
+    def advance(seconds):
+        clock[0] += seconds
+
+    def factory(_key):
+        provider = RateLimitedProvider()
+        providers.append(provider)
+        return provider
+
+    # A single cooling key makes the 600-second elapsed deadline arrive before
+    # the 22-attempt limit.
+    config = LiveConfig(MODEL_NAME, {"K01": "key-01"}, launch_interval=0.0)
+    client = GemmaPoolClient(config, client_factory=factory, monotonic=lambda: clock[0], sleeper=advance)
+    with pytest.raises(LiveCallError) as error:
+        client.generate_for_desk(desk=LogicalDesk("transition:adapter", "transition", "adapter", 1), prompt="{}")
+    assert error.value.error_class == "TRANSPORT_RETRY_EXHAUSTED"
+    assert error.value.details["attempts_used"] < 22
+    assert error.value.details["elapsed_seconds"] >= 600
+    assert sum(provider.calls for provider in providers) == error.value.details["attempts_used"]
+
+
 def test_run_provider_attempt_budget_blocks_dispatch_after_restored_root_telemetry(tmp_path):
     client, providers = _client(tmp_path)
     client.restore_telemetry({"calls": [{"call_id": f"L{i:03d}-A001", "desk_id": f"desk-{i}", "logical_order": i, "attempt": 1} for i in range(300)], "contract_failures": []})
