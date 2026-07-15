@@ -175,6 +175,20 @@ class UsageLedger:
                         )
                         """
                     )
+                    conn.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS quota_reservations (
+                            reservation_id TEXT PRIMARY KEY,
+                            bucket_id TEXT NOT NULL,
+                            input_tokens INTEGER NOT NULL,
+                            created_at REAL NOT NULL,
+                            pacific_date TEXT NOT NULL,
+                            state TEXT NOT NULL,
+                            dispatched INTEGER NOT NULL DEFAULT 0
+                        )
+                        """
+                    )
+                    conn.execute("CREATE INDEX IF NOT EXISTS quota_reservations_bucket_time ON quota_reservations(bucket_id, created_at)")
                     conn.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)")
                     if conn.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0] == 0:
                         conn.execute("INSERT INTO schema_version(version) VALUES (?)", (SCHEMA_VERSION,))
@@ -297,6 +311,88 @@ class UsageLedger:
             error_code=error_code,
         )
 
+    def cancel_generation(self, *, event_id: str, error_code: str, usage_run_id: str | None = None, usage_attempt_id: str | None = None, request_group_id: str | None = None) -> None:
+        self.update_event(
+            event_id,
+            expected_statuses={"PREPARED"},
+            usage_run_id=usage_run_id,
+            usage_attempt_id=usage_attempt_id,
+            request_group_id=request_group_id,
+            request_kind="generate_content",
+            status="FAILED",
+            provider_dispatched=False,
+            usage_metadata_status="NOT_APPLICABLE",
+            error_code=error_code,
+        )
+
+    def quota_reserve(self, *, reservation_id: str, bucket_id: str, input_tokens: int, created_at: float, pacific_date: str, limits: dict[str, int]) -> dict:
+        self.ensure()
+        try:
+            with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute("DELETE FROM quota_reservations WHERE created_at <= ?", (created_at - 3 * 86400,))
+                rolling = conn.execute("SELECT created_at, input_tokens FROM quota_reservations WHERE bucket_id=? AND state != 'RELEASED' AND created_at > ?", (bucket_id, created_at - 60)).fetchall()
+                daily = conn.execute("SELECT COUNT(*) FROM quota_reservations WHERE bucket_id=? AND state != 'RELEASED' AND pacific_date=?", (bucket_id, pacific_date)).fetchone()[0]
+                if len(rolling) + 1 > limits["safety_rpm"]:
+                    conn.rollback()
+                    return {"ok": False, "reason": "RPM_WINDOW_FULL", "release_at": min(row["created_at"] + 60 for row in rolling)}
+                if sum(row["input_tokens"] for row in rolling) + input_tokens > limits["safety_input_tpm"]:
+                    conn.rollback()
+                    return {"ok": False, "reason": "INPUT_TPM_WINDOW_FULL", "release_at": min(row["created_at"] + 60 for row in rolling)}
+                if daily + 1 > limits["safety_rpd"]:
+                    conn.rollback()
+                    return {"ok": False, "reason": "RPD_DAY_FULL", "release_at": None}
+                conn.execute("INSERT INTO quota_reservations(reservation_id,bucket_id,input_tokens,created_at,pacific_date,state,dispatched) VALUES(?,?,?,?,?,?,0)", (reservation_id, bucket_id, input_tokens, created_at, pacific_date, "RESERVED"))
+                conn.commit()
+                return {"ok": True, "reservation_id": reservation_id}
+        except sqlite3.IntegrityError as error:
+            raise UsageLedgerError("USAGE_EVENT_ID_COLLISION") from error
+        except Exception as error:
+            if isinstance(error, UsageLedgerError):
+                raise
+            raise UsageLedgerError("USAGE_DB_UNAVAILABLE") from error
+
+    def quota_transition(self, reservation_id: str, *, state: str, dispatched: bool | None = None) -> None:
+        self.ensure()
+        try:
+            with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                values = [state]
+                columns = "state=?"
+                if dispatched is not None:
+                    columns += ", dispatched=?"
+                    values.append(int(dispatched))
+                values.append(reservation_id)
+                expected = "RESERVED" if state == "DISPATCHED" else "DISPATCHED" if state in {"SUCCEEDED", "FAILED"} else "RESERVED"
+                cursor = conn.execute(f"UPDATE quota_reservations SET {columns} WHERE reservation_id=? AND state=?", (*values, expected))
+                if cursor.rowcount != 1:
+                    raise UsageLedgerError("USAGE_EVENT_STATE_CONFLICT")
+                conn.commit()
+        except UsageLedgerError:
+            raise
+        except Exception as error:
+            raise UsageLedgerError("USAGE_DB_UNAVAILABLE") from error
+
+    def quota_release(self, reservation_id: str) -> None:
+        self.ensure()
+        try:
+            with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute("UPDATE quota_reservations SET state='RELEASED' WHERE reservation_id=? AND state='RESERVED'", (reservation_id,))
+                conn.commit()
+        except Exception as error:
+            raise UsageLedgerError("USAGE_DB_UNAVAILABLE") from error
+
+    def quota_snapshot(self, bucket_ids: list[str], *, now: float, limits: dict[str, int], pacific_date: str) -> dict:
+        self.ensure()
+        with self._connect() as conn:
+            result = {}
+            for bucket_id in sorted(set(bucket_ids)):
+                rolling = conn.execute("SELECT input_tokens, state FROM quota_reservations WHERE bucket_id=? AND state != 'RELEASED' AND created_at > ?", (bucket_id, now - 60)).fetchall()
+                daily = conn.execute("SELECT COUNT(*) FROM quota_reservations WHERE bucket_id=? AND state != 'RELEASED' AND pacific_date=?", (bucket_id, pacific_date)).fetchone()[0]
+                result[bucket_id] = {"bucket_id": bucket_id, "rolling_request_count": len(rolling), "rolling_reserved_input_tokens": sum(row["input_tokens"] for row in rolling), "daily_request_count": daily, "remaining_rpm_headroom": max(0, limits["safety_rpm"] - len(rolling)), "remaining_tpm_headroom": max(0, limits["safety_input_tpm"] - sum(row["input_tokens"] for row in rolling)), "remaining_rpd_headroom": max(0, limits["safety_rpd"] - daily), "in_flight_reservations": sum(row["state"] == "RESERVED" for row in rolling)}
+            return result
+
     def insert_event(self, **values: Any) -> None:
         self.ensure()
         dispatch_utc = values.pop("dispatch_utc", None)
@@ -369,7 +465,7 @@ class UsageLedger:
             transition_sql = "(status='DISPATCHED' OR (status='PREPARED' AND request_kind='count_tokens' AND ?=0))"
             transition_params.append(values.get("provider_dispatched", 0))
         elif target_status == "FAILED":
-            transition_sql = "(status='DISPATCHED' OR (status='PREPARED' AND request_kind='count_tokens'))"
+            transition_sql = "(status='DISPATCHED' OR (status='PREPARED' AND request_kind IN ('count_tokens','generate_content')))"
         elif target_status == "USAGE_UNKNOWN":
             transition_sql = "status='DISPATCHED' AND request_kind='generate_content'"
         elif target_status is not None:
@@ -935,7 +1031,7 @@ class TokenGate:
         self.id_factory = id_factory or (lambda: uuid.uuid4().hex)
         self._generation_ownership: dict[str, dict[str, str]] = {}
 
-    def admit(self, *, client: object, model: str, prompt: str, config: object, key_slot_id: str, call: dict, max_output_tokens: int, output_identity: str | None = None) -> tuple[str, int]:
+    def admit(self, *, client: object, model: str, prompt: str, config: object, key_slot_id: str, call: dict, max_output_tokens: int, output_identity: str | None = None, max_input_tokens: int | None = None) -> tuple[str, int]:
         usage_attempt_id = self.id_factory()
         request_group_id = f"{self.usage_run_id}:{usage_attempt_id}"
         count_event_id = f"{request_group_id}:count_tokens"
@@ -948,8 +1044,19 @@ class TokenGate:
             count_prepared = True
             input_tokens, dispatched = self._count_tokens(count_event_id, count_ownership, client, model, prompt, config)
             self.ledger.finish_count_tokens(event_id=count_event_id, input_tokens=input_tokens, dispatched=dispatched, **count_ownership)
+            if max_input_tokens is not None and input_tokens > max_input_tokens:
+                raise TokenAdmissionError("PROJECT_INPUT_TPM_SINGLE_REQUEST_EXCEEDED")
             admission = decide_admission(input_tokens, max_output_tokens)
             self.ledger.insert_generation(event_id=generation_event_id, key_slot_id=key_slot_id, model=model, call=call, input_tokens=input_tokens, max_output_tokens=max_output_tokens, admission=admission, output_identity=output_identity, usage_run_id=self.usage_run_id, usage_attempt_id=usage_attempt_id, request_group_id=request_group_id)
+        except TokenAdmissionError as error:
+            if str(error) == "PROJECT_INPUT_TPM_SINGLE_REQUEST_EXCEEDED":
+                raise
+            if count_prepared:
+                try:
+                    self.ledger.finish_count_tokens(event_id=count_event_id, input_tokens=None, dispatched=bool(getattr(error, "_arc_count_dispatched", False)), error_code="TOKEN_COUNT_UNAVAILABLE", **count_ownership)
+                except Exception:
+                    pass
+            raise TokenAdmissionError("TOKEN_COUNT_UNAVAILABLE") from error
         except UsageEventCollision as error:
             raise TokenAdmissionError("USAGE_EVENT_ID_COLLISION") from error
         except UsageLedgerError:
@@ -972,6 +1079,9 @@ class TokenGate:
     def finish(self, *, event_id: str, response: object | None, succeeded: bool, error_code: str | None = None) -> None:
         usage = parse_usage_metadata(getattr(response, "usage_metadata", None) if response else None)
         self.ledger.finish_generation(event_id=event_id, usage=usage, status="SUCCEEDED" if succeeded else "FAILED", error_code=error_code, **self._generation_ownership.get(event_id, {}))
+
+    def cancel(self, event_id: str, error_code: str) -> None:
+        self.ledger.cancel_generation(event_id=event_id, error_code=error_code, **self._generation_ownership.get(event_id, {}))
 
     def _count_tokens(self, event_id: str, ownership: dict[str, str], client: object, model: str, prompt: str, config: object) -> tuple[int, bool]:
         if self.counter:
