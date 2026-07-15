@@ -94,7 +94,7 @@ def test_prose_prompts_put_final_contract_after_input_and_keep_guidance() -> Non
     assert writer.rfind("FINAL OUTPUT CONTRACT") > writer.rfind('"plan"')
 
 
-def test_generation_config_uses_json_mime_schema_and_prose_limit() -> None:
+def test_generation_config_uses_json_mime_and_prose_limit_without_schema() -> None:
     config = LiveConfig(MODEL_NAME, {f"K{i:02d}": f"key-{i}" for i in range(1, 12)}, launch_interval=1)
     client = GemmaPoolClient(config, client_factory=lambda key: object())
     prose = client._generation_config("writer")
@@ -103,7 +103,7 @@ def test_generation_config_uses_json_mime_schema_and_prose_limit() -> None:
     for value in (prose, revision):
         assert value["responseMimeType"] == "application/json"
         assert value["maxOutputTokens"] == 32768
-        assert value["responseSchema"] == {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"], "additionalProperties": False}
+        assert "responseSchema" not in value
     assert planning["responseMimeType"] == "application/json"
     assert planning["maxOutputTokens"] == 8192
     assert PROSE_PROVIDER_CONTRACT_VERSION == 1

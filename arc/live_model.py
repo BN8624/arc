@@ -16,7 +16,7 @@ import json
 from pathlib import Path
 from enum import Enum
 
-from .contracts import PROSE_PROVIDER_CONTRACT_VERSION, PROSE_PROVIDER_RESPONSE_SCHEMA
+from .contracts import PROSE_PROVIDER_CONTRACT_VERSION
 
 
 MODEL_NAME = "gemma-4-31b-it"
@@ -461,17 +461,9 @@ class GemmaPoolClient:
     def _generation_config(self, stage: str):
         values = {"candidateCount": 1, "maxOutputTokens": self.config.json_limit if stage not in {"writer", "revision"} else self.config.prose_limit, "thinkingConfig": {"thinkingLevel": self.config.thinking_level}}
         values["responseMimeType"] = "application/json"
-        if stage in {"writer", "revision"}:
-            values["responseSchema"] = PROSE_PROVIDER_RESPONSE_SCHEMA
         if not self._types:
             return values
-        try:
-            return self._types.GenerateContentConfig(**values)
-        except TypeError:
-            if stage not in {"writer", "revision"} or "responseSchema" not in values:
-                raise
-            values.pop("responseSchema")
-            return self._types.GenerateContentConfig(**values)
+        return self._types.GenerateContentConfig(**values)
 
     def _max_output_tokens(self, stage: str) -> int:
         return self.config.prose_limit if stage in {"writer", "revision"} else self.config.json_limit
