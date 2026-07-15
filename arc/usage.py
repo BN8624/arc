@@ -6,6 +6,7 @@ import hashlib
 import os
 import sqlite3
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -32,6 +33,10 @@ class UsageLedgerError(RuntimeError):
 
 class UsageEventCollision(UsageLedgerError):
     """Usage event identity collided with an existing row."""
+
+
+def _is_sqlite_lock_error(error: sqlite3.OperationalError) -> bool:
+    return "locked" in str(error).lower() or "busy" in str(error).lower()
 
 
 class TokenAdmissionError(RuntimeError):
@@ -122,6 +127,16 @@ class UsageLedger:
         self._ready = False
 
     def ensure(self) -> None:
+        for attempt in range(10):
+            try:
+                self._ensure_once()
+                return
+            except sqlite3.OperationalError as error:
+                if not _is_sqlite_lock_error(error) or attempt == 9:
+                    raise UsageLedgerError("USAGE_DB_UNAVAILABLE") from error
+                time.sleep(min(0.05 * (2 ** attempt), 0.5))
+
+    def _ensure_once(self) -> None:
         with self._lock:
             if self._ready:
                 return
@@ -129,9 +144,9 @@ class UsageLedger:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
                 if os.name == "posix":
                     self.path.parent.chmod(0o700)
-                with self._connect() as conn:
+                with self._connect(timeout=0.25, busy_timeout_ms=250) as conn:
                     conn.execute("PRAGMA journal_mode=WAL")
-                    conn.execute("PRAGMA busy_timeout=5000")
+                    conn.execute("PRAGMA busy_timeout=250")
                     conn.execute(
                         """
                         CREATE TABLE IF NOT EXISTS usage_events (
@@ -207,6 +222,8 @@ class UsageLedger:
                 self._ready = True
             except Exception as error:
                 if isinstance(error, UsageLedgerError):
+                    raise
+                if isinstance(error, sqlite3.OperationalError) and _is_sqlite_lock_error(error):
                     raise
                 raise UsageLedgerError("USAGE_DB_UNAVAILABLE") from error
 
@@ -659,10 +676,10 @@ class UsageLedger:
         except Exception as error:
             raise UsageLedgerError("USAGE_DB_UNAVAILABLE") from error
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path, timeout=5.0)
+    def _connect(self, *, timeout: float = 5.0, busy_timeout_ms: int = 5000) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.path, timeout=timeout)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
         return conn
 
 
