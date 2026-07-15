@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 
 from .contracts import ContractError, parse_object, validate_worker
-from .evidence_candidates import EVIDENCE_CANDIDATE_CATALOG_VERSION, EvidenceCandidateCatalogError, build_evidence_candidate_catalog
+from .evidence_candidates import EVIDENCE_CANDIDATE_CATALOG_VERSION, EvidenceCandidateCatalogError, EvidenceCandidateProjectionError, build_bounded_candidate_projection, build_evidence_candidate_catalog
 from .live_model import scope_projection
 from .pipeline import MockPipeline, WaveCheckpoint, status
 from .pilot_contracts import ACCEPTANCE_PROVIDER_CONTRACT_VERSION, ACCEPTANCE_RUBRIC, ACCEPTANCE_RUBRIC_VERSION, ACCEPTANCE_SCHEMA_VERSION, PILOT_REVIEW_ROLES, ROLLING_PLAN_HORIZON_LIMITS, STABLE_MEMORY_FIELDS, TRANSITION_ACTIONS, TRANSITION_CANONICAL_RESPONSE_FIELDS, TRANSITION_CONTRACT_VERSION, TRANSITION_EVIDENCE_FILES, TRANSITION_SCHEMA_VERSION, acceptance_catalog_plan, aggregate_pilot_acceptance, canonical_bytes, materialize_acceptance_worker_response, materialize_transition_response, rolling_plan_hash, transition_action_counts, validate_acceptance_worker, validate_grounded_pilot_acceptance, validate_pilot_fixture, validate_transition, validate_transition_response
@@ -220,7 +220,8 @@ class PilotPipeline:
 
     def _transition_payload(self, run_dir: Path, manifest: dict, episode_id: str, next_id: str, source: dict, index: int) -> dict:
         episode_dir = run_dir / "episodes" / episode_id
-        return {
+        candidate_catalog = _transition_candidate_catalog(run_dir, episode_id)
+        payload = {
             "stage": "transition",
             "role": "adapter",
             "transition_contract_version": TRANSITION_CONTRACT_VERSION,
@@ -230,12 +231,7 @@ class PilotPipeline:
             "remaining_episode_count": len(manifest["episode_ids"]) - index - 1,
             "rolling_plan": source["rolling_plan"],
             "required_next_episode_continuity": source["required_next_episode_continuity"],
-            "episode_plan": read_json(episode_dir / "episode_plan.json"),
-            "final": (episode_dir / "final.md").read_text(encoding="utf-8"),
-            "memory_update": read_json(episode_dir / "memory_update.json"),
-            "memory_after": read_json(episode_dir / "memory_after.json"),
             "evidence_candidate_catalog_version": EVIDENCE_CANDIDATE_CATALOG_VERSION,
-            "evidence_candidates": [candidate.to_dict() for candidate in _transition_candidate_catalog(run_dir, episode_id)],
             "plan_limits": dict(ROLLING_PLAN_HORIZON_LIMITS),
             "action_contract": "KEEP: item_before exists exactly once in the source rolling plan and item_after equals item_before. CHANGE: item_before exists exactly once and item_after is a different non-blank string placed at horizon_after. DROP: horizon_after and item_after are null and the item appears nowhere in rolling_plan_after. ADD: horizon_before and item_before are null and item_after is a new item absent from the source plan. Every decision needs a non-blank reason and at least one evidence_candidate_ids entry.",
             "candidate_selection_contract": "Select at least one evidence_candidate_ids value for every adaptation decision, using only candidate_id values from evidence_candidates. Candidate IDs are code-generated and already bind the exact artifact ref and excerpt; do not edit them, create new IDs, or output raw evidence, evidence_refs, ref, or excerpt fields. Select candidate IDs before writing the reason. An unknown or fabricated candidate ID is a terminal contract failure with no retry. Code derives canonical evidence and sorted unique evidence_refs from the selected IDs.",
@@ -243,13 +239,15 @@ class PilotPipeline:
             "accounting_rules": "Consume every source plan item with exactly one KEEP, CHANGE, or DROP decision, in source plan order (immediate_horizon first, then near_horizon). Applying the decisions in order must rebuild rolling_plan_after exactly. rolling_plan_after.immediate_horizon needs at least one item, items are unique across both horizons, and next_episode.required_role must equal rolling_plan_after.immediate_horizon[0]. Do not generate identities or hashes; return only the fields in strict_output_schema.",
             "strict_output_schema": {"next_episode": {"episode_id": next_id, "importance": "ordinary|major|pivot", "required_role": "string"}, "rolling_plan_after": {"immediate_horizon": ["string"], "near_horizon": ["string"]}, "adaptation_decisions": [{"action": "KEEP|CHANGE|DROP|ADD", "horizon_before": "immediate_horizon|near_horizon|null", "item_before": "string|null", "horizon_after": "immediate_horizon|near_horizon|null", "item_after": "string|null", "reason": "string", "evidence_candidate_ids": ["candidate_id"]}], "continuity_satisfied": ["string"], "continuity_deferred": ["string"], "adaptation_summary": "string"},
         }
+        return _bounded_json_payload(payload, candidate_catalog, [f"episodes/{episode_id}/{name}" for name in TRANSITION_EVIDENCE_FILES], None, _prompt_limit(self.client), "transition", "adapter", self.client, f"{episode_id}_to_{next_id}")
 
     def _transition(self, run_dir: Path, manifest: dict, transition_id: str, episode_id: str, next_id: str, source: dict, input_hash: str, index: int) -> tuple[dict, dict]:
         payload = self._transition_payload(run_dir, manifest, episode_id, next_id, source, index)
+        offered_ids = frozenset(entry["candidate_id"] for entry in payload["evidence_candidates"])
         prompt = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         if self.mode != "live":
             raw = self.client.generate(stage="transition", role="adapter", prompt=prompt)
-            return self._transition_from_response(run_dir, episode_id, next_id, source, input_hash, raw)
+            return self._transition_from_response(run_dir, episode_id, next_id, source, input_hash, raw, offered_ids)
         client = self._episode_client(episode_id, index)
         receipt_path = run_dir / "transitions" / f"{transition_id}.response.json"
         receipt = _read_transition_receipt(receipt_path, transition_id, episode_id, next_id, input_hash)
@@ -265,7 +263,7 @@ class PilotPipeline:
             write_json(receipt_path, receipt)
             self._save_checkpoint(run_dir, manifest)
         try:
-            return self._transition_from_response(run_dir, episode_id, next_id, source, input_hash, receipt["raw_response"])
+            return self._transition_from_response(run_dir, episode_id, next_id, source, input_hash, receipt["raw_response"], offered_ids)
         except ContractError as error:
             code = error.contract_code or "TRANSITION_RESPONSE_NOT_OBJECT"
             client.record_contract_failure("transition", "adapter", contract_code=code)
@@ -274,9 +272,12 @@ class PilotPipeline:
             self._save_checkpoint(run_dir, manifest)
             raise
 
-    def _transition_from_response(self, run_dir: Path, episode_id: str, next_id: str, source: dict, input_hash: str, raw: str) -> tuple[dict, dict]:
+    def _transition_from_response(self, run_dir: Path, episode_id: str, next_id: str, source: dict, input_hash: str, raw: str, offered_ids: frozenset[str]) -> tuple[dict, dict]:
         provider_response = validate_transition_response(parse_object(raw))
-        response = materialize_transition_response(provider_response, _transition_candidate_catalog(run_dir, episode_id))
+        # Only candidates actually offered in the provider projection are valid
+        # selections; materialization still reads the canonical catalog entries.
+        offered_catalog = [candidate for candidate in _transition_candidate_catalog(run_dir, episode_id) if candidate.candidate_id in offered_ids]
+        response = materialize_transition_response(provider_response, offered_catalog)
         transition = {"schema_version": TRANSITION_SCHEMA_VERSION, "completed_episode_id": episode_id, "next_episode_id": next_id, "transition_input_hash": input_hash, "next_source_hash": "pending", "rolling_plan_before_hash": rolling_plan_hash(source["rolling_plan"]), **response}
         validate_transition(transition, source, next_id, run_dir)
         next_source = self._next_source_from_transition(run_dir, episode_id, transition)
@@ -367,8 +368,8 @@ class PilotPipeline:
 
     def _review_worker_payload(self, manifest: dict, role: str, evidence_hash: str, catalog: list[dict], candidate_catalog: list[dict]) -> dict:
         dimension = next(item for item in ACCEPTANCE_RUBRIC if item["dimension"] == role)
-        artifact_metadata = [{key: entry[key] for key in ("ref", "kind", "episode_id", "sha256")} | {"character_count": len(entry["content"])} for entry in catalog]
-        return {
+        artifact_metadata = [{key: entry[key] for key in ("ref", "kind", "episode_id")} for entry in catalog]
+        payload = {
             "pilot_id": manifest["pilot_id"],
             "mode": manifest["mode"],
             "scenario": self.scenario,
@@ -383,18 +384,24 @@ class PilotPipeline:
             "criteria": dimension["criteria"],
             "coverage_rule": dimension["coverage_rule"],
             "artifact_metadata": artifact_metadata,
-            "evidence_candidates": candidate_catalog,
+            "evidence_ref_catalog": [],
+            "evidence_candidates": [],
             "evidence_contract": "Select only code-generated evidence_candidate_ids from evidence_candidates. Every criterion and strength must select candidate IDs allowed by its required artifact kinds; code materializes exact ref/excerpt evidence, evidence_refs, and coverage_refs. Do not output evidence, ref, excerpt, evidence_refs, or coverage_refs fields. Do not edit IDs or create new IDs. Unknown IDs are terminal contract failures.",
             "consistency_contract": "dimension_result is PASS only when every criterion result is PASS, critical_finding is null, and at least one grounded strength exists. dimension_result is HOLD when at least one criterion result is HOLD and critical_finding names one HOLD criterion_id with a non-blank finding. Strengths attach only to PASS criteria of this dimension, at most two.",
             "strict_output_schema": {"worker_id": f"pilot_review-{role}", "role": role, "verdict": "OK", "primary_finding": "string", "primary_risk": "string", "proposal": {"dimension_result": "PASS|HOLD", "criterion_results": [{"criterion_id": "string", "result": "PASS|HOLD", "finding": "string", "evidence_candidate_ids": ["candidate_id"]}], "critical_finding": {"criterion_id": "string", "finding": "string"}, "strengths": [{"criterion_id": "string", "strength": "string", "evidence_candidate_ids": ["candidate_id"]}] }},
         }
+        return _bounded_acceptance_payload(payload, candidate_catalog, dimension, manifest["episode_ids"], self.client, role)
 
     def _review_worker(self, run_dir: Path, manifest: dict, role: str, evidence_hash: str, catalog: list[dict], candidate_catalog: list[dict]) -> dict:
         payload = self._review_worker_payload(manifest, role, evidence_hash, catalog, candidate_catalog)
+        # Only candidates actually offered in this dimension's projection are
+        # valid selections; entries still come from the canonical catalog.
+        offered_ids = {entry["candidate_id"] for entry in payload["evidence_candidates"]}
+        offered_catalog = [entry for entry in candidate_catalog if entry["candidate_id"] in offered_ids]
         prompt = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         if self.mode != "live":
             value = parse_object(self.client.generate(stage="pilot_review", role=role, prompt=prompt))
-            return self._review_provider_response_contract(value, role, candidate_catalog, catalog, manifest["episode_ids"])
+            return self._review_provider_response_contract(value, role, offered_catalog, catalog, manifest["episode_ids"])
         client = self._acceptance_client()
         receipt_path = run_dir / "pilot_review_receipts" / f"{role}.response.json"
         receipt = _read_acceptance_receipt(receipt_path, role, evidence_hash)
@@ -410,7 +417,7 @@ class PilotPipeline:
             write_json(receipt_path, receipt)
         try:
             value = parse_object(receipt["raw_response"])
-            return self._review_provider_response_contract(value, role, candidate_catalog, catalog, manifest["episode_ids"])
+            return self._review_provider_response_contract(value, role, offered_catalog, catalog, manifest["episode_ids"])
         except ContractError as error:
             code = error.contract_code or "PILOT_REVIEW_RESPONSE_NOT_OBJECT"
             client.record_contract_failure("pilot_review", role, contract_code=code)
@@ -466,6 +473,103 @@ class PilotPipeline:
 
     def _save_manifest(self, run_dir: Path, manifest: dict) -> None:
         write_json(run_dir / "pilot_manifest.json", manifest)
+
+
+def _prompt_limit(client: object) -> int:
+    config = getattr(client, "config", None)
+    return int(getattr(config, "json_prompt_max_characters", 16000))
+
+
+def _record_prompt_failure(client: object, stage: str, role: str, code: str, character_count: int | None = None) -> None:
+    recorder = getattr(client, "record_contract_failure", None)
+    if recorder:
+        recorder(stage, role, contract_code=code, character_count=character_count)
+
+
+def _bounded_json_payload(
+    payload: dict,
+    full_catalog: list,
+    required_refs: list[str],
+    eligible_kinds: list[str] | tuple[str, ...] | None,
+    prompt_limit: int,
+    stage: str,
+    role: str,
+    client: object,
+    key: str,
+) -> dict:
+    base = {**payload, "evidence_ref_catalog": [], "evidence_candidates": []}
+    fixed_characters = len(json.dumps(base, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+    if fixed_characters > prompt_limit:
+        _record_prompt_failure(client, stage, role, "PROMPT_BUDGET_EXCEEDED", fixed_characters)
+        raise ContractError("fixed JSON payload exceeds the configured prompt budget", "PROMPT_BUDGET_EXCEEDED")
+    try:
+        projection = build_bounded_candidate_projection(full_catalog, required_refs, eligible_kinds, prompt_limit - fixed_characters)
+    except EvidenceCandidateProjectionError as error:
+        _record_prompt_failure(client, stage, role, error.contract_code)
+        raise ContractError(str(error), error.contract_code) from error
+    result = {**payload, **projection}
+    characters = len(json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+    if hasattr(client, "record_prompt_budget"):
+        client.record_prompt_budget(stage, role, characters, key=key)
+    if characters > prompt_limit:
+        _record_prompt_failure(client, stage, role, "PROMPT_BUDGET_EXCEEDED", characters)
+        raise ContractError("JSON prompt exceeds the configured prompt budget", "PROMPT_BUDGET_EXCEEDED")
+    return result
+
+
+def _acceptance_required_refs(candidate_catalog: list[dict], dimension: dict, episode_ids: list[str]) -> tuple[list[str], list[str]]:
+    eligible = {kind for criterion in dimension["criteria"] for kind in criterion["required_evidence_kinds"]}
+    rule = dimension["coverage_rule"]
+    eligible.update(rule["required_kind_episodes"])
+    eligible.update(rule["minimum_kind_episodes"])
+    by_ref = {entry["ref"]: entry for entry in candidate_catalog if entry["kind"] in eligible}
+    ordered_refs = [ref for ref in sorted(by_ref)]
+
+    def add(ref: str) -> None:
+        if ref in by_ref and ref not in required:
+            required.append(ref)
+
+    required: list[str] = []
+    for kind, selector in rule["required_kind_episodes"].items():
+        wanted = set(episode_ids if selector == "all" else [episode_ids[0]] if selector == "first" else [episode_ids[-1]] if selector == "last" else episode_ids[1:])
+        for ref in ordered_refs:
+            if by_ref[ref]["kind"] == kind and by_ref[ref]["episode_id"] in wanted:
+                add(ref)
+    if rule["required_transitions"] == "all":
+        for ref in ordered_refs:
+            if by_ref[ref]["kind"] == "transition":
+                add(ref)
+    for kind, minimum in rule["minimum_kind_episodes"].items():
+        seen: set[str] = set()
+        for ref in ordered_refs:
+            if by_ref[ref]["kind"] == kind and by_ref[ref]["episode_id"] not in seen:
+                add(ref)
+                seen.add(by_ref[ref]["episode_id"])
+                if len(seen) >= minimum:
+                    break
+    if rule["require_first_and_last_episode"]:
+        for episode_id in (episode_ids[0], episode_ids[-1]):
+            for ref in ordered_refs:
+                if by_ref[ref]["episode_id"] == episode_id and by_ref[ref]["kind"] != "transition":
+                    add(ref)
+                    break
+    # Every kind allowed by this dimension must remain selectable for every
+    # criterion, even when its coverage rule is satisfied by another kind.
+    for kind in sorted(eligible):
+        if not any(by_ref[ref]["kind"] == kind for ref in required):
+            next_ref = next((ref for ref in ordered_refs if by_ref[ref]["kind"] == kind), None)
+            if next_ref is not None:
+                add(next_ref)
+    for ref in ordered_refs:
+        if len(required) >= rule["minimum_granular_refs"]:
+            break
+        add(ref)
+    return required, sorted(eligible)
+
+
+def _bounded_acceptance_payload(payload: dict, full_catalog: list[dict], dimension: dict, episode_ids: list[str], client: object, role: str) -> dict:
+    required_refs, eligible_kinds = _acceptance_required_refs(full_catalog, dimension, episode_ids)
+    return _bounded_json_payload(payload, full_catalog, required_refs, eligible_kinds, _prompt_limit(client), "pilot_review", role, client, role)
 
 
 def _unique(values: list[str]) -> list[str]:
@@ -1137,7 +1241,7 @@ def pilot_status(run_dir: Path) -> dict:
         call_ids = [call.get("call_id") for call in calls]
         lease_sequences = [call.get("lease_sequence") for call in calls]
         acceptance_calls = [call for call in calls if call.get("scope_id") == "pilot:acceptance"]
-        result.update({"model": manifest["model"], "key_pool_size": manifest["key_pool_size"], "configured_max_live": manifest["max_live"], "telemetry_schema_version": telemetry["schema_version"], "pilot_live_call_count": len(calls), "live_telemetry_checkpoint": checkpoint, "successful_live_calls": sum(call["status"] == "PASS" for call in calls), "failed_live_calls": sum(call["status"] == "FAIL" for call in calls), "transient_failure_count": sum(call["status"] == "FAIL" and call.get("error_class") in {"RATE_LIMITED", "PROVIDER_5XX", "TIMEOUT", "NETWORK_ERROR"} for call in calls), "contract_failure_count": len(telemetry.get("contract_failures", [])), "used_key_slots": sorted({call["key_slot"] for call in calls}), "rotation_count": sum(1 for call in calls if call["status"] == "FAIL" and call.get("error_class")), "episode_call_counts": {episode_id: sum(call.get("scope_id") == f"episode:{episode_id}" for call in calls) for episode_id in manifest["completed_episodes"]}, "acceptance_call_count": len(acceptance_calls), "acceptance_pass_calls": sum(call["status"] == "PASS" for call in acceptance_calls), "acceptance_prompt_character_counts": {call["role"]: call["input_characters"] for call in acceptance_calls if call.get("stage") == "pilot_review" and call.get("status") == "PASS"}, "call_ids_unique": len(call_ids) == len(set(call_ids)), "lease_sequences_unique": len(lease_sequences) == len(set(lease_sequences))})
+        result.update({"model": manifest["model"], "key_pool_size": manifest["key_pool_size"], "configured_max_live": manifest["max_live"], "telemetry_schema_version": telemetry["schema_version"], "pilot_live_call_count": len(calls), "live_telemetry_checkpoint": checkpoint, "successful_live_calls": sum(call["status"] == "PASS" for call in calls), "failed_live_calls": sum(call["status"] == "FAIL" for call in calls), "transient_failure_count": sum(call["status"] == "FAIL" and call.get("error_class") in {"RATE_LIMITED", "PROVIDER_5XX", "TIMEOUT", "NETWORK_ERROR"} for call in calls), "contract_failure_count": len(telemetry.get("contract_failures", [])), "used_key_slots": sorted({call["key_slot"] for call in calls}), "rotation_count": sum(1 for call in calls if call["status"] == "FAIL" and call.get("error_class")), "episode_call_counts": {episode_id: sum(call.get("scope_id") == f"episode:{episode_id}" for call in calls) for episode_id in manifest["completed_episodes"]}, "acceptance_call_count": len(acceptance_calls), "acceptance_pass_calls": sum(call["status"] == "PASS" for call in acceptance_calls), "acceptance_prompt_character_counts": {call["role"]: call["input_characters"] for call in acceptance_calls if call.get("stage") == "pilot_review" and call.get("status") == "PASS"}, "prompt_budget": telemetry.get("prompt_budget", {}), "call_ids_unique": len(call_ids) == len(set(call_ids)), "lease_sequences_unique": len(lease_sequences) == len(set(lease_sequences))})
     return result
 
 

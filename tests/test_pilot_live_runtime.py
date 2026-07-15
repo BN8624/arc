@@ -11,11 +11,11 @@ import pytest
 
 from arc.contracts import ContractError, PROSE_FORBIDDEN_MARKERS, PROSE_MAX_CHARACTERS, PROSE_MIN_CHARACTERS, PROSE_REPAIRABLE_MIN_CHARACTERS, validate_draft_prose, validate_prose
 from arc.mock_model import acceptance_review_response, transition_adapter_response
-from arc.live_model import AtomicTelemetryStore, GemmaPoolClient, LiveCallError, LiveConfig, MODEL_NAME, RoutingStateStore
+from arc.live_model import AtomicTelemetryStore, GemmaPoolClient, LiveCallError, LiveConfig, LogicalDesk, MODEL_NAME, RoutingStateStore
 from arc.pipeline import PLANNING_ROLES, MockPipeline, WaveCheckpoint, status
 from arc.evidence_candidates import EVIDENCE_CANDIDATE_CATALOG_VERSION
 from arc.pilot_contracts import ACCEPTANCE_GENERIC_QUESTION_MARKER, ACCEPTANCE_PROVIDER_CONTRACT_VERSION, PILOT_REVIEW_ROLES
-from arc.pilot import PilotError, PilotPipeline, classify_episode_projection, episode_projection_document, inspect_pilot_checkpoint, live_telemetry_checkpoint, reconcile_live_telemetry_projections, reconcile_pilot_checkpoint
+from arc.pilot import PilotError, PilotPipeline, _transition_candidate_catalog, classify_episode_projection, episode_projection_document, inspect_pilot_checkpoint, live_telemetry_checkpoint, reconcile_live_telemetry_projections, reconcile_pilot_checkpoint
 from arc.storage import StorageError, read_json, write_json
 
 
@@ -233,6 +233,31 @@ def test_transition_payload_pins_continuity_contract(tmp_path):
     assert "Ignore nested-list membership; if an item also appears in a nested list, partition it once based solely on its top-level membership." in contract
 
 
+def test_transition_rejects_candidate_absent_from_provider_projection(tmp_path):
+    episode_id = "episode_007"
+    next_id = "episode_008"
+    episode_dir = tmp_path / "episodes" / episode_id
+    episode_dir.mkdir(parents=True)
+    prose = " ".join(f"Exact transition evidence sentence number {index:03d} keeps the completed final artifact long enough." for index in range(220))
+    (episode_dir / "final.md").write_text(prose, encoding="utf-8")
+    write_json(episode_dir / "episode_plan.json", {"objective": "A safe JSON excerpt."})
+    write_json(episode_dir / "memory_update.json", {"summary": "A memory update excerpt."})
+    write_json(episode_dir / "memory_after.json", {"summary": "A memory after excerpt."})
+
+    pipeline = PilotPipeline(object(), scenario="pass", mode="mock")
+    source = {"rolling_plan": {"immediate_horizon": ["next item"], "near_horizon": []}, "required_next_episode_continuity": []}
+    payload = pipeline._transition_payload(tmp_path, {"pilot_id": "pilot-test", "episode_ids": [episode_id, next_id]}, episode_id, next_id, source, 0)
+    offered_ids = frozenset(entry["candidate_id"] for entry in payload["evidence_candidates"])
+    excluded = [candidate for candidate in _transition_candidate_catalog(tmp_path, episode_id) if candidate.candidate_id not in offered_ids]
+    assert excluded
+
+    response = transition_adapter_response(payload)
+    response["adaptation_decisions"][0]["evidence_candidate_ids"] = [excluded[0].candidate_id]
+    with pytest.raises(ContractError) as error:
+        pipeline._transition_from_response(tmp_path, episode_id, next_id, source, "hash", json.dumps(response, ensure_ascii=False), offered_ids)
+    assert error.value.contract_code == "EVIDENCE_CANDIDATE_UNKNOWN"
+
+
 def _client(tmp_path, key_count: int = 11) -> tuple[GemmaPoolClient, dict[str, _Provider]]:
     providers: dict[str, _Provider] = {}
 
@@ -243,6 +268,16 @@ def _client(tmp_path, key_count: int = 11) -> tuple[GemmaPoolClient, dict[str, _
 
     store = AtomicTelemetryStore(tmp_path / "pilot_live_calls.json")
     return GemmaPoolClient(_config(key_count), client_factory=factory, telemetry_sink=store.save), providers
+
+
+def test_json_prompt_gate_rejects_before_key_lease_and_provider_call(tmp_path):
+    client, providers = _client(tmp_path)
+    with pytest.raises(LiveCallError) as error:
+        client.generate_for_desk(desk=LogicalDesk("transition:adapter", "transition", "adapter", 1), prompt="x" * 16001)
+    assert error.value.error_class == "PROMPT_BUDGET_EXCEEDED"
+    assert client.calls == []
+    assert all(not provider.prompts for provider in providers.values())
+    assert client.telemetry()["contract_failures"][0]["contract_code"] == "PROMPT_BUDGET_EXCEEDED"
 
 
 def _pilot_client(run_dir: Path, root: _PilotProviderRoot | None = None) -> tuple[GemmaPoolClient, _PilotProviderRoot]:
@@ -2111,7 +2146,9 @@ def test_live_acceptance_prompt_contains_dimension_rubric_and_catalog(tmp_path):
         assert 2 <= len(payload["criteria"]) <= 4
         assert len(payload["artifact_metadata"]) == 34
         assert {entry["kind"] for entry in payload["artifact_metadata"]} == {"episode_final", "episode_plan", "episode_review", "episode_memory_update", "episode_memory_after", "episode_source", "transition"}
-        assert payload["evidence_candidates"] == sorted(payload["evidence_candidates"], key=lambda entry: (entry["ref"], entry["ordinal"]))
+        refs = {entry["ref_id"]: entry for entry in payload["evidence_ref_catalog"]}
+        assert payload["evidence_candidates"] == sorted(payload["evidence_candidates"], key=lambda entry: (refs[entry["ref_id"]]["ref"], entry["ordinal"]))
+        assert all(set(entry) == {"candidate_id", "ref_id", "ordinal", "excerpt"} for entry in payload["evidence_candidates"])
         assert all("content" not in entry for entry in payload["evidence_candidates"])
         assert set(payload["strict_output_schema"]["proposal"]) == {"dimension_result", "criterion_results", "critical_finding", "strengths"}
         assert "evidence_refs" not in payload["strict_output_schema"]

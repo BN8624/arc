@@ -10,6 +10,7 @@ from arc.evidence_candidates import (
     EvidenceCandidateCatalogError,
     UnknownEvidenceCandidateError,
     build_evidence_candidate_catalog,
+    build_bounded_candidate_projection,
     catalog_bytes,
     lookup_candidate,
     make_candidate_id,
@@ -175,3 +176,37 @@ def test_catalog_validation_rejects_unknown_refs_and_requires_candidates_when_re
     raw = "short"
     validate_catalog([], {FINAL_REF: raw}, require_candidate_per_ref=False)
 
+
+def test_bounded_projection_uses_ref_aliases_and_preserves_catalog_ids():
+    raw = "First exact evidence sentence is long enough. Middle exact evidence sentence is long enough. Last exact evidence sentence is long enough."
+    catalog = build_evidence_candidate_catalog({FINAL_REF: raw})
+    projection = build_bounded_candidate_projection(catalog, [FINAL_REF], ["episode_final"], 2000)
+
+    assert projection["evidence_ref_catalog"] == [{"ref_id": "R00", "ref": FINAL_REF, "kind": "episode_final", "episode_id": "episode_004"}]
+    assert all(set(item) == {"candidate_id", "ref_id", "ordinal", "excerpt"} for item in projection["evidence_candidates"])
+    assert {item["candidate_id"] for item in projection["evidence_candidates"]} <= {item.candidate_id for item in catalog}
+
+
+def test_bounded_projection_spreads_selection_evenly_across_ordinals():
+    raw = " ".join(f"Exact evidence sentence number {index} is long enough to include." for index in range(9))
+    catalog = build_evidence_candidate_catalog({FINAL_REF: raw})
+    assert len(catalog) == 9
+
+    projection = None
+    for budget in range(100, 4000):
+        try:
+            projection = build_bounded_candidate_projection(catalog, [FINAL_REF], None, budget)
+        except EvidenceCandidateCatalogError:
+            continue
+        if len(projection["evidence_candidates"]) == 5:
+            break
+
+    assert {entry["ordinal"] for entry in projection["evidence_candidates"]} == {0, 2, 4, 6, 8}
+
+
+def test_bounded_projection_fails_closed_when_required_candidate_cannot_fit():
+    raw = "An exact evidence sentence that cannot fit the tiny projection budget."
+    catalog = build_evidence_candidate_catalog({FINAL_REF: raw})
+    with pytest.raises(EvidenceCandidateCatalogError) as error:
+        build_bounded_candidate_projection(catalog, [FINAL_REF], ["episode_final"], 1)
+    assert error.value.contract_code == "PROMPT_BUDGET_UNSATISFIABLE"

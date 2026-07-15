@@ -37,7 +37,12 @@ def acceptance_review_response(payload: dict, hold: bool = False) -> dict:
     """Deterministic rubric-grounded acceptance worker response for fake providers."""
     role = payload["dimension"]
     episode_ids = payload["episode_ids"]
-    catalog = payload["evidence_candidates"]
+    if "evidence_ref_catalog" in payload:
+        refs = {entry["ref_id"]: entry for entry in payload["evidence_ref_catalog"]}
+        catalog = [{**entry, **{key: refs[entry["ref_id"]][key] for key in ("ref", "kind", "episode_id")}} for entry in payload["evidence_candidates"]]
+    else:
+        # Preserve the fixture-only helper contract for existing offline tests.
+        catalog = payload["evidence_candidates"]
     by_kind: dict[str, list[dict]] = {}
     by_ref: dict[str, dict] = {}
     for entry in catalog:

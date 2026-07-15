@@ -38,6 +38,12 @@ class UnknownEvidenceCandidateError(EvidenceCandidateCatalogError):
     contract_code = "EVIDENCE_CANDIDATE_UNKNOWN"
 
 
+class EvidenceCandidateProjectionError(EvidenceCandidateCatalogError):
+    """A bounded provider projection cannot satisfy its evidence contract."""
+
+    contract_code = "PROMPT_BUDGET_UNSATISFIABLE"
+
+
 @dataclass(frozen=True, slots=True)
 class EvidenceCandidate:
     candidate_id: str
@@ -354,6 +360,89 @@ def generate_candidate_catalog(
 ) -> list[EvidenceCandidate]:
     """Public alias for build_evidence_candidate_catalog."""
     return build_evidence_candidate_catalog(artifacts, allowed_refs=allowed_refs, require_candidate_per_ref=require_candidate_per_ref)
+
+
+def _projection_json(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def build_bounded_candidate_projection(
+    full_catalog: Sequence[EvidenceCandidate | Mapping[str, Any]],
+    required_refs: Sequence[str],
+    eligible_kinds: Sequence[str] | None,
+    available_character_budget: int,
+) -> dict[str, list[dict[str, Any]]]:
+    """Build a deterministic compact candidate view for one provider prompt."""
+    if not isinstance(available_character_budget, int) or isinstance(available_character_budget, bool) or available_character_budget < 0:
+        raise EvidenceCandidateProjectionError("candidate projection budget is invalid")
+    normalized = [_candidate(value) for value in full_catalog]
+    allowed_kinds = set(eligible_kinds) if eligible_kinds is not None else None
+    required = list(dict.fromkeys(required_refs))
+    by_ref: dict[str, list[EvidenceCandidate]] = {}
+    for candidate in sorted(normalized, key=lambda item: (item.ref, item.ordinal)):
+        if allowed_kinds is None or candidate.kind in allowed_kinds:
+            by_ref.setdefault(candidate.ref, []).append(candidate)
+    missing = [ref for ref in required if ref not in by_ref]
+    if missing:
+        raise EvidenceCandidateProjectionError(f"required evidence refs have no eligible candidates: {missing}")
+
+    def priority(items: list[EvidenceCandidate]) -> list[EvidenceCandidate]:
+        positions = []
+        for position in (0, len(items) // 2, len(items) - 1):
+            if position not in positions:
+                positions.append(position)
+        # After first/middle/last, keep every selection prefix evenly spaced over
+        # the full ordinal range by bisecting the widest remaining gap.
+        chosen = sorted(positions)
+        while len(positions) < len(items):
+            gap = max(((right - left, -left) for left, right in zip(chosen, chosen[1:]) if right - left > 1), default=None)
+            if gap is None:
+                break
+            middle = -gap[1] + gap[0] // 2
+            positions.append(middle)
+            chosen.append(middle)
+            chosen.sort()
+        return [items[position] for position in positions]
+
+    # Only refs required by the dimension/stage enter the provider view. This keeps
+    # the canonical full catalog available for later materialization and audit.
+    ordered_refs = sorted(required)
+    ordered_candidates = {ref: priority(by_ref[ref]) for ref in ordered_refs}
+    selected: list[EvidenceCandidate] = [ordered_candidates[ref][0] for ref in ordered_refs]
+
+    def projection(items: Sequence[EvidenceCandidate]) -> dict[str, list[dict[str, Any]]]:
+        refs = sorted({candidate.ref for candidate in items})
+        ref_ids = {ref: f"R{index:02d}" for index, ref in enumerate(refs)}
+        return {
+            "evidence_ref_catalog": [
+                {"ref_id": ref_ids[ref], "ref": ref, "kind": by_ref[ref][0].kind, "episode_id": by_ref[ref][0].episode_id}
+                for ref in refs
+            ],
+            "evidence_candidates": [
+                {"candidate_id": candidate.candidate_id, "ref_id": ref_ids[candidate.ref], "ordinal": candidate.ordinal, "excerpt": candidate.excerpt}
+                for candidate in sorted(items, key=lambda item: (item.ref, item.ordinal))
+            ],
+        }
+
+    if len(_projection_json(projection(selected))) > available_character_budget:
+        raise EvidenceCandidateProjectionError("required candidate projection exceeds its prompt budget")
+
+    selected_ids = {candidate.candidate_id for candidate in selected}
+    # Add candidates in round-robin order, with first/middle/last positions first.
+    for position in range(1, max((len(items) for items in ordered_candidates.values()), default=0)):
+        for ref in ordered_refs:
+            candidates = ordered_candidates[ref]
+            if position >= len(candidates):
+                continue
+            candidate = candidates[position]
+            if candidate.candidate_id in selected_ids:
+                continue
+            proposed = selected + [candidate]
+            if len(_projection_json(projection(proposed))) > available_character_budget:
+                continue
+            selected.append(candidate)
+            selected_ids.add(candidate.candidate_id)
+    return projection(selected)
 
 
 def catalog_bytes(catalog: Sequence[EvidenceCandidate | Mapping[str, Any]]) -> bytes:

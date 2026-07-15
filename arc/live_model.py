@@ -33,10 +33,11 @@ class LiveConfigError(ValueError):
 
 
 class LiveCallError(RuntimeError):
-    def __init__(self, error_class: str, stage: str, role: str, slot: str, message: str, http_status: int | None = None, provider_code: str | None = None):
+    def __init__(self, error_class: str, stage: str, role: str, slot: str, message: str, http_status: int | None = None, provider_code: str | None = None, details: dict | None = None):
         super().__init__(message)
         self.error_class, self.stage, self.role, self.slot = error_class, stage, role, slot
         self.http_status, self.provider_code = http_status, provider_code
+        self.details = details or {}
 
 
 @dataclass(frozen=True)
@@ -207,12 +208,23 @@ class LiveConfig:
     json_limit: int = 8192
     prose_limit: int = 32768
     thinking_level: str = "high"
+    json_prompt_max_characters: int = 16000
 
     @classmethod
     def from_environment(cls, env: dict[str, str] | None = None) -> "LiveConfig":
         env = os.environ if env is None else env
         try:
-            config = cls(env.get("MODEL", ""), {f"K{i:02d}": env.get(f"GOOGLE_API_KEY_{i}", "") for i in range(1, 12)}, int(env.get("ARC_MAX_LIVE", "11")), float(env["ARC_LAUNCH_INTERVAL_SECONDS"]), int(env.get("ARC_REQUEST_TIMEOUT_SECONDS", "600")), int(env.get("ARC_JSON_MAX_OUTPUT_TOKENS", "8192")), int(env.get("ARC_PROSE_MAX_OUTPUT_TOKENS", "32768")), env.get("ARC_THINKING_LEVEL", "high"))
+            config = cls(
+                env.get("MODEL", ""),
+                {f"K{i:02d}": env.get(f"GOOGLE_API_KEY_{i}", "") for i in range(1, 12)},
+                int(env.get("ARC_MAX_LIVE", "11")),
+                float(env["ARC_LAUNCH_INTERVAL_SECONDS"]),
+                int(env.get("ARC_REQUEST_TIMEOUT_SECONDS", "600")),
+                int(env.get("ARC_JSON_MAX_OUTPUT_TOKENS", "8192")),
+                int(env.get("ARC_PROSE_MAX_OUTPUT_TOKENS", "32768")),
+                env.get("ARC_THINKING_LEVEL", "high"),
+                int(env.get("ARC_JSON_PROMPT_MAX_CHARACTERS", "16000")),
+            )
         except (ValueError, KeyError) as error:
             raise LiveConfigError("numeric live configuration is invalid") from error
         config.validate()
@@ -223,7 +235,7 @@ class LiveConfig:
             raise LiveConfigError("MODEL must be gemma-4-31b-it")
         if any(not value for value in self.keys.values()) or len(set(self.keys.values())) != 11:
             raise LiveConfigError("eleven distinct non-empty key slots are required")
-        if not 1 <= self.max_live <= 11 or not math.isfinite(self.launch_interval) or not 1 <= self.launch_interval <= 60 or self.timeout <= 0 or not 1 <= self.json_limit <= 32768 or not 1 <= self.prose_limit <= 32768:
+        if not 1 <= self.max_live <= 11 or not math.isfinite(self.launch_interval) or not 1 <= self.launch_interval <= 60 or self.timeout <= 0 or not 1 <= self.json_limit <= 32768 or not 1 <= self.prose_limit <= 32768 or not 4000 <= self.json_prompt_max_characters <= 24000:
             raise LiveConfigError("live limits are invalid")
         if self.thinking_level not in {"low", "medium", "high"}:
             raise LiveConfigError("thinking level is invalid")
@@ -276,6 +288,9 @@ class ScopedGemmaPoolClient:
     def record_contract_failure(self, stage: str, role: str, slot: str | None = None, contract_code: str | None = None, character_count: int | None = None) -> None:
         self.base.record_contract_failure(stage, role, slot, contract_code=contract_code, scope_id=self.scope_id, character_count=character_count)
 
+    def record_prompt_budget(self, stage: str, role: str, character_count: int, key: str | None = None) -> None:
+        self.base.record_prompt_budget(stage, role, character_count, key=key)
+
     def close(self) -> None:
         return None
 
@@ -294,6 +309,7 @@ class GemmaPoolClient:
         self.contract_failures: list[dict] = []
         self.active_by_stage: dict[str, int] = {}
         self.max_active_by_stage: dict[str, int] = {}
+        self.prompt_budget = {"json_prompt_max_characters": config.json_prompt_max_characters, "max_observed_json_prompt_characters": 0, "transition_prompt_characters": {}, "acceptance_prompt_characters": {}}
         if client_factory is None:
             from google import genai
             from google.genai import types
@@ -314,6 +330,9 @@ class GemmaPoolClient:
         return ScopedGemmaPoolClient(self, scope_id, logical_order_base)
 
     def generate_for_desk(self, *, desk: LogicalDesk, prompt: str) -> str:
+        if desk.stage not in {"writer", "revision", "preflight"} and len(prompt) > self.config.json_prompt_max_characters:
+            self.record_contract_failure(desk.stage, desk.role, contract_code="PROMPT_BUDGET_EXCEEDED", scope_id=desk.scope_id, character_count=len(prompt))
+            raise LiveCallError("PROMPT_BUDGET_EXCEEDED", desk.stage, desk.role, "NONE", "JSON prompt exceeds the configured character budget", details={"stage": desk.stage, "role": desk.role, "prompt_characters": len(prompt), "prompt_character_limit": self.config.json_prompt_max_characters})
         while True:
             slot, lease_sequence = self.pool.lease()
             try:
@@ -394,7 +413,7 @@ class GemmaPoolClient:
 
     def _telemetry_snapshot(self, scope_id: str | None = None) -> dict:
         calls = sorted(self.calls, key=lambda call: (call.get("logical_order", 0), call.get("attempt", 0)))
-        snapshot = {"schema_version": 2, "provider": "gemini_developer_api", "model": self.config.model, "calls": calls, "contract_failures": self.contract_failures, "max_active_by_stage": self.max_active_by_stage}
+        snapshot = {"schema_version": 2, "provider": "gemini_developer_api", "model": self.config.model, "calls": calls, "contract_failures": self.contract_failures, "max_active_by_stage": self.max_active_by_stage, "prompt_budget": self.prompt_budget}
         return scope_projection(snapshot, scope_id) if scope_id is not None else snapshot
 
     def telemetry(self, scope_id: str | None = None) -> dict:
@@ -406,11 +425,12 @@ class GemmaPoolClient:
             self.calls = list(telemetry["calls"])
             self.contract_failures = list(telemetry.get("contract_failures", []))
             self.max_active_by_stage = dict(telemetry.get("max_active_by_stage", {}))
+            self.prompt_budget = dict(telemetry.get("prompt_budget", self.prompt_budget))
 
     def record_contract_failure(self, stage: str, role: str, slot: str | None = None, contract_code: str | None = None, scope_id: str | None = None, character_count: int | None = None) -> None:
         now = datetime.now(timezone.utc).isoformat()
         with self._lock:
-            recent = next((call for call in reversed(self.calls) if call.get("scope_id") == scope_id and call["stage"] == stage and call["role"] == role), None)
+            recent = next((call for call in reversed(self.calls) if call.get("scope_id") == scope_id and call.get("stage") == stage and call.get("role") == role), None)
             key_slot = slot or (recent or {}).get("key_slot") or "UNKNOWN"
             message = "sanitized planning merge contract failure" if stage == "planning_merge" else "sanitized prose contract failure" if stage in {"writer", "revision"} else "sanitized contract failure"
             event = {"event_id": f"CF{len(self.contract_failures)+1:03d}", "scope_id": scope_id, "desk_id": (recent or {}).get("desk_id", f"{stage}:{role}"), "stage": stage, "role": role, "key_slot": key_slot, "call_id": (recent or {}).get("call_id"), "contract_code": contract_code, "error_class": "CONTRACT_ERROR", "created_at": now, "message": message}
@@ -420,6 +440,18 @@ class GemmaPoolClient:
             if duplicate:
                 return
             self.contract_failures.append(event)
+            if self._telemetry_sink:
+                self._telemetry_sink(self._telemetry_snapshot())
+
+    def record_prompt_budget(self, stage: str, role: str, character_count: int, key: str | None = None) -> None:
+        if stage in {"writer", "revision", "preflight"}:
+            return
+        with self._lock:
+            self.prompt_budget["max_observed_json_prompt_characters"] = max(self.prompt_budget.get("max_observed_json_prompt_characters", 0), character_count)
+            if stage == "transition":
+                self.prompt_budget.setdefault("transition_prompt_characters", {})[key or f"{stage}:{role}"] = character_count
+            elif stage == "pilot_review":
+                self.prompt_budget.setdefault("acceptance_prompt_characters", {})[key or role] = character_count
             if self._telemetry_sink:
                 self._telemetry_sink(self._telemetry_snapshot())
 
