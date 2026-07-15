@@ -280,6 +280,51 @@ def test_json_prompt_gate_rejects_before_key_lease_and_provider_call(tmp_path):
     assert client.telemetry()["contract_failures"][0]["contract_code"] == "PROMPT_BUDGET_EXCEEDED"
 
 
+def test_all_rate_limited_transport_stops_at_desk_attempt_budget(tmp_path):
+    class RateLimitedModels:
+        def __init__(self, owner):
+            self.owner = owner
+
+        def generate_content(self, **_kwargs):
+            self.owner.calls += 1
+            error = RuntimeError("rate limited")
+            error.status_code = 429
+            raise error
+
+    class RateLimitedProvider:
+        def __init__(self):
+            self.calls = 0
+            self.models = RateLimitedModels(self)
+
+    clock = [0.0]
+    providers = []
+
+    def advance(seconds):
+        clock[0] += seconds
+
+    def factory(_key):
+        provider = RateLimitedProvider()
+        providers.append(provider)
+        return provider
+
+    config = LiveConfig(MODEL_NAME, {"K01": "key-01", "K02": "key-02"}, launch_interval=0.0)
+    client = GemmaPoolClient(config, client_factory=factory, monotonic=lambda: clock[0], sleeper=advance)
+    with pytest.raises(LiveCallError) as error:
+        client.generate_for_desk(desk=LogicalDesk("transition:adapter", "transition", "adapter", 1), prompt="{}")
+    assert error.value.error_class == "TRANSPORT_RETRY_EXHAUSTED"
+    assert error.value.details["attempts_used"] == 22
+    assert sum(provider.calls for provider in providers) == 22
+
+
+def test_run_provider_attempt_budget_blocks_dispatch_after_restored_root_telemetry(tmp_path):
+    client, providers = _client(tmp_path)
+    client.restore_telemetry({"calls": [{"call_id": f"L{i:03d}-A001", "desk_id": f"desk-{i}", "logical_order": i, "attempt": 1} for i in range(300)], "contract_failures": []})
+    with pytest.raises(LiveCallError) as error:
+        client.generate_for_desk(desk=LogicalDesk("transition:adapter", "transition", "adapter", 1), prompt="{}")
+    assert error.value.error_class == "RUN_PROVIDER_ATTEMPT_BUDGET_EXHAUSTED"
+    assert all(not provider.prompts for provider in providers.values())
+
+
 def _pilot_client(run_dir: Path, root: _PilotProviderRoot | None = None) -> tuple[GemmaPoolClient, _PilotProviderRoot]:
     provider_root = root or _PilotProviderRoot()
     state_store = RoutingStateStore(run_dir / "routing_state.json", list(_config().keys))
@@ -2968,6 +3013,41 @@ def test_rejected_transition_receipt_fails_closed_without_recall(tmp_path):
         pipeline.run(PILOT_FIXTURE, output)
     assert resumed_root.provider_calls == []
     assert (output / TRANSITION_RECEIPT_PATH).read_bytes() == receipt_bytes
+    assert not (output / TRANSITION_ARTIFACT_PATH).exists()
+
+
+class _TransitionRateLimitedRoot(_PilotProviderRoot):
+    def response(self, stage: str, role: str, payload: dict) -> str:
+        if stage == "transition":
+            error = RuntimeError("rate limited")
+            error.status_code = 429
+            raise error
+        return super().response(stage, role, payload)
+
+
+def test_transition_transport_exhaustion_surfaces_in_pilot_manifest(tmp_path):
+    output = tmp_path / "pilot-live"
+    clock = [0.0]
+
+    def advance(seconds: float) -> None:
+        clock[0] += seconds
+
+    root = _TransitionRateLimitedRoot()
+    state_store = RoutingStateStore(output / "routing_state.json", list(_config().keys))
+    telemetry_store = AtomicTelemetryStore(output / "pilot_live_calls.json")
+    client = GemmaPoolClient(_config(), client_factory=root.factory, state_store=state_store, telemetry_sink=telemetry_store.save, monotonic=lambda: clock[0], sleeper=advance)
+    with pytest.raises(LiveCallError) as error:
+        PilotPipeline(client, scenario=None, mode="live").run(PILOT_FIXTURE, output)
+
+    assert error.value.error_class == "TRANSPORT_RETRY_EXHAUSTED"
+    manifest = read_json(output / "pilot_manifest.json")
+    assert manifest["status"] == "ERROR"
+    assert manifest["last_error"]["error_class"] == "TRANSPORT_RETRY_EXHAUSTED"
+    assert manifest["last_error"]["stage"] == "transition"
+    assert manifest["last_error"]["attempts_used"] == 22
+    assert manifest["last_error"]["last_error_class"] == "RATE_LIMITED"
+    assert manifest["last_error"]["message"] == "sanitized pilot failure"
+    assert not (output / TRANSITION_RECEIPT_PATH).exists()
     assert not (output / TRANSITION_ARTIFACT_PATH).exists()
 
 

@@ -499,7 +499,9 @@ class MockPipeline:
 
     def _error_record(self, error: Exception) -> dict | str:
         if hasattr(error, "error_class"):
-            return {"error_class": error.error_class, "stage": error.stage, "role": error.role, "key_slot": error.slot, "http_status": error.http_status, "provider_code": error.provider_code, "message": "sanitized provider failure"}
+            record = {"error_class": error.error_class, "stage": error.stage, "role": error.role, "key_slot": error.slot, "http_status": error.http_status, "provider_code": error.provider_code, "message": "sanitized provider failure"}
+            record.update({key: value for key, value in getattr(error, "details", {}).items() if key != "prompt" and key != "excerpt"})
+            return record
         if isinstance(error, ContractError) and error.contract_code:
             telemetry = self.client.telemetry() if hasattr(self.client, "telemetry") else {"contract_failures": []}
             event = next((item for item in reversed(telemetry.get("contract_failures", [])) if item.get("contract_code") == error.contract_code), {})

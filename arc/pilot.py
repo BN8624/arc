@@ -84,7 +84,21 @@ class PilotPipeline:
                 active = manifest.get("active_episode_id")
                 child = read_json(run_dir / "episodes" / active / "manifest.json") if active and (run_dir / "episodes" / active / "manifest.json").exists() else {}
                 child_error = child.get("last_error") if isinstance(child.get("last_error"), dict) else None
-                manifest["last_error"] = {"error_class": (child_error or {}).get("error_class", "CONTRACT_ERROR" if isinstance(error, ContractError) else "PIPELINE_ERROR"), "active_episode_id": active, "stage": (child_error or {}).get("stage"), "role": (child_error or {}).get("role"), "contract_code": (child_error or {}).get("contract_code"), "message": "sanitized child episode failure"}
+                # Pilot-level desk failures (transition, acceptance) leave no child
+                # episode error; classify them from the raised error instead of
+                # collapsing to PIPELINE_ERROR/CONTRACT_ERROR without details.
+                direct = None
+                if child_error is None:
+                    if hasattr(error, "error_class"):
+                        direct = {"error_class": error.error_class, "stage": error.stage, "role": error.role, "contract_code": None}
+                        direct.update({key: value for key, value in getattr(error, "details", {}).items() if key not in {"prompt", "excerpt"}})
+                    elif isinstance(error, ContractError) and error.contract_code:
+                        direct = {"error_class": "CONTRACT_ERROR", "contract_code": error.contract_code}
+                record = child_error or direct
+                manifest["last_error"] = {"error_class": (record or {}).get("error_class", "CONTRACT_ERROR" if isinstance(error, ContractError) else "PIPELINE_ERROR"), "active_episode_id": active, "stage": (record or {}).get("stage"), "role": (record or {}).get("role"), "contract_code": (record or {}).get("contract_code"), "message": "sanitized pilot failure" if direct else "sanitized child episode failure"}
+                for key in ("desk_id", "attempt_limit", "attempts_used", "elapsed_limit_seconds", "elapsed_seconds", "last_error_class", "last_http_status", "prompt_characters", "prompt_character_limit", "max_provider_attempts_per_run", "provider_attempts_used"):
+                    if record and key in record:
+                        manifest["last_error"][key] = record[key]
                 self._save_checkpoint(run_dir, manifest)
             else:
                 manifest["last_error"] = str(error)
@@ -1241,7 +1255,7 @@ def pilot_status(run_dir: Path) -> dict:
         call_ids = [call.get("call_id") for call in calls]
         lease_sequences = [call.get("lease_sequence") for call in calls]
         acceptance_calls = [call for call in calls if call.get("scope_id") == "pilot:acceptance"]
-        result.update({"model": manifest["model"], "key_pool_size": manifest["key_pool_size"], "configured_max_live": manifest["max_live"], "telemetry_schema_version": telemetry["schema_version"], "pilot_live_call_count": len(calls), "live_telemetry_checkpoint": checkpoint, "successful_live_calls": sum(call["status"] == "PASS" for call in calls), "failed_live_calls": sum(call["status"] == "FAIL" for call in calls), "transient_failure_count": sum(call["status"] == "FAIL" and call.get("error_class") in {"RATE_LIMITED", "PROVIDER_5XX", "TIMEOUT", "NETWORK_ERROR"} for call in calls), "contract_failure_count": len(telemetry.get("contract_failures", [])), "used_key_slots": sorted({call["key_slot"] for call in calls}), "rotation_count": sum(1 for call in calls if call["status"] == "FAIL" and call.get("error_class")), "episode_call_counts": {episode_id: sum(call.get("scope_id") == f"episode:{episode_id}" for call in calls) for episode_id in manifest["completed_episodes"]}, "acceptance_call_count": len(acceptance_calls), "acceptance_pass_calls": sum(call["status"] == "PASS" for call in acceptance_calls), "acceptance_prompt_character_counts": {call["role"]: call["input_characters"] for call in acceptance_calls if call.get("stage") == "pilot_review" and call.get("status") == "PASS"}, "prompt_budget": telemetry.get("prompt_budget", {}), "call_ids_unique": len(call_ids) == len(set(call_ids)), "lease_sequences_unique": len(lease_sequences) == len(set(lease_sequences))})
+        result.update({"model": manifest["model"], "key_pool_size": manifest["key_pool_size"], "configured_max_live": manifest["max_live"], "telemetry_schema_version": telemetry["schema_version"], "pilot_live_call_count": len(calls), "live_telemetry_checkpoint": checkpoint, "successful_live_calls": sum(call["status"] == "PASS" for call in calls), "failed_live_calls": sum(call["status"] == "FAIL" for call in calls), "transient_failure_count": sum(call["status"] == "FAIL" and call.get("error_class") in {"RATE_LIMITED", "PROVIDER_5XX", "TIMEOUT", "NETWORK_ERROR"} for call in calls), "contract_failure_count": len(telemetry.get("contract_failures", [])), "used_key_slots": sorted({call["key_slot"] for call in calls}), "rotation_count": sum(1 for call in calls if call["status"] == "FAIL" and call.get("error_class")), "episode_call_counts": {episode_id: sum(call.get("scope_id") == f"episode:{episode_id}" for call in calls) for episode_id in manifest["completed_episodes"]}, "acceptance_call_count": len(acceptance_calls), "acceptance_pass_calls": sum(call["status"] == "PASS" for call in acceptance_calls), "acceptance_prompt_character_counts": {call["role"]: call["input_characters"] for call in acceptance_calls if call.get("stage") == "pilot_review" and call.get("status") == "PASS"}, "prompt_budget": telemetry.get("prompt_budget", {}), "retry_budget": telemetry.get("retry_budget", {}), "call_ids_unique": len(call_ids) == len(set(call_ids)), "lease_sequences_unique": len(lease_sequences) == len(set(lease_sequences))})
     return result
 
 

@@ -76,10 +76,14 @@ class KeyState(str, Enum):
     DISABLED = "DISABLED"
 
 
+class RetryDeadlineExceeded(RuntimeError):
+    """No key can be leased before a desk retry deadline."""
+
+
 class DynamicKeyPool:
     """Lease fungible API-key slots to logical desks."""
-    def __init__(self, slots: list[str], monotonic: Callable[[], float] = time.monotonic, state_store: "RoutingStateStore | None" = None, utcnow: Callable[[], datetime] = lambda: datetime.now(timezone.utc)):
-        self._clock, self._lock, self._slots, self._cursor, self._sequence, self._store = monotonic, threading.Condition(), {slot: {"state": KeyState.AVAILABLE, "failures": 0, "cooldown": 0.0, "lease": 0} for slot in slots}, 0, 0, state_store
+    def __init__(self, slots: list[str], monotonic: Callable[[], float] = time.monotonic, state_store: "RoutingStateStore | None" = None, utcnow: Callable[[], datetime] = lambda: datetime.now(timezone.utc), waiter: Callable[[float], None] | None = None):
+        self._clock, self._waiter, self._lock, self._slots, self._cursor, self._sequence, self._store = monotonic, waiter, threading.Condition(), {slot: {"state": KeyState.AVAILABLE, "failures": 0, "cooldown": 0.0, "lease": 0} for slot in slots}, 0, 0, state_store
         self._utcnow = utcnow
         if state_store and state_store.path.exists():
             state = state_store.load()
@@ -93,7 +97,7 @@ class DynamicKeyPool:
         if self._store:
             self._store.save(cursor=self._cursor % len(self._slots), lease_sequence=self._sequence + 1, keys={slot: {"state": item["state"], "consecutive_transient_failures": item["failures"], "cooldown_until": (self._utcnow() + timedelta(seconds=max(0.0, item["cooldown"] - self._clock()))).isoformat() if item["state"] == KeyState.COOLDOWN else None, "last_lease_sequence": item["lease"]} for slot, item in self._slots.items()})
 
-    def lease(self) -> tuple[str, int]:
+    def lease(self, deadline: float | None = None) -> tuple[str, int]:
         with self._lock:
             while True:
                 now = self._clock()
@@ -111,7 +115,19 @@ class DynamicKeyPool:
                 waits = [item["cooldown"] - now for item in self._slots.values() if item["state"] == KeyState.COOLDOWN]
                 if not waits:
                     raise LiveConfigError("all key slots are disabled")
-                self._lock.wait(timeout=max(0.0, min(waits)))
+                timeout = max(0.0, min(waits))
+                if deadline is not None:
+                    timeout = min(timeout, max(0.0, deadline - now))
+                    if timeout <= 0:
+                        raise RetryDeadlineExceeded("desk retry deadline exceeded while waiting for a key")
+                if self._waiter is None:
+                    self._lock.wait(timeout=timeout)
+                else:
+                    self._lock.release()
+                    try:
+                        self._waiter(timeout)
+                    finally:
+                        self._lock.acquire()
 
     def release(self, slot: str, error_class: str | None = None) -> None:
         with self._lock:
@@ -209,6 +225,9 @@ class LiveConfig:
     prose_limit: int = 32768
     thinking_level: str = "high"
     json_prompt_max_characters: int = 16000
+    max_transport_attempts_per_desk: int = 22
+    max_transport_retry_seconds_per_desk: int = 600
+    max_provider_attempts_per_run: int = 300
 
     @classmethod
     def from_environment(cls, env: dict[str, str] | None = None) -> "LiveConfig":
@@ -224,6 +243,9 @@ class LiveConfig:
                 int(env.get("ARC_PROSE_MAX_OUTPUT_TOKENS", "32768")),
                 env.get("ARC_THINKING_LEVEL", "high"),
                 int(env.get("ARC_JSON_PROMPT_MAX_CHARACTERS", "16000")),
+                int(env.get("ARC_MAX_TRANSPORT_ATTEMPTS_PER_DESK", "22")),
+                int(env.get("ARC_MAX_TRANSPORT_RETRY_SECONDS_PER_DESK", "600")),
+                int(env.get("ARC_MAX_PROVIDER_ATTEMPTS_PER_RUN", "300")),
             )
         except (ValueError, KeyError) as error:
             raise LiveConfigError("numeric live configuration is invalid") from error
@@ -235,7 +257,7 @@ class LiveConfig:
             raise LiveConfigError("MODEL must be gemma-4-31b-it")
         if any(not value for value in self.keys.values()) or len(set(self.keys.values())) != 11:
             raise LiveConfigError("eleven distinct non-empty key slots are required")
-        if not 1 <= self.max_live <= 11 or not math.isfinite(self.launch_interval) or not 1 <= self.launch_interval <= 60 or self.timeout <= 0 or not 1 <= self.json_limit <= 32768 or not 1 <= self.prose_limit <= 32768 or not 4000 <= self.json_prompt_max_characters <= 24000:
+        if not 1 <= self.max_live <= 11 or not math.isfinite(self.launch_interval) or not 1 <= self.launch_interval <= 60 or self.timeout <= 0 or not 1 <= self.json_limit <= 32768 or not 1 <= self.prose_limit <= 32768 or not 4000 <= self.json_prompt_max_characters <= 24000 or not 1 <= self.max_transport_attempts_per_desk <= 110 or not 30 <= self.max_transport_retry_seconds_per_desk <= 3600 or not 50 <= self.max_provider_attempts_per_run <= 2000:
             raise LiveConfigError("live limits are invalid")
         if self.thinking_level not in {"low", "medium", "high"}:
             raise LiveConfigError("thinking level is invalid")
@@ -296,16 +318,19 @@ class ScopedGemmaPoolClient:
 
 
 class GemmaPoolClient:
-    def __init__(self, config: LiveConfig, client_factory: Callable[[str], object] | None = None, state_store: RoutingStateStore | None = None, telemetry_sink: Callable[[dict], None] | None = None, usage_gate: object | None = None):
+    def __init__(self, config: LiveConfig, client_factory: Callable[[str], object] | None = None, state_store: RoutingStateStore | None = None, telemetry_sink: Callable[[dict], None] | None = None, usage_gate: object | None = None, monotonic: Callable[[], float] | None = None, sleeper: Callable[[float], None] | None = None):
         self.config, self._lock, self.calls = config, threading.Lock(), []
+        self._clock = monotonic or time.monotonic
+        self._sleeper = sleeper
+        self._provider_attempts_reserved = 0
         self._telemetry_sink = telemetry_sink
         uses_real_provider = client_factory is None
         if usage_gate is None and uses_real_provider:
             from .usage import TokenGate, UsageLedger
             usage_gate = TokenGate(UsageLedger())
         self.usage_gate = usage_gate
-        self.pacer = LaunchPacer(config.launch_interval)
-        self.pool = DynamicKeyPool(list(config.keys), state_store=state_store)
+        self.pacer = LaunchPacer(config.launch_interval, monotonic=self._clock, sleeper=sleeper or time.sleep)
+        self.pool = DynamicKeyPool(list(config.keys), monotonic=self._clock, state_store=state_store, waiter=sleeper)
         self.contract_failures: list[dict] = []
         self.active_by_stage: dict[str, int] = {}
         self.max_active_by_stage: dict[str, int] = {}
@@ -333,17 +358,54 @@ class GemmaPoolClient:
         if desk.stage not in {"writer", "revision", "preflight"} and len(prompt) > self.config.json_prompt_max_characters:
             self.record_contract_failure(desk.stage, desk.role, contract_code="PROMPT_BUDGET_EXCEEDED", scope_id=desk.scope_id, character_count=len(prompt))
             raise LiveCallError("PROMPT_BUDGET_EXCEEDED", desk.stage, desk.role, "NONE", "JSON prompt exceeds the configured character budget", details={"stage": desk.stage, "role": desk.role, "prompt_characters": len(prompt), "prompt_character_limit": self.config.json_prompt_max_characters})
-        while True:
-            slot, lease_sequence = self.pool.lease()
+        started = self._clock()
+        desk_attempts = 0
+        last_error: LiveCallError | None = None
+        deadline = started + self.config.max_transport_retry_seconds_per_desk
+        while desk_attempts < self.config.max_transport_attempts_per_desk:
+            if self._clock() >= deadline:
+                raise self._transport_exhausted(desk, desk_attempts, started, last_error)
+            if not self._reserve_provider_attempt(desk):
+                raise LiveCallError("RUN_PROVIDER_ATTEMPT_BUDGET_EXHAUSTED", desk.stage, desk.role, "NONE", "run provider attempt budget exhausted", details={"max_provider_attempts_per_run": self.config.max_provider_attempts_per_run, "provider_attempts_used": self._provider_attempts_reserved})
+            try:
+                slot, lease_sequence = self.pool.lease(deadline=deadline)
+            except (RetryDeadlineExceeded, LiveConfigError):
+                self._release_provider_reservation()
+                raise self._transport_exhausted(desk, desk_attempts, started, last_error)
+            desk_attempts += 1
             try:
                 text = self._invoke(slot, desk, prompt, lease_sequence)
                 self.pool.release(slot)
                 return text
             except LiveCallError as error:
                 self.pool.release(slot, error.error_class)
+                last_error = error
                 if error.error_class in {"RATE_LIMITED", "PROVIDER_5XX", "TIMEOUT", "NETWORK_ERROR", "AUTH_ERROR", "PERMISSION_ERROR"}:
                     continue
                 raise
+        raise self._transport_exhausted(desk, desk_attempts, started, last_error)
+
+    def _reserve_provider_attempt(self, desk: LogicalDesk) -> bool:
+        exhausted = False
+        with self._lock:
+            if self._provider_attempts_reserved >= self.config.max_provider_attempts_per_run:
+                exhausted = True
+            else:
+                self._provider_attempts_reserved += 1
+        if exhausted:
+            self.record_contract_failure(desk.stage, desk.role, contract_code="RUN_PROVIDER_ATTEMPT_BUDGET_EXHAUSTED", scope_id=desk.scope_id)
+            return False
+        return True
+
+    def _release_provider_reservation(self) -> None:
+        with self._lock:
+            self._provider_attempts_reserved = max(0, self._provider_attempts_reserved - 1)
+
+    def _transport_exhausted(self, desk: LogicalDesk, attempts: int, started: float, last_error: LiveCallError | None) -> LiveCallError:
+        elapsed = max(0.0, self._clock() - started)
+        details = {"stage": desk.stage, "role": desk.role, "desk_id": desk.desk_id, "attempt_limit": self.config.max_transport_attempts_per_desk, "attempts_used": attempts, "elapsed_limit_seconds": self.config.max_transport_retry_seconds_per_desk, "elapsed_seconds": elapsed, "last_error_class": getattr(last_error, "error_class", None), "last_http_status": getattr(last_error, "http_status", None)}
+        self.record_contract_failure(desk.stage, desk.role, contract_code="TRANSPORT_RETRY_EXHAUSTED", scope_id=desk.scope_id)
+        return LiveCallError("TRANSPORT_RETRY_EXHAUSTED", desk.stage, desk.role, getattr(last_error, "slot", "NONE"), "desk transport retry budget exhausted", http_status=getattr(last_error, "http_status", None), details=details)
 
     def generate(self, *, stage: str, role: str, prompt: str) -> str:
         return self.generate_for_desk(desk=logical_desk(stage, role), prompt=prompt)
@@ -413,7 +475,7 @@ class GemmaPoolClient:
 
     def _telemetry_snapshot(self, scope_id: str | None = None) -> dict:
         calls = sorted(self.calls, key=lambda call: (call.get("logical_order", 0), call.get("attempt", 0)))
-        snapshot = {"schema_version": 2, "provider": "gemini_developer_api", "model": self.config.model, "calls": calls, "contract_failures": self.contract_failures, "max_active_by_stage": self.max_active_by_stage, "prompt_budget": self.prompt_budget}
+        snapshot = {"schema_version": 2, "provider": "gemini_developer_api", "model": self.config.model, "calls": calls, "contract_failures": self.contract_failures, "max_active_by_stage": self.max_active_by_stage, "prompt_budget": self.prompt_budget, "retry_budget": {"max_attempts_per_desk": self.config.max_transport_attempts_per_desk, "max_retry_seconds_per_desk": self.config.max_transport_retry_seconds_per_desk, "max_provider_attempts_per_run": self.config.max_provider_attempts_per_run, "provider_attempts_used": self._provider_attempts_reserved, "retry_exhausted_count": sum(item.get("contract_code") == "TRANSPORT_RETRY_EXHAUSTED" for item in self.contract_failures)}}
         return scope_projection(snapshot, scope_id) if scope_id is not None else snapshot
 
     def telemetry(self, scope_id: str | None = None) -> dict:
@@ -426,6 +488,7 @@ class GemmaPoolClient:
             self.contract_failures = list(telemetry.get("contract_failures", []))
             self.max_active_by_stage = dict(telemetry.get("max_active_by_stage", {}))
             self.prompt_budget = dict(telemetry.get("prompt_budget", self.prompt_budget))
+            self._provider_attempts_reserved = len(self.calls)
 
     def record_contract_failure(self, stage: str, role: str, slot: str | None = None, contract_code: str | None = None, scope_id: str | None = None, character_count: int | None = None) -> None:
         now = datetime.now(timezone.utc).isoformat()
